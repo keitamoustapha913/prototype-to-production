@@ -18,6 +18,29 @@ def load_state_module():
 
 
 class ContractTests(unittest.TestCase):
+    def test_distributed_instructions_do_not_reference_the_pilot_application(self):
+        """A pilot-specific example must not bias future app discovery."""
+        instruction_paths = [SKILL_ROOT / "SKILL.md"]
+        instruction_paths.extend((SKILL_ROOT / "references").glob("*.md"))
+        instruction_paths.extend((SKILL_ROOT / "assets/project").glob("*.md"))
+        forbidden = ("qworks", "vda", "audit collaboration", "shared overview", "ccoverview")
+        for path in instruction_paths:
+            source = path.read_text(encoding="utf-8").lower()
+            for phrase in forbidden:
+                with self.subTest(path=path.relative_to(SKILL_ROOT), phrase=phrase):
+                    self.assertNotIn(phrase, source)
+
+    def test_skill_does_not_impose_pilot_design_style(self):
+        overview = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8").lower()
+        workflow = (SKILL_ROOT / "references/workflow.md").read_text(encoding="utf-8").lower()
+        browser_qa = (SKILL_ROOT / "references/visual-qa.md").read_text(encoding="utf-8").lower()
+        self.assertIn("design direction comes from the current user", overview)
+        self.assertNotIn("simpler, cleaner or more ergonomic ui", overview)
+        self.assertNotIn("simple, ergonomic, precise, friendly", overview)
+        self.assertNotIn("compact **but legible** density", overview)
+        self.assertNotIn("do not use placeholder giant cards", workflow)
+        self.assertNotIn("audit selection", browser_qa)
+
     def test_manifest_has_durable_state_fields(self):
         manifest = json.loads((SKILL_ROOT / "assets/project/manifest.template.json").read_text())
         self.assertTrue({

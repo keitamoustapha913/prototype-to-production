@@ -1,6 +1,6 @@
 interface:
   display_name: Prototype to Production
-  short_description: Prototype and lock faithful SaaS redesigns
+  short_description: Prototype and lock faithful web UI redesigns
   default_prompt: Use $prototype-to-production to redesign this page. Build and visually
     check a runnable preview, then stop for my approval.
   icon_small: assets/icon.svg

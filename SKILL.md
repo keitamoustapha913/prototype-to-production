@@ -1,6 +1,6 @@
 ---
 name: prototype-to-production
-description: Use when an existing SaaS dashboard or business app needs a simpler, cleaner or more ergonomic UI from text or image references; when reviewing or approving visual prototypes, copying an approved UI into real code, fixing visual drift or confusing agent handoffs, or recovering redesign progress after Codex context compaction.
+description: Use when redesigning the UI of any existing web app, dashboard, or business interface from a user brief or visual references; when reviewing or approving prototypes, copying an approved design into the real app, preventing visual drift or ambiguous implementation handoffs, or recovering redesign progress after Codex context compaction.
 ---
 
 # Prototype to Production
@@ -9,7 +9,9 @@ Turn a runnable frontend prototype into a precise, recoverable implementation co
 
 ## Short requests are complete requests
 
-A user can simply say **“Redesign Audit Collaboration → Shared Overview as a compact SaaS dashboard”**, **“Make this page like these images”**, **“Review prototype v1”**, or **“Implement the approved prototype.”** Do not make them write an initiative ID, stage list, source filename, validation checklist, or an 80-line prompt. Infer the real app, page/feature scope and stable initiative ID by inspecting the open repository and conversation/artifacts. Ask one focused question only when the target or design direction cannot safely be identified.
+A user can simply say **“Redesign the billing page using these reference images”**, **“Prototype this app with a bold editorial look”**, **“Review prototype v1”**, or **“Implement the approved prototype.”** Do not make them write an initiative ID, stage list, source filename, validation checklist, or an 80-line prompt. Infer the real app, page/feature scope and stable initiative ID by inspecting the open repository and conversation/artifacts. Ask one focused question only when the target or design direction cannot safely be identified.
+
+**Design direction comes from the current user and this initiative's references**, never from the skill, a previous app, or an earlier test case. Any visual style is eligible: dense or spacious, minimalist or expressive, formal or playful. If a style is not specified and cannot be inferred from supplied references or a request to retain the existing style, ask a focused question. Record the agreed direction in initiative-local decisions and prototype evidence; do not carry another project's aesthetic forward.
 
 Default route for a new redesign: **discover A → build separate runnable B → verify visually → present a short review → STOP for explicit approval**. “Review” means inspect evidence and request revisions or user approval, never approve on the user's behalf. “Implement” means resume/validate the exact prior approval, specify slices, implement and verify without restyling. Auto-resume existing initiatives before acting; never restart based solely on chat memory. See `references/workflow.md`.
 
@@ -36,7 +38,7 @@ After **every material** choice, revision, blocker, or completed task, record `e
 
 ## Quality bar
 
-Simple, ergonomic, precise, friendly, truthful SaaS UI: compact **but legible** density, consistent alignment, concise and unambiguous copy, reasonable mobile touch targets, no overlaps, clipped copy, fake status or unexplained oversized controls. Before approval, test 320/390/768/1024/1440px (or documented equivalent) and supported long-text locales; inspect real pixels. The **approved prototype**, not generic advice, controls final dimensions. Unreplayable fixtures, screenshots containing prototype QA controls, missing source or browser, incomplete functional coverage, stale hashes or self-review never count as acceptance.
+Evaluate the UI against **the user's chosen aesthetic**, applicable accessibility/usability requirements, and the real application's behavior. Check alignment, readability, control reachability, truthful content, focus states, responsiveness, and absence of accidental overlap/clipping. Do not impose a default palette, density, card size, typography, copy tone, or amount of whitespace. Before approval, test 320/390/768/1024/1440px (or documented equivalent) and supported long-text locales; inspect real pixels. The **approved prototype**, not generic advice, controls final dimensions and visual character. Unreplayable fixtures, screenshots containing prototype QA controls, missing source or browser, incomplete functional coverage, stale hashes or self-review never count as acceptance.
 
 ## Included resources
 
