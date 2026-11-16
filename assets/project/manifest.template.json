@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "initiative_id": "example-redesign",
+  "scope": "page",
+  "stage": "discover",
+  "approved_version": null,
+  "active_approval_id": null,
+  "approvals": {},
+  "references": [],
+  "slices": {},
+  "next_action": "Inspect existing routes, behaviors, states and design references.",
+  "last_checkpoint": null,
+  "provenance": {
+    "created_at": null,
+    "repository_head": null,
+    "worktree_status": null,
+    "coordinator": null
+  },
+  "design_direction": {
+    "description": "",
+    "reference_images": [],
+    "approved_style_rules": [],
+    "interaction_decisions": []
+  },
+  "blockers": []
+}

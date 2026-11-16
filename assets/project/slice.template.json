@@ -1,0 +1,28 @@
+{
+  "slice_id": "example-invoice-list",
+  "scope": "page",
+  "owner": "unassigned",
+  "status": "draft",
+  "routes": ["/invoices"],
+  "allowed_paths": ["src/features/invoices/**"],
+  "dependencies": [],
+  "current_behavior": ["List invoices, search and filter, open invoice details."],
+  "prototype_version": "v1",
+  "prototype_source_paths": ["prototype/versions/v1/invoices.tsx"],
+  "visual_cases": [
+    {
+      "case_id": "invoices-desktop-default",
+      "reference_file": "references/v1/invoices-desktop-default.png",
+      "route": "/invoices",
+      "viewport": {"width": 1440, "height": 900},
+      "fixture": "fixtures/invoices.json",
+      "state_setup": "default"
+    }
+  ],
+  "design_tokens": ["design/tokens.json"],
+  "acceptance_checks": ["Match the approved screenshot for each visual case."],
+  "functional_tests": ["Invoice search, filters and detail navigation still work."],
+  "prohibited_deviations": ["Do not invent spacing, table density or component size."],
+  "evidence": {"functional": [], "visual": []},
+  "blockers": []
+}
