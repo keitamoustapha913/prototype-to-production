@@ -23,6 +23,8 @@ VALID_SCOPES = frozenset({"feature", "page", "app"})
 INITIATIVE_ID = re.compile(r"^[a-z][a-z0-9-]{2,60}$")
 VERSION_ID = re.compile(r"^[a-z][a-z0-9-]{1,60}$")
 SKILL_ROOT = Path(__file__).resolve().parents[1]
+HIDDEN_ARTIFACT_ROOT = Path(".artifacts") / "prototype-to-production"
+LEGACY_ARTIFACT_ROOT = Path("design") / "redesigns"
 
 
 class StateError(Exception):
@@ -57,17 +59,96 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def git_workspace_root(project_root: Path) -> Path | None:
+    """Detect normal, unborn and linked Git worktrees without changing them."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(project_root), "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True,
+        )
+    except OSError:
+        return None
+    return Path(result.stdout.strip()).resolve() if result.returncode == 0 and result.stdout.strip() else None
+
+
 def location(project_root: str, initiative_id: str) -> Path:
     root = Path(project_root).resolve(strict=True)
     if not root.is_dir():
         raise StateError(f"Project root is not a directory: {root}")
     if not INITIATIVE_ID.fullmatch(initiative_id):
         raise StateError("Initiative ID must be 3–61 lowercase letters/digits/hyphens, starting with a letter")
-    parent = root / "design" / "redesigns"
-    target = parent / initiative_id
-    if parent.resolve() != parent or target.is_symlink():
-        raise StateError("Initiative directory cannot use a symlink or redirect outside its project path")
-    return target
+    hidden = root / HIDDEN_ARTIFACT_ROOT / initiative_id
+    legacy = root / LEGACY_ARTIFACT_ROOT / initiative_id
+    for candidate in (hidden, legacy):
+        if candidate.parent.resolve() != candidate.parent or candidate.is_symlink():
+            raise StateError("Initiative directory cannot use a symlink or redirect outside its project path")
+    existing = [candidate for candidate in (hidden, legacy) if (candidate / "manifest.json").is_file()]
+    if len(existing) > 1:
+        raise StateError("Ambiguous initiative: both hidden and legacy state exist; reconcile before continuing")
+    if existing:
+        return existing[0]
+    # Never trample an incomplete/unrecognized initiative directory.
+    if hidden.exists() or legacy.exists():
+        raise StateError("Unrecognized or partially initialized initiative directory; inspect it before continuing")
+    return hidden if git_workspace_root(root) else legacy
+
+
+def ensure_local_git_ignore(project_root: Path, directory: Path) -> None:
+    """Keep a new Git-backed initiative local without modifying tracked .gitignore."""
+    root = git_workspace_root(project_root)
+    if root is None:
+        return
+    if directory.is_relative_to(project_root / HIDDEN_ARTIFACT_ROOT):
+        ignore_base = HIDDEN_ARTIFACT_ROOT
+    elif directory.is_relative_to(project_root / LEGACY_ARTIFACT_ROOT):
+        # Existing initiatives stay in place; never move old source/screenshot links.
+        ignore_base = directory.relative_to(project_root)
+    else:
+        return
+    relative = directory.relative_to(root).as_posix()
+    tracked = subprocess.run(
+        ["git", "-C", str(root), "ls-files", "--", relative + "/"],
+        capture_output=True, text=True,
+    )
+    if tracked.returncode != 0 or tracked.stdout.strip():
+        raise StateError("Existing tracked redesign artifacts cannot be made untracked by an ignore rule; ask before any Git index change")
+    target = directory / "manifest.json"
+
+    def is_ignored() -> bool:
+        return subprocess.run(
+            ["git", "-C", str(root), "check-ignore", "-q", "--", str(target)],
+            capture_output=True,
+        ).returncode == 0
+
+    if is_ignored():
+        return
+    git_path = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "--git-path", "info/exclude"],
+        capture_output=True, text=True,
+    )
+    if git_path.returncode != 0 or not git_path.stdout.strip():
+        raise StateError("Cannot locate Git's local exclude file for private redesign artifacts")
+    exclude = Path(git_path.stdout.strip())
+    if not exclude.is_absolute():
+        exclude = root / exclude
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    project_prefix = project_root.relative_to(root).as_posix()
+    pattern = "/" + ("" if project_prefix == "." else project_prefix + "/") + ignore_base.as_posix() + "/"
+    with exclude.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            handle.seek(0)
+            existing = handle.read()
+            if pattern not in existing.splitlines():
+                handle.seek(0, os.SEEK_END)
+                handle.write(("\n" if existing and not existing.endswith("\n") else "")
+                             + "# prototype-to-production: local state and visual evidence\n" + pattern + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    if not is_ignored():
+        raise StateError("Git is not ignoring the redesign artifact directory; inspect .gitignore exclusion rules")
 
 
 @contextmanager
@@ -198,6 +279,80 @@ def validate_visual_cases(cases: object) -> list[str]:
     return errors
 
 
+def validate_replay_proof(directory: Path, approval: dict) -> tuple[list[str], list[str]]:
+    """Check durable evidence that every source-mode reference can be replayed."""
+    proof = approval.get("replay")
+    if not isinstance(proof, dict):
+        return [], ["Source approval requires a replay proof with deterministic browser evidence"]
+    version = approval.get("approved_version")
+    errors: list[str] = []
+    for key in ("command", "script", "evidence_file"):
+        if not isinstance(proof.get(key), str) or not proof[key].strip():
+            errors.append(f"Replay proof requires a nonempty {key}")
+    if proof.get("qa_controls_excluded") is not True:
+        errors.append("Replay proof must exclude prototype-only QA controls from approved product screenshots")
+    script, evidence_file = proof.get("script"), proof.get("evidence_file")
+    if not isinstance(script, str) or not script.startswith(f"prototype/versions/{version}/"):
+        errors.append(f"Replay script must be versioned under prototype/versions/{version}/")
+    if not isinstance(evidence_file, str) or not evidence_file.startswith(f"evidence/{version}/"):
+        errors.append(f"Replay evidence must be versioned under evidence/{version}/")
+    paths = [path for path in (script, evidence_file) if isinstance(path, str) and path]
+    try:
+        evidence = read_json(artifact_file(directory, evidence_file)) if isinstance(evidence_file, str) else {}
+    except (OSError, StateError) as error:
+        errors.append(f"Replay evidence unavailable: {error}")
+        return paths, errors
+    if evidence.get("status") != "PASS" or type(evidence.get("clean_context_runs")) is not int or evidence["clean_context_runs"] < 2:
+        errors.append("Replay evidence requires PASS from two or more clean browser contexts")
+    records = evidence.get("cases")
+    if not isinstance(records, list):
+        records = []
+    cases = approval.get("visual_cases")
+    expected = {case["case_id"]: case for case in cases if isinstance(case, dict) and isinstance(case.get("case_id"), str)} if isinstance(cases, list) else {}
+    observed: dict[str, dict] = {}
+    for row in records:
+        if not isinstance(row, dict) or not isinstance(row.get("case_id"), str) or row["case_id"] in observed:
+            errors.append("Replay evidence contains an invalid or repeated case")
+            continue
+        observed[row["case_id"]] = row
+    if set(observed) != set(expected):
+        errors.append("Replay evidence must cover exactly every approved visual case")
+    for case_id, case in expected.items():
+        record = observed.get(case_id)
+        if not record:
+            continue
+        try:
+            digest = digest_of(artifact_file(directory, case["reference_file"]))
+        except (StateError, OSError, KeyError) as error:
+            errors.append(f"Replay reference {case_id}: {error}")
+            continue
+        if record.get("reference_sha256") != digest or record.get("matching_pixels") is not True:
+            errors.append(f"Replay visual case {case_id} does not match the saved reference screenshot")
+        if record.get("fixture_replayed") is not True:
+            errors.append(f"Replay visual case {case_id} has no proven fixture setup")
+        if record.get("qa_controls_visible") is not False:
+            errors.append(f"Replay visual case {case_id} includes QA-only controls")
+        first, second = record.get("first_capture"), record.get("second_capture")
+        if first == second or any(path == case.get("reference_file") for path in (first, second)):
+            errors.append(f"Replay visual case {case_id}: fresh captures must be separate files from the reference and each other")
+        for label, path in (("first", first), ("second", second)):
+            if not isinstance(path, str) or not path.startswith(f"evidence/{version}/") or not path.endswith(".png"):
+                errors.append(f"Replay visual case {case_id}: {label} capture must be a versioned PNG in evidence/{version}/")
+                continue
+            paths.append(path)
+            try:
+                captured = artifact_file(directory, path)
+                dimensions = png_dimensions(captured)
+                viewport = case.get("viewport") if isinstance(case.get("viewport"), dict) else {}
+                if dimensions != (viewport.get("width"), viewport.get("height")):
+                    errors.append(f"Replay visual case {case_id}: {label} capture has a wrong viewport")
+                if digest_of(captured) != digest:
+                    errors.append(f"Replay visual case {case_id}: {label} capture bytes differ from the saved reference")
+            except (StateError, OSError) as error:
+                errors.append(f"Replay visual case {case_id}: missing or invalid {label} capture: {error}")
+    return paths, errors
+
+
 def validate_approval_record(directory: Path, value: dict, existing: dict) -> tuple[dict, list[str]]:
     errors = validate_scope(value.get("scope"))
     if value.get("scope") != existing.get("scope"):
@@ -230,6 +385,10 @@ def validate_approval_record(directory: Path, value: dict, existing: dict) -> tu
     cases = value.get("visual_cases")
     errors.extend(validate_visual_cases(cases))
     paths = list(sources) + list(assets)
+    if mode == "source" or "replay" in value:
+        replay_paths, replay_errors = validate_replay_proof(directory, value)
+        paths.extend(replay_paths)
+        errors.extend(replay_errors)
     if isinstance(cases, list):
         for case in cases:
             if isinstance(case, dict):
@@ -258,7 +417,8 @@ def validate_approval_record(directory: Path, value: dict, existing: dict) -> tu
                     errors.append(f"Reference PNG viewport mismatch for {case['reference_file']}: image {dims}, requested {viewport}")
             except (StateError, OSError) as error:
                 errors.append(str(error))
-    frozen = {**value, "approved_at": utc_now(), "artifact_hashes": digests}
+    frozen = {**value, "approved_at": utc_now(), "artifact_hashes": digests,
+              "replay_required": mode == "source"}
     return frozen, errors
 
 
@@ -274,6 +434,10 @@ def check_approval(directory: Path, manifest: dict) -> list[str]:
         errors.append("Approved prototype source paths are missing")
     if approval.get("mode") == "image-only" and approval.get("image_only_approved") is not True:
         errors.append("Image-only reconstruction was not explicitly approved")
+    replay_paths: list[str] = []
+    if approval.get("replay_required") or "replay" in approval:
+        replay_paths, replay_errors = validate_replay_proof(directory, approval)
+        errors.extend(replay_errors)
     for path, expected in approval.get("artifact_hashes", {}).items():
         try:
             actual = digest_of(artifact_file(directory, path))
@@ -281,7 +445,7 @@ def check_approval(directory: Path, manifest: dict) -> list[str]:
                 errors.append(f"sha256 mismatch for locked artifact {path}: expected {expected}, found {actual}")
         except (StateError, OSError) as error:
             errors.append(str(error))
-    expected_paths = set(approval.get("source_paths", [])) | set(approval.get("asset_paths", []))
+    expected_paths = set(approval.get("source_paths", [])) | set(approval.get("asset_paths", [])) | set(replay_paths)
     for case in approval.get("visual_cases", []):
         if isinstance(case, dict):
             expected_paths.update([case.get("reference_file"), case.get("fixture")])
@@ -867,7 +1031,10 @@ def reconcile_slice(directory: Path, slice_id: str, action: str, review_file: st
 
 def git_info(project_root: Path) -> tuple[str | None, str | None]:
     def run(*args):
-        result = subprocess.run(["git", "-C", str(project_root), *args], capture_output=True, text=True)
+        try:
+            result = subprocess.run(["git", "-C", str(project_root), *args], capture_output=True, text=True)
+        except OSError:
+            return None
         return result.stdout.strip() if result.returncode == 0 else None
     return run("rev-parse", "HEAD"), run("status", "--short")
 
@@ -936,6 +1103,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         directory = location(args.project_root, args.initiative_id)
         if args.command == "init":
+            ensure_local_git_ignore(Path(args.project_root).resolve(), directory)
             initialize(directory, args.scope, args.next_action)
         elif args.command == "event":
             add_event(directory, args.event_file)

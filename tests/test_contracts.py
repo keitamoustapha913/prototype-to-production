@@ -37,6 +37,25 @@ class ContractTests(unittest.TestCase):
         }.issubset(packet))
         self.assertEqual(packet["status"], "draft")
 
+    def test_approval_template_requires_real_user_approval_and_replay_proof(self):
+        path = SKILL_ROOT / "assets/project/approval.template.json"
+        self.assertTrue(path.is_file(), "A copyable approval contract must exist")
+        approval = json.loads(path.read_text())
+        self.assertIs(approval["approved_by_user"], False)
+        self.assertEqual(approval["mode"], "source")
+        self.assertTrue(approval["visual_cases"])
+        self.assertIn("script", approval["replay"])
+        self.assertIn("evidence_file", approval["replay"])
+        self.assertIs(approval["replay"]["qa_controls_excluded"], False)
+
+    def test_replay_report_template_cannot_be_falsely_approved_by_default(self):
+        path = SKILL_ROOT / "assets/project/replay.template.json"
+        self.assertTrue(path.is_file(), "A browser replay report contract must exist")
+        report = json.loads(path.read_text())
+        self.assertEqual(report["status"], "BLOCKED")
+        self.assertEqual(report["clean_context_runs"], 0)
+        self.assertIs(report["cases"][0]["fixture_replayed"], False)
+
     def test_invalid_scope_and_empty_ready_visual_cases_are_rejected(self):
         state = load_state_module()
         packet = json.loads((SKILL_ROOT / "assets/project/slice.template.json").read_text())

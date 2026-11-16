@@ -1,8 +1,8 @@
 interface:
   display_name: Prototype to Production
-  short_description: Lock approved UI prototypes and verify implementation
-  default_prompt: Use $prototype-to-production to redesign this page from my existing
-    app, freeze the approved prototype, and produce verified implementation slices.
+  short_description: Prototype and lock faithful SaaS redesigns
+  default_prompt: Use $prototype-to-production to redesign this page. Build and visually
+    check a runnable preview, then stop for my approval.
   icon_small: assets/icon.svg
   icon_large: assets/icon.svg
 policy:

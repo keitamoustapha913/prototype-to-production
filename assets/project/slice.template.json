@@ -22,7 +22,7 @@
   "design_tokens": ["design/tokens.json"],
   "acceptance_checks": ["Match the approved screenshot for each visual case."],
   "functional_tests": ["Invoice search, filters and detail navigation still work."],
-  "prohibited_deviations": ["Do not invent spacing, table density or component size."],
+  "prohibited_deviations": ["Do not invent spacing, table density or component size.", "Never copy prototype-only fixture or debug controls into production."],
   "evidence": {"functional": [], "visual": []},
   "blockers": []
 }

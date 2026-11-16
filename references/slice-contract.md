@@ -2,6 +2,8 @@
 
 The coordinator issues one `slices/<id>/contract.json` per end-to-end user flow, not per disconnected CSS task. A worker should be able to complete its slice with only the repository, this contract, the exact approved references, and existing app tests. When a referenced design detail is absent, report BLOCKED and ask the coordinator; never infer it from generic design taste.
 
+In Git projects the handoff lives under ignored `.artifacts/prototype-to-production/<id>/`. If a worker uses a **different** clone, worktree, computer or isolated filesystem, the coordinator must explicitly transfer the complete hashed initiative evidence first; Git alone will not include it. A worker lacking that directory must stop, never recreate the prototype from a prose task packet.
+
 ## Required contract content
 
 Read the `assets/project/slice.template.json` example. Fill every field with **actual** paths and behavior from application A and approved B. Especially:
@@ -10,14 +12,14 @@ Read the `assets/project/slice.template.json` example. Fill every field with **a
 - `current_behavior` and `functional_tests`: every filter, navigation, form validation, loading/empty/error/permission state, keyboard action, and workflow that application A already supports. The prototype's omissions do not authorize feature removal.
 - `prototype_version`, `prototype_source_paths`, `approval_id`, `approved_artifact_hashes`: the exact reusable source and assets for B. Prefer adapting that source within existing app infrastructure. For image-only exceptions, explicitly state reconstruction status and uncertainty.
 - `visual_cases`: actual `case_id`, `route`, locked `reference_file`, viewport width/height, named fixture file, and state setup. The case must exactly match one in the active user approval. Provide desktop/mobile and significant interaction states; newly needed visual patterns require approval before dispatch.
-- `design_tokens`, `acceptance_checks`, `prohibited_deviations`: explicit component hierarchy, spacing scale, grid columns, alignment, widths/heights, typography, row density, labels, truncation, icons and error/help text. Tie numerical requirements to the approved prototype CSS and pixels; do not invent universal sizes that override it. Avoid excessive copy, overlapping/overflowing content and false status claims.
+- `design_tokens`, `acceptance_checks`, `prohibited_deviations`: explicit component hierarchy, spacing scale, grid columns, alignment, widths/heights, typography, row density, labels, truncation, icons and error/help text. Tie numerical requirements to approved CSS and pixels. **Exclude prototype-only fixture selectors, reset buttons, harness banners and testing affordances** from production source. Avoid excessive copy, overflowing content, tiny controls and false status claims.
 - `evidence`, `blockers`: actual screenshots and test output must be produced in verification; do not mark a task accepted merely because it compiles.
 
 The utility locks the contract's hash. Alterations after dispatch invalidate reconciliation. A task whose dependency is not accepted is `blocked`, not ready for parallel work.
 
 ## Worker protocol
 
-1. Run `resume` and `validate`; read your slice packet and actual source/reference files; compare current Git and user modifications. If the shared approval is stale, **stop**.
+1. Run `resume` and `validate`; read the slice packet, locked prototype source/reference pixels, executable fixture setup and replay proof; compare current Git and user modifications. If ignored state is absent in your worktree or the approval is stale, **stop**.
 2. Work only inside `allowed_paths`; if the real app requires a shared component or another file, request a coordinator-owned prerequisite, do not reach across ownership boundaries.
 3. Implement current behavior end-to-end while reusing prototype markup/tokens. Preserve unrelated code changes. Run relevant behavior checks and capture visual evidence at every specified case.
 4. Write a worker JSON file with `slice_id`, `owner`, `status` (`submitted` or `blocked`), `summary`, `implementation_paths`, `source_revision`, `functional_evidence`, `visual_evidence`, `blockers` and `next_action`.

@@ -1,0 +1,37 @@
+{
+  "decision_id": "approve-overview-v1",
+  "approved_version": "v1",
+  "scope": "page",
+  "mode": "source",
+  "approved_by_user": false,
+  "user_approval_note": "",
+  "source_paths": [
+    "prototype/versions/v1/index.html"
+  ],
+  "asset_paths": [],
+  "visual_cases": [
+    {
+      "case_id": "overview-desktop",
+      "reference_file": "references/v1/overview-desktop.png",
+      "route": "/overview",
+      "viewport": {"width": 1440, "height": 900},
+      "fixture": "fixtures/v1/overview.json",
+      "state_setup": "Use versioned replay script to restore the exact owner/default state, clock and file blobs"
+    },
+    {
+      "case_id": "overview-mobile",
+      "reference_file": "references/v1/overview-mobile.png",
+      "route": "/overview",
+      "viewport": {"width": 390, "height": 844},
+      "fixture": "fixtures/v1/overview.json",
+      "state_setup": "Use versioned replay script to restore the same owner/default fixture at mobile viewport"
+    }
+  ],
+  "replay": {
+    "command": "node prototype/versions/v1/replay.mjs",
+    "script": "prototype/versions/v1/replay.mjs",
+    "evidence_file": "evidence/v1/replay.json",
+    "qa_controls_excluded": false
+  },
+  "exceptions": []
+}

@@ -34,7 +34,14 @@ if (!initiativeId || !sliceId || !appBaseUrl ||
     !/^[a-z][a-z0-9-]{2,60}$/.test(sliceId)) {
   throw new Error('BLOCKED: REDESIGN_PROJECT_ROOT, REDESIGN_INITIATIVE_ID, REDESIGN_SLICE_ID and REDESIGN_APP_BASE_URL are required');
 }
-const initiative = resolve(projectRoot, 'design', 'redesigns', initiativeId);
+const candidates = [
+  resolve(projectRoot, '.artifacts', 'prototype-to-production', initiativeId),
+  resolve(projectRoot, 'design', 'redesigns', initiativeId),
+].filter(path => existsSync(resolve(path, 'manifest.json')));
+if (candidates.length !== 1) {
+  throw new Error('BLOCKED: missing or ambiguous redesign state in hidden/legacy initiative directories');
+}
+const initiative = candidates[0];
 
 function artifact(relativePath: string): string {
   if (!relativePath || isAbsolute(relativePath) || relativePath.split(/[\\/]/).includes('..')) {
@@ -97,6 +104,8 @@ for (const visualCase of packet.visual_cases) {
     // Layout guard; add app-specific overlap checks for the approved component hierarchy.
     const horizontalOverflow = await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth + 1);
     expect(horizontalOverflow, 'Unexpected horizontal page overflow').toBe(false);
+    const visibleQaControls = await page.locator('[data-prototype-only]:visible, [data-qa-only]:visible').count();
+    expect(visibleQaControls, 'Prototype-only controls must not appear in approved product UI').toBe(0);
 
     const screenshotFile = artifact(`slices/${sliceId}/evidence/${visualCase.case_id}.png`);
     mkdirSync(dirname(screenshotFile), { recursive: true });

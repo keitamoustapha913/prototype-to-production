@@ -2,6 +2,7 @@
 
 import json
 import hashlib
+import os
 from pathlib import Path
 import struct
 import subprocess
@@ -34,12 +35,15 @@ class ProjectStateTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.initiative = self.root / "design/redesigns/billing-refresh"
+        # A test directory can itself live under the skill Git checkout.
+        # Prevent discovery of an unrelated parent repository.
+        self.test_env = {**os.environ, "GIT_CEILING_DIRECTORIES": str(self.root.parent)}
 
     def cli(self, command, *extra, success=True):
         result = subprocess.run(
             [sys.executable, str(SCRIPT), command, "--project-root", str(self.root),
              "--initiative-id", "billing-refresh", *map(str, extra)],
-            text=True, capture_output=True,
+            text=True, capture_output=True, env=self.test_env,
         )
         if success:
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -62,7 +66,7 @@ class ProjectStateTests(unittest.TestCase):
         path.write_bytes(contents)
         return path
 
-    def approval(self, version="v1", mode="source", source=True):
+    def approval(self, version="v1", mode="source", source=True, replay=True):
         source_path = f"prototype/versions/{version}/invoices.tsx"
         screenshot_path = f"references/{version}/invoices-desktop.png"
         fixture_path = f"fixtures/{version}/invoices.json"
@@ -81,7 +85,44 @@ class ProjectStateTests(unittest.TestCase):
                 "fixture": fixture_path, "state_setup": "default",
             }], "exceptions": [],
         }
+        if mode == "source" and replay:
+            approval["replay"] = self.replay_proof(approval)
         return approval
+
+    def replay_proof(self, approval, *, controls_visible=False, cases=None):
+        """A saved browser-run contract; the coordinator still reviews the real pixels."""
+        version = approval["approved_version"]
+        script = f"prototype/versions/{version}/replay.mjs"
+        evidence = f"evidence/{version}/replay.json"
+        self.artifact(script, b"// Invoke the reproducible fixture setup and compare screenshots.\n")
+        logged_cases = []
+        for case in approval["visual_cases"]:
+            source = (self.initiative / case["reference_file"]).read_bytes()
+            first = f"evidence/{version}/{case['case_id']}-run1.png"
+            second = f"evidence/{version}/{case['case_id']}-run2.png"
+            self.artifact(first, source)
+            self.artifact(second, source)
+            logged_cases.append({
+                "case_id": case["case_id"],
+                "reference_sha256": hashlib.sha256(source).hexdigest(),
+                "first_capture": first,
+                "second_capture": second,
+                "fixture_replayed": True,
+                "matching_pixels": True,
+                "qa_controls_visible": controls_visible,
+            })
+        if cases is not None:
+            logged_cases = cases
+        self.artifact(evidence, json.dumps({
+            "status": "PASS", "clean_context_runs": 2,
+            "cases": logged_cases,
+        }).encode("utf-8"))
+        return {
+            "command": f"node {script}",
+            "script": script,
+            "evidence_file": evidence,
+            "qa_controls_excluded": not controls_visible,
+        }
 
     def approve(self, approval):
         approval_file = self.write_input("approve.json", approval)
@@ -154,6 +195,70 @@ class ProjectStateTests(unittest.TestCase):
         failure = self.cli("init", "--scope", "app", success=False)
         self.assertNotEqual(failure.returncode, 0)
         self.assertEqual(self.manifest()["scope"], "page")
+
+    def test_git_project_uses_ignored_hidden_artifacts_without_changing_gitignore(self):
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        gitignore = self.root / ".gitignore"
+        gitignore.write_text("node_modules/\n", encoding="utf-8")
+        self.cli("init", "--scope", "page")
+        hidden = self.root / ".artifacts/prototype-to-production/billing-refresh"
+        self.assertTrue((hidden / "manifest.json").is_file())
+        self.assertFalse((self.initiative / "manifest.json").exists())
+        self.assertEqual(gitignore.read_text(), "node_modules/\n")
+        ignored = subprocess.run(
+            ["git", "-C", str(self.root), "check-ignore", "-q",
+             ".artifacts/prototype-to-production/billing-refresh/manifest.json"],
+            capture_output=True,
+        )
+        self.assertEqual(ignored.returncode, 0)
+        status = subprocess.check_output(["git", "-C", str(self.root), "status", "--short"], text=True)
+        self.assertNotIn(".artifacts", status)
+        self.assertIn("NOT YET APPROVED", self.cli("validate").stdout)
+
+    def test_git_project_still_resumes_a_preexisting_legacy_initiative(self):
+        self.init()
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        self.assertIn("billing-refresh", self.cli("resume").stdout)
+        self.cli("init", "--scope", "page")
+        ignored = subprocess.run(
+            ["git", "-C", str(self.root), "check-ignore", "-q",
+             "design/redesigns/billing-refresh/manifest.json"],
+            capture_output=True,
+        )
+        self.assertEqual(ignored.returncode, 0)
+        self.assertTrue((self.initiative / "manifest.json").is_file())
+        self.assertFalse((self.root / ".artifacts/prototype-to-production/billing-refresh").exists())
+
+    def test_hidden_parent_symlink_cannot_redirect_git_artifacts(self):
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        (self.root / ".artifacts").symlink_to(elsewhere, target_is_directory=True)
+        result = self.cli("init", "--scope", "page", success=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((elsewhere / "prototype-to-production").exists())
+
+    def test_git_nested_project_artifacts_are_ignored_within_its_subdirectory(self):
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        project = self.root / "apps" / "dashboard"
+        project.mkdir(parents=True)
+        self.root = project
+        self.cli("init", "--scope", "page")
+        hidden = project / ".artifacts/prototype-to-production/billing-refresh/manifest.json"
+        self.assertTrue(hidden.is_file())
+        status = subprocess.check_output(["git", "-C", str(project), "status", "--short"], text=True)
+        self.assertNotIn(".artifacts", status)
+
+    def test_non_git_project_works_even_when_git_is_not_installed(self):
+        for command, extra in (("init", ["--scope", "page"]), ("resume", [])):
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), command, "--project-root", str(self.root),
+                 "--initiative-id", "billing-refresh", *extra],
+                capture_output=True, text=True,
+                env={**self.test_env, "PATH": str(self.root / "nonexistent-bin")},
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue((self.initiative / "manifest.json").is_file())
 
     def test_invalid_initiative_id_cannot_escape_project(self):
         result = subprocess.run([
@@ -242,9 +347,81 @@ class ProjectStateTests(unittest.TestCase):
         self.assertEqual(self.manifest()["approved_version"], "v1")
         self.assertEqual(self.manifest()["stage"], "approved")
         locked = self.manifest()["approvals"]["decision-v1"]["artifact_hashes"]
-        self.assertEqual(len(locked), 3)
+        self.assertEqual(len(locked), 7)
         self.assertTrue(all(len(digest) == 64 for digest in locked.values()))
         self.assertIn("v1", self.cli("resume").stdout)
+
+    def test_source_approval_without_reproducible_visual_evidence_is_blocked(self):
+        self.init()
+        approval = self.approval(replay=False)
+        rejected = self.cli("approve", "--approval-file", self.write_input("approve.json", approval), success=False)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("replay", rejected.stderr.lower())
+        self.assertIsNone(self.manifest()["approved_version"])
+
+    def test_replay_evidence_with_visible_qa_controls_cannot_be_approved(self):
+        self.init()
+        approval = self.approval()
+        approval["replay"] = self.replay_proof(approval, controls_visible=True)
+        rejected = self.cli("approve", "--approval-file", self.write_input("approve.json", approval), success=False)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("qa", rejected.stderr.lower())
+
+    def test_replay_evidence_must_cover_all_locked_visual_cases(self):
+        self.init()
+        approval = self.approval()
+        approval["replay"] = self.replay_proof(approval, cases=[])
+        rejected = self.cli("approve", "--approval-file", self.write_input("approve.json", approval), success=False)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("replay", rejected.stderr.lower())
+
+    def test_malformed_replay_case_reports_clean_blocker_instead_of_crashing(self):
+        self.init()
+        approval = self.approval()
+        approval["replay"] = self.replay_proof(approval, cases=[{"case_id": []}])
+        rejected = self.cli("approve", "--approval-file", self.write_input("approve.json", approval), success=False)
+        self.assertEqual(rejected.returncode, 2)
+        self.assertIn("BLOCKED:", rejected.stderr)
+        self.assertNotIn("Traceback", rejected.stderr)
+
+    def test_replay_script_and_report_become_hash_locked(self):
+        self.init()
+        approval = self.approval()
+        approval["replay"] = self.replay_proof(approval)
+        self.approve(approval)
+        self.cli("validate")
+        self.artifact(approval["replay"]["script"], b"changed fixture setup")
+        rejected = self.cli("validate", success=False)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("sha256", rejected.stderr.lower())
+
+    def test_replay_approval_rejects_missing_real_capture(self):
+        self.init()
+        approval = self.approval()
+        report_path = self.initiative / approval["replay"]["evidence_file"]
+        report = json.loads(report_path.read_text())
+        report["cases"][0]["first_capture"] = "evidence/v1/missing-run.png"
+        report_path.write_text(json.dumps(report), encoding="utf-8")
+        rejected = self.cli("approve", "--approval-file", self.write_input("approve.json", approval), success=False)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("capture", rejected.stderr.lower())
+
+    def test_replay_approval_rejects_different_capture_pixels(self):
+        self.init()
+        approval = self.approval()
+        self.artifact("evidence/v1/invoices-desktop-run2.png", png(color=(90, 91, 92)))
+        rejected = self.cli("approve", "--approval-file", self.write_input("approve.json", approval), success=False)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("capture", rejected.stderr.lower())
+
+    def test_replay_captures_are_hash_locked_after_approval(self):
+        self.init()
+        approval = self.approval()
+        self.approve(approval)
+        self.artifact("evidence/v1/invoices-desktop-run2.png", png(color=(90, 91, 92)))
+        rejected = self.cli("validate", success=False)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("sha256", rejected.stderr.lower())
 
     def test_missing_source_or_reference_blocks_approval(self):
         self.init()

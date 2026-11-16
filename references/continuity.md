@@ -1,6 +1,12 @@
 # Durable state and recovery protocol
 
-Everything material lives in the application's Git worktree, under `design/redesigns/<initiative-id>/`. The global skill never stores app decisions. A conversation transcript, context compaction, or checkpoint summary is not an approval source.
+Everything material lives in the application workspace, inside the initiative directory returned by `scripts/project_state.py init` or `resume`. In a Git project the default is locally ignored `.artifacts/prototype-to-production/<initiative-id>/`; non-Git projects and preexisting initiatives may use `design/redesigns/<initiative-id>/`. The global installed skill never stores app decisions. Chat memory, compaction and a checkpoint summary are not approval sources.
+
+## Git ignore and portability
+
+On `init` in a Git worktree, the utility adds a narrowly scoped local exclusion in Git's `info/exclude` if needed; it does **not** edit tracked `.gitignore`, stage files or untrack previously committed artifacts. New initiatives are created in the hidden directory. Existing `design/redesigns/<id>/` initiatives stay at their original path and are locally ignored when `init` is rerun there. If both paths contain the same ID, a symlink escapes the workspace, or artifacts are already tracked, stop and ask for reconciliation; do not auto-move, delete or run `git rm --cached`.
+
+**Tradeoff:** Ignored artifacts are not included in Git clones, PRs or independent worktrees. They persist through context compaction and fresh Codex CLI sessions in the **same local workspace**. For a different machine/agent checkout, explicitly transfer the complete initiative directory, including locked sources, screenshots, fixtures, replay logs, manifest and decisions journal, by an authorized channel; validate there. If it is unavailable, report `BLOCKED`. Do not claim cross-machine durability from ignore rules alone. The user owns backups of ignored state; offer an archive/export when useful, without silently uploading sensitive app data.
 
 ## Authority order
 
@@ -15,7 +21,7 @@ Only a **coordinator** updates `manifest.json`, global decisions, approvals, or 
 
 At every material user decision, style choice, interaction requirement, new prototype variant, blocker, ownership assignment, source change, test outcome, or next-step change:
 
-1. Save the exact design/source/artifact/code references in the project, including screenshot state and viewport when relevant.
+1. Save the exact design/source/artifact/code references inside the initiative directory, including runnable fixture loaders, replay results and screenshot state/viewport when relevant. Mark test-only controls separately from product UI.
 2. Write a typed event JSON and run `python <skill>/scripts/project_state.py event --project-root <repo> --initiative-id <id> --event-file <json>`.
 3. Write a checkpoint JSON (`summary`, `completed`, `next_action`, `blockers`, optional `repository_head` and `worktree_status`) and run `checkpoint ... --checkpoint-file <json>`.
 4. Verify `manifest.json`, `CHECKPOINT.md`, and the actual files agree before continuing. Avoid leaving the only record in chat.
@@ -24,9 +30,9 @@ Commands consume **real JSON files**; use ordinary project files for intermediat
 
 ## Recovery on a fresh session or after compaction
 
-1. Read the repo `AGENTS.md` and the active redesign pointer if one exists. Identify exact initiative ID; do not guess from similarly named directories.
+1. Read the repo `AGENTS.md` and the active redesign pointer if one exists. Identify the exact initiative ID and locate it using the skill script; do not guess between hidden/legacy paths or similarly named projects.
 2. Run `resume --project-root ... --initiative-id ...`; read `manifest.json`, `CHECKPOINT.md`, recent journal events, and relevant slice contract. Read the approval entry and its paths.
-3. Run `validate` to hash-check the locked sources, screenshots and fixtures; compare current Git HEAD/status and relevant code with recorded provenance. Any mismatch needs inspection. A hash mismatch to a locked reference is a blocker until explicitly reapproved.
+3. Run `validate` to hash-check the locked sources, screenshots, fixtures, replay code and evidence; compare current Git HEAD/status and relevant code with recorded provenance. Missing ignored artifacts after a clone or a hash mismatch are blockers; only the original approval process can authorize new artifacts.
 4. State the active approved version, completed slices, current ownership, blockers, and **next safe action**. Resume only after unresolved discrepancies are reconciled.
 5. Record the rehydration findings as an event/checkpoint, including any new blockers. If a critical earlier decision was never recorded, ask the user again; do not make it up.
 

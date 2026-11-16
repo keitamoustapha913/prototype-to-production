@@ -1,0 +1,24 @@
+{
+  "status": "BLOCKED",
+  "clean_context_runs": 0,
+  "cases": [
+    {
+      "case_id": "overview-desktop",
+      "reference_sha256": "REPLACE_WITH_ACTUAL_REFERENCE_PNG_SHA256",
+      "first_capture": "evidence/v1/overview-desktop-run1.png",
+      "second_capture": "evidence/v1/overview-desktop-run2.png",
+      "fixture_replayed": false,
+      "matching_pixels": false,
+      "qa_controls_visible": true
+    },
+    {
+      "case_id": "overview-mobile",
+      "reference_sha256": "REPLACE_WITH_ACTUAL_REFERENCE_PNG_SHA256",
+      "first_capture": "evidence/v1/overview-mobile-run1.png",
+      "second_capture": "evidence/v1/overview-mobile-run2.png",
+      "fixture_replayed": false,
+      "matching_pixels": false,
+      "qa_controls_visible": true
+    }
+  ]
+}
