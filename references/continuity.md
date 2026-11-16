@@ -26,13 +26,17 @@ At every material user decision, style choice, interaction requirement, new prot
 3. Write a checkpoint JSON (`summary`, `completed`, `next_action`, `blockers`, optional `repository_head` and `worktree_status`) and run `checkpoint ... --checkpoint-file <json>`.
 4. Verify `manifest.json`, `CHECKPOINT.md`, and the actual files agree before continuing. Avoid leaving the only record in chat.
 
+The coordinator must use `reconcile --action block` whenever a confirmed defect stops a slice. A sentence such as "Task 1 is blocked" in a checkpoint without the canonical slice status `blocked` is an invalid handoff; `validate` checks status/blocker consistency. After correction, use `reconcile --action unblock` with a resolution note and reverify. Checkpoints show all currently blocked slices and their reasons, rather than relying on a manually maintained duplicate list.
+
+Save all material screenshot warnings with `warning-record`, including unchanged-page (A-before/A-after) comparisons that **must not** be mislabeled as approved-B failures. Its evidence register protects the report, before/after PNGs, retries, investigation files and side-by-side HTML gallery with SHA-256 hashes; `validate` catches later changes and missing files. Use unique filenames per run and never overwrite evidence. When something was already lost, record that loss honestly, preserve remaining independent retries, and ask the user to accept or reject the evidenced limitation. A hash detects change/loss; **it is not a backup**. Ignored evidence still needs a verified archive or transfer before moving to another worktree/computer.
+
 Commands consume **real JSON files**; use ordinary project files for intermediate payloads (e.g. `design/redesigns/<id>/inputs/`), so intent is reviewable. Do not write secrets into artifacts or reports.
 
 ## Recovery on a fresh session or after compaction
 
 1. Read the repo `AGENTS.md` and the active redesign pointer if one exists. Identify the exact initiative ID and locate it using the skill script; do not guess between hidden/legacy paths or similarly named projects.
 2. Run `resume --project-root ... --initiative-id ...`; read `manifest.json`, `CHECKPOINT.md`, recent journal events, and relevant slice contract. Read the approval entry and its paths.
-3. Run `validate` to hash-check the locked sources, screenshots, fixtures, replay code and evidence; compare current Git HEAD/status and relevant code with recorded provenance. Missing ignored artifacts after a clone or a hash mismatch are blockers; only the original approval process can authorize new artifacts.
+3. Run `validate` to hash-check the locked sources, screenshots, fixtures, replay code, blocker evidence, and every registered warning's gallery/PNG/log hashes; compare current Git HEAD/status and relevant code with recorded provenance. Missing ignored artifacts after a clone or a hash mismatch are blockers; only the original approval process can authorize new artifacts.
 4. State the active approved version, completed slices, current ownership, blockers, and **next safe action**. Resume only after unresolved discrepancies are reconciled.
 5. Record the rehydration findings as an event/checkpoint, including any new blockers. If a critical earlier decision was never recorded, ask the user again; do not make it up.
 

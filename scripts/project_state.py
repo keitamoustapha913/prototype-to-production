@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 import fcntl
 import hashlib
+from html import escape as html_escape
 import json
 import os
 from pathlib import Path
@@ -479,16 +480,24 @@ def render_checkpoint(manifest: dict) -> str:
     lines.extend(f"- {item}" for item in recent.get("completed", []))
     lines += ["", "## Blockers", ""]
     lines.extend(f"- {item}" for item in manifest.get("blockers", []))
+    for slice_id, item in sorted(manifest.get("slices", {}).items()):
+        if item.get("status") == "blocked":
+            lines.extend(f"- {slice_id}: {reason}" for reason in item.get("blockers", []))
     lines += ["", "## Slices", ""]
     for slice_id, item in sorted(manifest.get("slices", {}).items()):
         lines.append(f"- {slice_id}: {item.get('status', 'unknown')} ({item.get('owner', 'unassigned')})")
     lines += ["", "## Capture warnings needing user review", ""]
     pending = [
-        f"- {slice_id}: {', '.join(item.get('warning_case_ids') or [])} (provisional, NOT accepted)"
+        f"- {slice_id}: {', '.join(item.get('warning_case_ids') or [])} (provisional, NOT accepted); gallery: {item.get('warning_gallery_file', 'UNAVAILABLE')}"
         for slice_id, item in sorted(manifest.get("slices", {}).items())
         if item.get("status") == "provisional"
     ]
     lines.extend(pending or ["None pending."])
+    lines += ["", "## Supplemental visual warnings and side-by-side reviews", ""]
+    for warning_id, item in sorted(manifest.get("warnings", {}).items()):
+        lines.append(f"- {warning_id}: {item.get('status')} ({item.get('comparison_scope')}); gallery: {item.get('gallery_file')}")
+    if not manifest.get("warnings"):
+        lines.append("None recorded.")
     lines += ["", "## Recorded repository provenance", ""]
     for key, value in manifest.get("provenance", {}).items():
         lines.append(f"- {key}: {value}")
@@ -710,7 +719,7 @@ def create_slice(directory: Path, contract_file: str) -> None:
                 errors.append(f"Unknown or circular slice dependency: {dep}")
         if errors:
             raise StateError("Invalid slice handoff: " + "; ".join(errors))
-        pending = [dep for dep in dependencies if manifest["slices"][dep]["status"] != "accepted"]
+        pending = [dep for dep in dependencies if manifest["slices"][dep]["status"] not in {"accepted", "provisional"}]
         packet = {
             **candidate,
             "status": "blocked" if pending else "ready",
@@ -1037,9 +1046,287 @@ def check_saved_verification(directory: Path, slice_id: str, assignment: dict, m
     return errors
 
 
+def warning_gallery(directory: Path, warning_dir: Path, report: dict) -> str:
+    """Portable, dependency-free side-by-side proof, never a production UI."""
+    scope_labels = {
+        "approved_to_implementation": ("Before / approved prototype", "After / implemented page"),
+        "original_before_to_original_after": ("Before / original baseline", "After / post-change capture"),
+        "prototype_replay": ("Before / prototype reference", "After / prototype replay"),
+    }
+    before_label, after_label = scope_labels[report["comparison_scope"]]
+
+    def linked_image(relative: str, label: str) -> str:
+        url = html_escape(os.path.relpath(directory / relative, warning_dir).replace(os.sep, "/"), quote=True)
+        safe_label = html_escape(label, quote=True)
+        return f'<a href="{url}" target="_blank"><img loading="lazy" src="{url}" alt="{safe_label}"></a>'
+
+    cards = []
+    for item in report["comparison_pairs"]:
+        first, second = item["reference_file"], item["actual_file"]
+        width, height = png_dimensions(artifact_file(directory, first))
+        heading = f'{html_escape(item["case_id"])} — {html_escape(item["attempt_id"])} ({width} × {height})'
+        cards.append(
+            '<section class="comparison-pair">'
+            f'<h2>{heading}</h2><p>Changed pixels reported: {html_escape(str(item["different_pixels"]))}</p>'
+            '<div class="images">'
+            f'<figure><figcaption>{before_label}</figcaption>{linked_image(first, before_label)}</figure>'
+            f'<figure><figcaption>{after_label}</figcaption>{linked_image(second, after_label)}</figure>'
+            '</div></section>'
+        )
+    title = html_escape(report["warning_id"])
+    scope = html_escape(report["comparison_scope"])
+    summary = html_escape(report["summary"])
+    notes = html_escape(report["reviewer_notes"])
+    return ("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+            '<meta name="viewport" content="width=device-width,initial-scale=1">'
+            f'<title>Visual warning: {title}</title><style>'
+            'body{font:15px/1.55 system-ui,sans-serif;max-width:1500px;margin:0 auto;padding:24px;color:#182333;background:#f4f6fa}'
+            'h1{margin-bottom:4px}header,.comparison-pair{background:white;border:1px solid #dce2e9;border-radius:12px;padding:18px;margin-bottom:18px}'
+            '.images{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}'
+            'figure{min-width:0;margin:0}figcaption{font-weight:600;margin-bottom:8px}'
+            'img{display:block;max-width:100%;height:auto;border:1px solid #ccd3dd;border-radius:5px}'
+            'a{display:block}p{overflow-wrap:anywhere}small{color:#4c596b}'
+            '@media(max-width:700px){.images{grid-template-columns:1fr}body{padding:10px}}'
+            '</style></head><body>'
+            f'<header><h1>Visual warning: {title}</h1><p>{summary}</p>'
+            f'<small>Comparison: {scope}. Reviewer notes: {notes}</small></header>'
+            + "".join(cards) + '</body></html>\n')
+
+
+def record_warning(directory: Path, input_file: str) -> None:
+    warning = read_json(Path(input_file))
+    with coordinator_lock(directory):
+        manifest = manifest_at(directory)
+        errors = check_initiative(directory, manifest)
+        warning_id = warning.get("warning_id")
+        slice_id = warning.get("slice_id")
+        assignment = manifest.get("slices", {}).get(slice_id) if isinstance(slice_id, str) else None
+        if not isinstance(warning_id, str) or not INITIATIVE_ID.fullmatch(warning_id):
+            errors.append("Warning requires a unique lowercase warning_id")
+        if isinstance(warning_id, str) and warning_id in manifest.get("warnings", {}):
+            errors.append("Warning ID already exists; evidence must never be overwritten")
+        if not assignment or assignment.get("status") == "cancelled":
+            errors.append("Warning must name an existing, active slice")
+        if warning.get("classification") != "capture_instability":
+            errors.append("Only independently investigated capture instability can be a visual WARNING; real UI defects must BLOCK")
+        if not isinstance(warning.get("comparison_scope"), str) or warning.get("comparison_scope") not in {
+            "approved_to_implementation", "original_before_to_original_after", "prototype_replay"
+        }:
+            errors.append("Warning needs the correct explicit comparison_scope")
+        disposition = warning.get("disposition")
+        if not isinstance(disposition, str) or disposition not in {"needs_user_review", "informational"}:
+            errors.append("Warning disposition must be needs_user_review or informational")
+        if assignment and assignment.get("status") == "accepted" and disposition == "needs_user_review":
+            errors.append("A pending warning cannot be added after slice acceptance; record it before accepting")
+        if not isinstance(warning.get("summary"), str) or not warning["summary"].strip():
+            errors.append("Warning needs a clear summary")
+        if (not isinstance(warning.get("reviewer"), str) or not warning["reviewer"].strip()
+                or assignment and warning["reviewer"] == assignment["owner"]):
+            errors.append("Warning requires an independent reviewer")
+        if not isinstance(warning.get("reviewer_notes"), str) or not warning["reviewer_notes"].strip():
+            errors.append("Warning requires independent visual-review notes")
+        contexts = warning.get("retry_context_ids")
+        if (not isinstance(contexts, list) or len(contexts) != 3
+                or any(not isinstance(value, str) or not value.strip() for value in contexts)
+                or len(set(contexts)) != 3):
+            errors.append("Warning needs exactly three distinct clean-browser retry context IDs")
+            contexts = []
+        pairs = warning.get("comparison_pairs")
+        if not isinstance(pairs, list) or len(pairs) < 3:
+            errors.append("Warning needs three or more actual before/after screenshot pairs")
+            pairs = []
+        seen_pairs: set[tuple[str, str]] = set()
+        seen_actual_paths: set[str] = set()
+        used_contexts: set[str] = set()
+        evidence_hashes: dict[str, str] = {}
+        any_difference = False
+        for item in pairs:
+            if not isinstance(item, dict):
+                errors.append("Each comparison pair must be an object")
+                continue
+            case_id, attempt = item.get("case_id"), item.get("attempt_id")
+            before, after = item.get("reference_file"), item.get("actual_file")
+            if (not isinstance(case_id, str) or not case_id.strip()
+                    or not isinstance(attempt, str) or attempt not in contexts):
+                errors.append("Comparison pair needs a case_id and one of the named clean retry contexts")
+                continue
+            if (case_id, attempt) in seen_pairs or not isinstance(after, str) or after in seen_actual_paths or before == after:
+                errors.append("Screenshot pairs must have distinct paths and unique case/context combinations")
+                continue
+            seen_pairs.add((case_id, attempt))
+            used_contexts.add(attempt)
+            seen_actual_paths.add(after)
+            changed = item.get("different_pixels")
+            if type(changed) is not int or changed < 0:
+                errors.append("Comparison pair needs a nonnegative integer changed-pixel count")
+                continue
+            any_difference |= changed > 0
+            try:
+                before_path = artifact_file(directory, before)
+                after_path = artifact_file(directory, after)
+                if png_dimensions(before_path) != png_dimensions(after_path):
+                    errors.append(f"Comparison pair {case_id} has different screenshot dimensions")
+                evidence_hashes[before] = digest_of(before_path)
+                evidence_hashes[after] = digest_of(after_path)
+            except (StateError, OSError) as error:
+                errors.append(str(error))
+        if set(contexts) != used_contexts:
+            errors.append("Every clean retry context must have a saved screenshot comparison")
+        if disposition == "needs_user_review" and not any_difference:
+            errors.append("A pending capture WARNING must show actual residual differences; exact retries are informational")
+        supporting = warning.get("supporting_files")
+        if not isinstance(supporting, list) or not supporting or any(not isinstance(p, str) for p in supporting):
+            errors.append("Warning needs actual saved investigation files")
+            supporting = []
+        for path in supporting:
+            try:
+                evidence_hashes[path] = digest_of(artifact_file(directory, path))
+            except (StateError, OSError) as error:
+                errors.append(str(error))
+        if errors:
+            raise StateError("Cannot record visual warning: " + "; ".join(errors))
+        warning_dir = directory / "warnings" / warning_id
+        warning_dir.mkdir(parents=True, exist_ok=False)
+        record_file = f"warnings/{warning_id}/record.json"
+        gallery_file = f"warnings/{warning_id}/comparison.html"
+        atomic_json(directory / record_file, {"warning": warning, "artifact_hashes": evidence_hashes,
+                                              "approval_id": manifest.get("active_approval_id"), "recorded_at": utc_now()})
+        atomic_text(directory / gallery_file, warning_gallery(directory, warning_dir, warning))
+        evidence_hashes[record_file] = digest_of(directory / record_file)
+        evidence_hashes[gallery_file] = digest_of(directory / gallery_file)
+        manifest.setdefault("warnings", {})[warning_id] = {
+            "slice_id": slice_id, "status": "pending_user_review" if disposition == "needs_user_review" else "informational",
+            "comparison_scope": warning["comparison_scope"], "summary": warning["summary"],
+            "approval_id": manifest.get("active_approval_id"), "record_file": record_file,
+            "gallery_file": gallery_file, "evidence_hashes": evidence_hashes,
+        }
+        journal(directory, {"type": "visual_warning_recorded", "warning_id": warning_id,
+                            "slice_id": slice_id, "status": manifest["warnings"][warning_id]["status"],
+                            "gallery_file": gallery_file})
+        manifest["next_action"] = (f"Review side-by-side gallery {gallery_file} before final acceptance"
+                                   if disposition == "needs_user_review" else manifest.get("next_action"))
+        note_progress(manifest, f"Saved visual warning {warning_id} ({manifest['warnings'][warning_id]['status']})")
+        atomic_json(directory / "manifest.json", manifest)
+        atomic_text(directory / "CHECKPOINT.md", render_checkpoint(manifest))
+    print(f"Recorded visual warning {warning_id}: {gallery_file}")
+
+
+def check_warning_evidence(directory: Path, manifest: dict) -> list[str]:
+    errors: list[str] = []
+    for warning_id, warning in manifest.get("warnings", {}).items():
+        if warning.get("slice_id") not in manifest.get("slices", {}):
+            errors.append(f"Visual warning {warning_id}: unknown slice")
+        if warning.get("status") not in {"pending_user_review", "informational", "accepted", "rejected"}:
+            errors.append(f"Visual warning {warning_id}: invalid status")
+        evidence_hashes = warning.get("evidence_hashes")
+        if (not isinstance(evidence_hashes, dict) or not evidence_hashes
+                or warning.get("record_file") not in evidence_hashes
+                or warning.get("gallery_file") not in evidence_hashes):
+            errors.append(f"Visual warning {warning_id}: missing source, screenshot or side-by-side gallery hashes")
+            continue
+        for relative, digest in evidence_hashes.items():
+            try:
+                if digest_of(artifact_file(directory, relative)) != digest:
+                    errors.append(f"Visual warning {warning_id}: sha256 mismatch in evidence {relative}")
+            except (StateError, OSError) as error:
+                errors.append(str(error))
+        if warning.get("status") in {"accepted", "rejected"} and warning.get("decision_file") not in evidence_hashes:
+            errors.append(f"Visual warning {warning_id}: missing hashed user decision")
+        if (warning.get("status") == "pending_user_review"
+                and manifest["slices"].get(warning.get("slice_id"), {}).get("status") == "accepted"
+                and warning.get("approval_id") == manifest.get("active_approval_id")):
+            errors.append(f"Visual warning {warning_id}: slice accepted without user's warning decision")
+    return errors
+
+
+def save_approved_case_warning_gallery(directory: Path, slice_id: str, manifest: dict, review: dict) -> str:
+    """Include original mismatch and all three retries, also for legacy B-case warning records."""
+    pairs: list[dict] = []
+    packet = read_json(directory / "slices" / slice_id / "contract.json")
+    approved = {case["case_id"]: case for case in packet["visual_cases"]}
+    for item in review["visual_evidence"]:
+        if item["result"] != "WARNING":
+            continue
+        case_id = item["case_id"]
+        reference = approved[case_id]["reference_file"]
+        diagnosis = read_json(artifact_file(directory, item["capture_warning"]["diagnosis_file"]))
+        pairs.append({
+            "case_id": case_id, "attempt_id": "initial-failure", "reference_file": reference,
+            "actual_file": item["implementation_screenshot"],
+            "different_pixels": diagnosis.get("initial_different_pixels", "initial mismatch, count not recorded"),
+        })
+        for index, screenshot in enumerate(item["capture_warning"]["retry_screenshots"]):
+            pairs.append({
+                "case_id": case_id, "attempt_id": diagnosis["retry_context_ids"][index],
+                "reference_file": reference, "actual_file": screenshot,
+                "different_pixels": diagnosis["retry_different_pixels"][index],
+            })
+    report = {
+        "warning_id": f"approved-capture-warnings-{slice_id}",
+        "comparison_scope": "approved_to_implementation",
+        "summary": "Provisional capture-only discrepancies: original failed image and three reviewed fresh retries per case",
+        "reviewer_notes": review["notes"],
+        "comparison_pairs": pairs,
+    }
+    relative = f"slices/{slice_id}/evidence/approved-capture-warnings.html"
+    target = directory / relative
+    content = warning_gallery(directory, target.parent, report)
+    if target.exists():
+        if target.read_text(encoding="utf-8") != content:
+            raise StateError("Existing warning gallery changed; preserve it and start a new verification version")
+    else:
+        atomic_text(target, content)
+    return relative
+
+
+def decide_warning(directory: Path, warning_id: str, decision_file: str) -> None:
+    decision = read_json(Path(decision_file))
+    with coordinator_lock(directory):
+        manifest = manifest_at(directory)
+        errors = check_initiative(directory, manifest)
+        warning = manifest.get("warnings", {}).get(warning_id)
+        if errors:
+            raise StateError("Cannot decide warning while verification state is invalid: " + "; ".join(errors))
+        if not warning or warning["status"] != "pending_user_review":
+            raise StateError("Warning is missing or no longer awaiting user review")
+        if (decision.get("warning_id") != warning_id or decision.get("decision") not in {"accept", "reject"}
+                or decision.get("confirmed_by_user") is not True
+                or decision.get("approval_id") != warning.get("approval_id")
+                or not str(decision.get("user_note") or "").strip()):
+            raise StateError("Explicit user decision must name this warning, current approval, accept/reject and a reason")
+        relative = f"warnings/{warning_id}/decision.json"
+        if (directory / relative).exists():
+            raise StateError("Warning decision was already recorded; do not overwrite user decisions")
+        atomic_json(directory / relative, {**decision, "recorded_at": utc_now()})
+        warning["decision_file"] = relative
+        warning["evidence_hashes"][relative] = digest_of(directory / relative)
+        warning["status"] = "accepted" if decision["decision"] == "accept" else "rejected"
+        if warning["status"] == "rejected":
+            assignment = manifest["slices"][warning["slice_id"]]
+            assignment["status"] = "blocked"
+            assignment["blockers"] = [f"User rejected visual warning {warning_id}: {decision['user_note']}"]
+            block_dependents(directory, manifest, warning["slice_id"])
+            manifest["stage"] = "verify"
+            manifest["next_action"] = "Investigate the rejected visual warning and reverify before final acceptance"
+        else:
+            manifest["next_action"] = "Revalidate evidence and finish remaining slice acceptance"
+        journal(directory, {"type": "visual_warning_decided", "warning_id": warning_id,
+                            "status": warning["status"], "decision": decision})
+        note_progress(manifest, f"Visual warning {warning_id}: {warning['status']} by explicit user decision")
+        atomic_json(directory / "manifest.json", manifest)
+        atomic_text(directory / "CHECKPOINT.md", render_checkpoint(manifest))
+    print(f"Visual warning {warning_id}: {warning['status']}")
+
+
 def check_initiative(directory: Path, manifest: dict) -> list[str]:
     errors = check_approval(directory, manifest)
     for slice_id, assignment in manifest.get("slices", {}).items():
+        status = assignment.get("status")
+        blockers = assignment.get("blockers", [])
+        if status == "blocked" and not blockers:
+            errors.append(f"Slice {slice_id}: blocked status requires an explicit recorded reason")
+        if status in {"ready", "reported", "verified", "provisional", "accepted"} and blockers:
+            errors.append(f"Slice {slice_id}: nonblocked status contradicts recorded blockers")
         if assignment.get("status") != "cancelled" and assignment.get("prototype_version") != manifest.get("approved_version"):
             errors.append(f"Slice {slice_id}: references a superseded or revoked prototype")
         try:
@@ -1050,7 +1337,43 @@ def check_initiative(directory: Path, manifest: dict) -> list[str]:
             errors.append(str(error))
         if assignment.get("status") in {"verified", "provisional", "accepted"}:
             errors.extend(check_saved_verification(directory, slice_id, assignment, manifest))
+        for path, saved_digest in assignment.get("block_evidence_hashes", {}).items():
+            try:
+                if digest_of(artifact_file(directory, path)) != saved_digest:
+                    errors.append(f"Slice {slice_id}: altered original blocker evidence {path}")
+            except (StateError, OSError) as error:
+                errors.append(str(error))
+    errors.extend(check_warning_evidence(directory, manifest))
     return errors
+
+
+def pending_supplemental_warnings(manifest: dict, slice_id: str) -> list[str]:
+    return [warning_id for warning_id, warning in manifest.get("warnings", {}).items()
+            if warning.get("slice_id") == slice_id
+            and warning.get("approval_id") == manifest.get("active_approval_id")
+            and warning.get("status") in {"pending_user_review", "rejected"}]
+
+
+def block_dependents(directory: Path, manifest: dict, prerequisite_id: str) -> None:
+    """A newly blocked prerequisite cannot leave dependent tasks falsely ready or accepted."""
+    for dependent_id, dependent in manifest["slices"].items():
+        if prerequisite_id not in dependent.get("dependencies", []) or dependent["status"] == "cancelled":
+            continue
+        reason = f"Waiting for accepted dependency: {prerequisite_id}"
+        if reason in dependent.get("blockers", []):
+            continue
+        previous = dependent["status"]
+        dependent["status"] = "blocked"
+        dependent["blockers"] = list(dependent.get("blockers", [])) + [reason]
+        if previous == "ready":
+            packet_path = artifact_file(directory, dependent["contract_file"])
+            packet = read_json(packet_path)
+            packet["status"], packet["blockers"] = "blocked", dependent["blockers"]
+            atomic_json(packet_path, packet)
+            dependent["contract_sha256"] = digest_of(packet_path)
+        journal(directory, {"type": "dependent_slice_blocked", "slice_id": dependent_id,
+                            "prerequisite": prerequisite_id, "prior_status": previous})
+        block_dependents(directory, manifest, dependent_id)
 
 
 def unblock_dependents(directory: Path, manifest: dict) -> None:
@@ -1084,14 +1407,60 @@ def reconcile_slice(directory: Path, slice_id: str, action: str, review_file: st
             errors.append("Slice references superseded prototype; reapproval and reslicing required")
         if errors:
             raise StateError("Cannot reconcile: " + "; ".join(errors))
-        if action == "report":
-            if assignment["status"] in {"verified", "provisional", "accepted"}:
-                raise StateError("Cannot replace verification/acceptance with a later worker report")
+        if action == "block":
+            if assignment["status"] == "cancelled" or not review_file:
+                raise StateError("Blocking an active slice requires --review-file with the defect and next action")
+            blocker = read_json(Path(review_file))
+            if (blocker.get("slice_id") != slice_id
+                    or not str(blocker.get("reason") or "").strip()
+                    or not str(blocker.get("next_action") or "").strip()):
+                raise StateError("Blocker must identify the slice, concrete defect and next action")
+            evidence = blocker.get("evidence_files")
+            if not isinstance(evidence, list) or not evidence or not all(isinstance(p, str) for p in evidence):
+                raise StateError("A real blocker requires supporting evidence files")
+            hashes: dict[str, str] = {}
+            for path in evidence:
+                if not path.startswith(f"slices/{slice_id}/evidence/"):
+                    raise StateError("Blocker evidence must belong to the affected slice")
+                hashes[path] = digest_of(artifact_file(directory, path))
+            assignment.setdefault("block_evidence_hashes", {}).update(hashes)
+            assignment["status"] = "blocked"
+            assignment["blockers"] = [blocker["reason"]]
+            block_dependents(directory, manifest, slice_id)
+            manifest["stage"] = "implement"
+            manifest["next_action"] = blocker["next_action"]
+            journal(directory, {"type": "slice_blocked", "slice_id": slice_id,
+                                "reason": blocker["reason"], "evidence_hashes": hashes,
+                                "next_action": blocker["next_action"]})
+        elif action == "unblock":
+            if assignment["status"] != "blocked" or not review_file:
+                raise StateError("Only a blocked slice can be resumed with a written resolution")
+            if any(manifest["slices"][dep]["status"] not in {"accepted", "provisional"}
+                   for dep in assignment.get("dependencies", [])):
+                raise StateError("Slice still has an unfinished or blocked dependency")
+            resolution = read_json(Path(review_file))
+            if (resolution.get("slice_id") != slice_id
+                    or not str(resolution.get("resolution") or "").strip()
+                    or not str(resolution.get("next_action") or "").strip()):
+                raise StateError("Unblocking requires an explicit resolution and next action")
+            assignment["status"], assignment["blockers"] = "ready", []
+            manifest["stage"] = "implement"
+            manifest["next_action"] = resolution["next_action"]
+            journal(directory, {"type": "slice_unblocked_after_resolution", "slice_id": slice_id,
+                                "resolution": resolution["resolution"],
+                                "next_action": resolution["next_action"]})
+        elif action == "report":
+            if assignment["status"] in {"verified", "provisional", "accepted", "blocked"}:
+                raise StateError("Cannot erase a blocker or verification with a stale worker report; resolve the blocker first")
             report = read_json(directory / "slices" / slice_id / "worker-report.json")
             if report.get("owner") != assignment["owner"] or report.get("slice_id") != slice_id:
                 raise StateError("Worker report identity conflicts with coordinator assignment")
             assignment["status"] = "reported" if report["status"] == "submitted" else "blocked"
-            assignment["blockers"] = report.get("blockers", [])
+            assignment["blockers"] = (report.get("blockers") or [f"Worker reported blocked: {report['summary']}"])
+            if assignment["status"] == "reported":
+                assignment["blockers"] = []
+            else:
+                block_dependents(directory, manifest, slice_id)
             journal(directory, {"type": "slice_reconciled", "slice_id": slice_id, "status": assignment["status"], "summary": report["summary"]})
             manifest["stage"] = "implement"
             manifest["next_action"] = "Verify reported slice against approved visual cases and affected behavior"
@@ -1105,6 +1474,7 @@ def reconcile_slice(directory: Path, slice_id: str, action: str, review_file: st
             if failures:
                 assignment["status"] = "blocked"
                 assignment["blockers"] = failures
+                block_dependents(directory, manifest, slice_id)
                 assignment["warning_case_ids"] = []
                 manifest["stage"] = "verify"
                 manifest["next_action"] = "Fix verification blockers, rerun visual/functional checks and submit review"
@@ -1112,6 +1482,11 @@ def reconcile_slice(directory: Path, slice_id: str, action: str, review_file: st
                 atomic_json(directory / "manifest.json", manifest)
                 atomic_text(directory / "CHECKPOINT.md", render_checkpoint(manifest))
                 raise StateError("Verification BLOCKED: " + "; ".join(failures))
+            if verified["status"] == "WARNING":
+                gallery = save_approved_case_warning_gallery(directory, slice_id, manifest, verified)
+                verified["warning_gallery_file"] = gallery
+                verified["evidence_hashes"][gallery] = digest_of(directory / gallery)
+                assignment["warning_gallery_file"] = gallery
             atomic_json(directory / "slices" / slice_id / "verification.json", verified)
             assignment["status"] = "provisional" if verified["status"] == "WARNING" else "verified"
             assignment["blockers"] = []
@@ -1130,6 +1505,9 @@ def reconcile_slice(directory: Path, slice_id: str, action: str, review_file: st
         elif action == "accept":
             if assignment["status"] != "verified":
                 raise StateError("Slice must have PASS verification and independent reviewer before acceptance")
+            pending = pending_supplemental_warnings(manifest, slice_id)
+            if pending:
+                raise StateError("Review supplemental side-by-side capture warnings before acceptance: " + ", ".join(pending))
             failures = check_saved_verification(directory, slice_id, assignment, manifest)
             if failures:
                 raise StateError("Verification became stale: " + "; ".join(failures))
@@ -1142,6 +1520,9 @@ def reconcile_slice(directory: Path, slice_id: str, action: str, review_file: st
         elif action == "accept-warning":
             if assignment["status"] != "provisional":
                 raise StateError("Only a provisional capture WARNING can receive explicit later user acceptance")
+            pending = pending_supplemental_warnings(manifest, slice_id)
+            if pending:
+                raise StateError("Resolve supplemental side-by-side warnings before slice acceptance: " + ", ".join(pending))
             if not review_file:
                 raise StateError("Capture WARNING acceptance needs --review-file with the user's explicit decision")
             decision = read_json(Path(review_file))
@@ -1213,7 +1594,7 @@ def main(argv: list[str] | None = None) -> int:
     commands = parser.add_subparsers(dest="command", required=True)
     for name in (
         "init", "event", "checkpoint", "approve", "revoke-approval", "slice-create", "slice-cancel",
-        "slice-report", "reconcile", "resume", "validate",
+        "slice-report", "reconcile", "warning-record", "warning-decide", "resume", "validate",
     ):
         sub = commands.add_parser(name)
         sub.add_argument("--project-root", required=True)
@@ -1240,8 +1621,13 @@ def main(argv: list[str] | None = None) -> int:
             sub.add_argument("--report-file", required=True)
         if name == "reconcile":
             sub.add_argument("--slice-id", required=True)
-            sub.add_argument("--action", choices=["report", "verify", "accept", "accept-warning"], required=True)
+            sub.add_argument("--action", choices=["report", "block", "unblock", "verify", "accept", "accept-warning"], required=True)
             sub.add_argument("--review-file")
+        if name == "warning-record":
+            sub.add_argument("--warning-file", required=True)
+        if name == "warning-decide":
+            sub.add_argument("--warning-id", required=True)
+            sub.add_argument("--decision-file", required=True)
     args = parser.parse_args(argv)
     try:
         directory = location(args.project_root, args.initiative_id)
@@ -1264,6 +1650,10 @@ def main(argv: list[str] | None = None) -> int:
             worker_report(directory, args.slice_id, args.owner, args.report_file)
         elif args.command == "reconcile":
             reconcile_slice(directory, args.slice_id, args.action, args.review_file)
+        elif args.command == "warning-record":
+            record_warning(directory, args.warning_file)
+        elif args.command == "warning-decide":
+            decide_warning(directory, args.warning_id, args.decision_file)
         elif args.command == "resume":
             return 2 if print_resume(directory, Path(args.project_root).resolve()) else 0
         elif args.command == "validate":
@@ -1274,7 +1664,7 @@ def main(argv: list[str] | None = None) -> int:
             if not manifest.get("active_approval_id"):
                 print("NOT YET APPROVED: initiative state is valid, but no prototype is approved for implementation")
             else:
-                print("OK: current approval, slice handoffs, and accepted evidence hashes are consistent")
+                print("OK: current approval, slice handoffs, warning galleries, and evidence hashes are consistent")
         return 0
     except (OSError, ValueError, StateError) as error:
         print(f"BLOCKED: {error}", file=sys.stderr)

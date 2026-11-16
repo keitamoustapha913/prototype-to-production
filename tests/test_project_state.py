@@ -732,6 +732,15 @@ class ProjectStateTests(unittest.TestCase):
         self.assertEqual(recorded["status"], "WARNING")
         self.assertEqual(recorded["warning_case_ids"], ["invoices-desktop"])
         self.assertEqual(len(recorded["visual_evidence"][0]["capture_warning"]["retry_screenshots"]), 3)
+        warning_gallery = recorded.get("warning_gallery_file")
+        self.assertIsInstance(warning_gallery, str)
+        gallery_html = (self.initiative / warning_gallery).read_text(encoding="utf-8")
+        self.assertIn("Before / approved prototype", gallery_html)
+        self.assertIn("After / implemented page", gallery_html)
+        self.assertIn("retry-3.png", gallery_html)
+        self.assertIn("implemented.png", gallery_html)
+        self.assertIn(warning_gallery, recorded["evidence_hashes"])
+        self.assertIn(warning_gallery, (self.initiative / "CHECKPOINT.md").read_text())
         self.assertNotEqual(self.cli("reconcile", "--slice-id", "invoice-list",
                                      "--action", "accept", success=False).returncode, 0)
         self.cli("validate")
@@ -810,6 +819,214 @@ class ProjectStateTests(unittest.TestCase):
         self.cli("validate")
         self.artifact("slices/invoice-list/evidence/retry-2.png", png(color=(10, 20, 30)))
         self.assertNotEqual(self.cli("validate", success=False).returncode, 0)
+
+    def warning_packet(self, disposition="needs_user_review"):
+        """Three genuine, separately named comparisons plus an investigation file."""
+        pairs = []
+        for index in range(1, 4):
+            original = f"slices/invoice-list/evidence/unchanged-before-{index}.png"
+            observed = f"slices/invoice-list/evidence/unchanged-after-{index}.png"
+            self.artifact(original, png(width=390, height=844, color=(240, 240, 240)))
+            self.artifact(observed, png(width=390, height=844, color=(241, 240, 240)))
+            pairs.append({
+                "case_id": "unchanged-invoice-mobile", "attempt_id": f"fresh-{index}",
+                "reference_file": original, "actual_file": observed, "different_pixels": 10,
+            })
+        diagnosis = "slices/invoice-list/evidence/capture-diagnosis.json"
+        self.artifact(diagnosis, b'{"reason":"Color rounding only after navigation","layout_matches":true}')
+        return {
+            "warning_id": "unchanged-page-raster", "slice_id": "invoice-list",
+            "comparison_scope": "original_before_to_original_after",
+            "classification": "capture_instability",
+            "disposition": disposition,
+            "summary": "Ten channel-level pixels differ without a layout change",
+            "reviewer": "independent-qa", "reviewer_notes": "Checked all three pairs, text and geometry",
+            "retry_context_ids": ["fresh-1", "fresh-2", "fresh-3"],
+            "comparison_pairs": pairs, "supporting_files": [diagnosis],
+        }
+
+    def test_coordinator_block_updates_official_status_and_checkpoint_without_accepting(self):
+        self.init()
+        approval = self.approval()
+        self.approve(approval)
+        self.slice_create(self.slice_packet(approval))
+        evidence = "slices/invoice-list/evidence/dirty-cancel.json"
+        self.artifact(evidence, b'{"model":"auditor","visible":"client"}')
+        blocker = {
+            "slice_id": "invoice-list", "reason": "Visible selector disagrees with retained model after Cancel",
+            "next_action": "Fix dirty-cancel selection and rerun interaction checks",
+            "evidence_files": [evidence],
+        }
+        self.cli("reconcile", "--slice-id", "invoice-list", "--action", "block",
+                 "--review-file", self.write_input("blocker.json", blocker))
+        self.assertEqual(self.manifest()["slices"]["invoice-list"]["status"], "blocked")
+        self.assertIn("visible selector", " ".join(self.manifest()["slices"]["invoice-list"]["blockers"]).lower())
+        checkpoint = (self.initiative / "CHECKPOINT.md").read_text(encoding="utf-8")
+        self.assertIn("Visible selector disagrees", checkpoint)
+        self.assertIn("invoice-list: blocked", checkpoint)
+        self.cli("validate")
+        self.assertNotEqual(self.cli("reconcile", "--slice-id", "invoice-list", "--action", "accept",
+                                     success=False).returncode, 0)
+        self.assertNotEqual(self.cli("reconcile", "--slice-id", "invoice-list", "--action", "unblock",
+                                     success=False).returncode, 0)
+        resolution = {"slice_id": "invoice-list", "resolution": "Corrected select value and retested Cancel",
+                      "next_action": "Re-run worker tests before verification"}
+        self.cli("reconcile", "--slice-id", "invoice-list", "--action", "unblock",
+                 "--review-file", self.write_input("resolution.json", resolution))
+        self.assertEqual(self.manifest()["slices"]["invoice-list"]["status"], "ready")
+        self.cli("validate")
+        self.artifact(evidence, b'{"model":"client","visible":"client"}')
+        self.assertNotEqual(self.cli("validate", success=False).returncode, 0)
+
+    def test_warning_registry_generates_side_by_side_gallery_and_protects_evidence(self):
+        self.init()
+        approval = self.approval()
+        self.approve(approval)
+        self.slice_create(self.slice_packet(approval))
+        warning = self.warning_packet()
+        self.cli("warning-record", "--warning-file", self.write_input("warning.json", warning))
+        manifest = self.manifest()
+        stored = manifest["warnings"]["unchanged-page-raster"]
+        self.assertEqual(stored["status"], "pending_user_review")
+        gallery = self.initiative / stored["gallery_file"]
+        source = gallery.read_text(encoding="utf-8")
+        self.assertIn("Before", source)
+        self.assertIn("After", source)
+        self.assertIn("Before / original baseline", source)
+        self.assertIn("After / post-change capture", source)
+        self.assertIn("unchanged-before-1.png", source)
+        self.assertIn("unchanged-after-3.png", source)
+        self.assertEqual(source.count("class=\"comparison-pair\""), 3)
+        self.assertIn("unchanged-page-raster", (self.initiative / "CHECKPOINT.md").read_text())
+        self.assertNotEqual(self.cli("warning-record", "--warning-file", self.write_input("warning.json", warning),
+                                     success=False).returncode, 0)
+        self.cli("validate")
+        self.artifact(warning["comparison_pairs"][0]["actual_file"], png(width=390, height=844, color=(20, 20, 20)))
+        self.assertNotEqual(self.cli("validate", success=False).returncode, 0)
+
+    def test_malformed_warning_input_returns_clean_blocker(self):
+        self.init()
+        approval = self.approval()
+        self.approve(approval)
+        self.slice_create(self.slice_packet(approval))
+        for field in ("slice_id", "comparison_scope", "disposition"):
+            warning = self.warning_packet()
+            warning[field] = ["invalid-list-instead-of-text"]
+            result = self.cli("warning-record", "--warning-file", self.write_input("malformed-warning.json", warning),
+                              success=False)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("BLOCKED:", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(self.manifest()["warnings"], {})
+
+    def test_pending_supplemental_warning_blocks_acceptance_until_user_reviews_gallery(self):
+        self.init()
+        approval = self.approval()
+        self.approve(approval)
+        self.slice_create(self.slice_packet(approval))
+        self.submit_slice()
+        self.cli("reconcile", "--slice-id", "invoice-list", "--action", "verify",
+                 "--review-file", self.write_input("review.json", self.review(approval)))
+        self.cli("warning-record", "--warning-file", self.write_input("warning.json", self.warning_packet()))
+        self.assertNotEqual(self.cli("reconcile", "--slice-id", "invoice-list", "--action", "accept",
+                                     success=False).returncode, 0)
+        decision = {"warning_id": "unchanged-page-raster", "approval_id": self.manifest()["active_approval_id"],
+                    "decision": "accept", "confirmed_by_user": False,
+                    "user_note": "Reviewed the side-by-side evidence; artifact is insignificant"}
+        self.assertNotEqual(self.cli("warning-decide", "--warning-id", "unchanged-page-raster",
+                                     "--decision-file", self.write_input("decision.json", decision),
+                                     success=False).returncode, 0)
+        decision["confirmed_by_user"] = True
+        self.cli("warning-decide", "--warning-id", "unchanged-page-raster",
+                 "--decision-file", self.write_input("decision.json", decision))
+        self.assertEqual(self.manifest()["warnings"]["unchanged-page-raster"]["status"], "accepted")
+        self.cli("reconcile", "--slice-id", "invoice-list", "--action", "accept")
+        self.cli("validate")
+        decision_path = self.initiative / self.manifest()["warnings"]["unchanged-page-raster"]["decision_file"]
+        decision_path.write_text('{"tampered":true}', encoding="utf-8")
+        self.assertNotEqual(self.cli("validate", success=False).returncode, 0)
+
+    def test_information_only_warning_is_preserved_but_does_not_block_acceptance(self):
+        self.init()
+        approval = self.approval()
+        self.approve(approval)
+        self.slice_create(self.slice_packet(approval))
+        self.submit_slice()
+        self.cli("reconcile", "--slice-id", "invoice-list", "--action", "verify",
+                 "--review-file", self.write_input("review.json", self.review(approval)))
+        warning = self.warning_packet(disposition="informational")
+        for item in warning["comparison_pairs"]:
+            self.artifact(item["actual_file"], (self.initiative / item["reference_file"]).read_bytes())
+            item["different_pixels"] = 0
+        self.cli("warning-record", "--warning-file", self.write_input("warning.json", warning))
+        self.assertEqual(self.manifest()["warnings"]["unchanged-page-raster"]["status"], "informational")
+        self.cli("reconcile", "--slice-id", "invoice-list", "--action", "accept")
+        self.cli("validate")
+
+    def test_stale_worker_report_cannot_silently_erase_real_blocker(self):
+        self.init()
+        approval = self.approval()
+        self.approve(approval)
+        self.slice_create(self.slice_packet(approval))
+        self.submit_slice()
+        evidence = "slices/invoice-list/evidence/selector-state.json"
+        self.artifact(evidence, b'{"visible":"wrong"}')
+        blocker = {"slice_id": "invoice-list", "reason": "Unsaved draft selector stays wrong after Cancel",
+                   "next_action": "Fix the selector", "evidence_files": [evidence]}
+        self.cli("reconcile", "--slice-id", "invoice-list", "--action", "block",
+                 "--review-file", self.write_input("blocker.json", blocker))
+        self.assertNotEqual(self.cli("reconcile", "--slice-id", "invoice-list", "--action", "report",
+                                     success=False).returncode, 0)
+        self.assertEqual(self.manifest()["slices"]["invoice-list"]["status"], "blocked")
+
+    def test_rejected_visual_warning_never_allows_final_acceptance(self):
+        self.init()
+        approval = self.approval()
+        self.approve(approval)
+        self.slice_create(self.slice_packet(approval))
+        self.submit_slice()
+        self.cli("reconcile", "--slice-id", "invoice-list", "--action", "verify",
+                 "--review-file", self.write_input("review.json", self.review(approval)))
+        self.cli("warning-record", "--warning-file", self.write_input("warning.json", self.warning_packet()))
+        rejection = {"warning_id": "unchanged-page-raster", "approval_id": self.manifest()["active_approval_id"],
+                     "decision": "reject", "confirmed_by_user": True,
+                     "user_note": "The comparison may hide an actual regression"}
+        self.cli("warning-decide", "--warning-id", "unchanged-page-raster",
+                 "--decision-file", self.write_input("reject.json", rejection))
+        self.assertEqual(self.manifest()["slices"]["invoice-list"]["status"], "blocked")
+        resolution = {"slice_id": "invoice-list", "resolution": "Will reproduce and reverify",
+                      "next_action": "Rerun browser checks"}
+        self.cli("reconcile", "--slice-id", "invoice-list", "--action", "unblock",
+                 "--review-file", self.write_input("resolution.json", resolution))
+        self.cli("reconcile", "--slice-id", "invoice-list", "--action", "report")
+        self.cli("reconcile", "--slice-id", "invoice-list", "--action", "verify",
+                 "--review-file", self.write_input("review.json", self.review(approval)))
+        self.assertNotEqual(self.cli("reconcile", "--slice-id", "invoice-list", "--action", "accept",
+                                     success=False).returncode, 0)
+
+    def test_new_real_blocker_holds_dependents_that_were_already_ready(self):
+        self.init()
+        approval = self.approval()
+        self.approve(approval)
+        self.slice_create(self.slice_packet(approval))
+        self.submit_slice()
+        self.cli("reconcile", "--slice-id", "invoice-list", "--action", "verify",
+                 "--review-file", self.write_input("review.json", self.review(approval)))
+        self.cli("reconcile", "--slice-id", "invoice-list", "--action", "accept")
+        dependent = self.slice_packet(approval, slice_id="invoice-export", paths=["src/features/export/**"])
+        dependent["dependencies"] = ["invoice-list"]
+        self.slice_create(dependent)
+        self.assertEqual(self.manifest()["slices"]["invoice-export"]["status"], "ready")
+        path = "slices/invoice-list/evidence/new-regression.json"
+        self.artifact(path, b'{"problem":"new regression"}')
+        blocker = {"slice_id": "invoice-list", "reason": "New regression in a shared selector",
+                   "next_action": "Fix and reverify all affected journeys", "evidence_files": [path]}
+        self.cli("reconcile", "--slice-id", "invoice-list", "--action", "block",
+                 "--review-file", self.write_input("blocker.json", blocker))
+        manifest = self.manifest()
+        self.assertEqual(manifest["slices"]["invoice-export"]["status"], "blocked")
+        self.assertIn("Waiting for accepted dependency: invoice-list", manifest["slices"]["invoice-export"]["blockers"])
+        self.cli("validate")
 
 
 if __name__ == "__main__":

@@ -45,7 +45,7 @@ class ContractTests(unittest.TestCase):
         manifest = json.loads((SKILL_ROOT / "assets/project/manifest.template.json").read_text())
         self.assertTrue({
             "schema_version", "initiative_id", "scope", "stage", "approved_version",
-            "references", "slices", "next_action", "last_checkpoint", "provenance",
+            "references", "slices", "warnings", "next_action", "last_checkpoint", "provenance",
         }.issubset(manifest))
         self.assertIn(manifest["scope"], ("feature", "page", "app"))
         self.assertIsInstance(manifest["slices"], dict)
@@ -111,6 +111,15 @@ class ContractTests(unittest.TestCase):
         ):
             with self.subTest(rule=rule):
                 self.assertIn(rule, source)
+
+    def test_side_by_side_warning_handoff_and_canonical_blocker_commands_are_documented(self):
+        browser_qa = (SKILL_ROOT / "references/visual-qa.md").read_text(encoding="utf-8")
+        workflow = (SKILL_ROOT / "references/workflow.md").read_text(encoding="utf-8")
+        for phrase in ("warning-record", "warning-decide", "comparison.html", "side-by-side", "original_before_to_original_after"):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, browser_qa)
+        self.assertIn("reconcile --action block", workflow)
+        self.assertIn("reconcile --action unblock", workflow)
 
 
 if __name__ == "__main__":

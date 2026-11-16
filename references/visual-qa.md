@@ -44,6 +44,40 @@ Distinguish **real UI defects** (wrong layout/alignment, overlapping or clipped 
 
 The exception is only for **approved-B → in-scope implementation** screenshot comparisons. It cannot waive prototype approval replay, out-of-scope functional regressions, missing tests, unknown discrepancies, broken UI, or inaccessible elements. Never mutate approved references, crop away defects, mask changed regions, manufacture retry captures, increase a global threshold, or convert a test tool error into PASS. Browser unavailability is **BLOCKED**.
 
+## Supplemental warnings: mandatory side-by-side visual handoff
+
+Keep **all material screenshot warnings**, including original-A before/after regression comparisons, distinct from the approved-B case results. A clean B-case PASS must not be rewritten to WARNING because an unrelated original-page screenshot differs. A known tiny capture artifact on an unchanged page may be reviewed as a supplemental warning, but an actual change to layout, content, function or accessibility is **BLOCKED**.
+
+1. Save the **original failed** screenshot, reference, three separately named fresh-context retry pairs, changed-pixel counts, diagnosis/DOM/style comparisons, independent review and any lost-evidence disclosure. Use unique output filenames for each run; never silently reuse an old output path. Missing historical files must remain described as missing, not fabricated.
+2. Prepare a warning JSON in the initiative's ignored `inputs/` or `slices/<id>/evidence/`. For each comparison, map the exact before/after images; include `case_id`, `attempt_id`, `reference_file`, `actual_file`, and `different_pixels`. Include a meaningful summary and independent reviewer notes. Three distinct `retry_context_ids` are mandatory. `disposition: "informational"` is for issues whose fresh retries exactly match and need no user waiver; `"needs_user_review"` is for independently confirmed residual capture-only differences, which block final slice acceptance until explicitly reviewed.
+3. Run `python <skill>/scripts/project_state.py warning-record --project-root <repo> --initiative-id <id> --warning-file <warning.json>`. The utility creates **`warnings/<warning-id>/comparison.html`**: a responsive side-by-side gallery with captions identifying whether it compares an approved prototype, original-application baseline or prototype replay to its correct capture. Original-size image links support close inspection. It also locks the report, every screenshot, investigation file, and gallery itself by SHA-256 in `manifest.json`.
+4. Include that gallery path, warning ID and status in the handoff and final review. The checkpoint lists all registered warnings and their galleries. Re-run `validate`/`resume` to detect missing or changed evidence. If evidence has been overwritten, record the incident in the investigation; keep authentic independent retry pairs and request a decision, not an invented reconstruction.
+5. When a warning is pending, ask the **user** to inspect the gallery and explicitly accept or reject it. Record the actual response as a decision JSON and run `warning-decide --warning-id <id> --decision-file <json>`. A rejected warning blocks its slice for correction. Neither Codex nor the reviewer may manufacture `confirmed_by_user: true` on the user's behalf.
+
+Example warning input (shortened to one affected case; repeat it for each actual page/state):
+
+```json
+{
+  "warning_id": "unchanged-settings-raster",
+  "slice_id": "account-page",
+  "comparison_scope": "original_before_to_original_after",
+  "classification": "capture_instability",
+  "disposition": "needs_user_review",
+  "summary": "Small font edge pixels differ after navigation; geometry and behavior agree",
+  "reviewer": "independent-reviewer",
+  "reviewer_notes": "Inspected all three pairs, DOM positions, labels, focus and interactions",
+  "retry_context_ids": ["fresh-1", "fresh-2", "fresh-3"],
+  "comparison_pairs": [
+    {"case_id": "settings-desktop", "attempt_id": "fresh-1", "reference_file": "slices/account-page/evidence/before-1.png", "actual_file": "slices/account-page/evidence/after-1.png", "different_pixels": 20},
+    {"case_id": "settings-desktop", "attempt_id": "fresh-2", "reference_file": "slices/account-page/evidence/before-2.png", "actual_file": "slices/account-page/evidence/after-2.png", "different_pixels": 20},
+    {"case_id": "settings-desktop", "attempt_id": "fresh-3", "reference_file": "slices/account-page/evidence/before-3.png", "actual_file": "slices/account-page/evidence/after-3.png", "different_pixels": 20}
+  ],
+  "supporting_files": ["slices/account-page/evidence/investigation.json"]
+}
+```
+
+After the user agrees, a decision file contains `warning_id`, active `approval_id`, `decision: "accept"` (or `"reject"`), `confirmed_by_user: true`, and the actual `user_note`. The utility saves and hashes that decision. A supplemental warning's status never changes an approved B-case visual result; it has its own audit trail. For an already-provisional approved B case, also follow the separate `accept-warning` protocol below.
+
 ## What to inspect visibly
 
 - Side-by-side render with the approved version at every approved state and viewport. Check page/container sizes, margins/gaps, grid alignment, exact component density, row heights, typography, truncation, table columns, buttons, labels, icon sizing and consistency.
@@ -96,6 +130,8 @@ For a capture-only warning, replace that visual item's `result` with `"WARNING"`
 ```
 
 The diagnosis JSON must contain `case_id` matching the approved case, `classification: "capture_instability"`, `comparison_scope: "approved_to_implementation"`, `visible_ui_defect: false`, a substantive `investigation` explanation, `retry_different_pixels` with **three positive integer counts**, `retry_context_ids` with **three distinct, nonempty fresh-context IDs** in retry order, and a nonempty `browser_version`. Store other environment details and diff reports there too. The CLI checks for the required records and files, but cannot independently prove human visual equivalence: the reviewer must make that judgment honestly.
+
+`verify` also **automatically generates** `slices/<id>/evidence/approved-capture-warnings.html`, placing the initial failed capture and all three retry PNGs alongside their approved references. The file is SHA-locked in `verification.json` and linked from the checkpoint. Every B-case warning thus has a side-by-side handoff without a separate manual gallery command. Use `warning-record` additionally for supplemental/out-of-scope comparisons, never to relabel the approved B-case result.
 
 `verify` marks warnings as `provisional`, **not accepted**, and unlocks downstream implementation tasks. `accept` refuses a provisional slice. At final review, show the user the exact warning screenshots and diagnostics. Only after the user explicitly accepts those warnings, save a decision JSON like:
 

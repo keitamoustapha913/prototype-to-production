@@ -8,6 +8,7 @@
   "approvals": {},
   "references": [],
   "slices": {},
+  "warnings": {},
   "next_action": "Inspect existing routes, behaviors, states and design references.",
   "last_checkpoint": null,
   "provenance": {
