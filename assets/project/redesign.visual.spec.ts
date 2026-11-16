@@ -24,6 +24,12 @@ type SliceContract = {
   approved_artifact_hashes: Record<string, string>;
   visual_cases: VisualCase[];
 };
+type ApprovedManifest = {
+  active_approval_id: string;
+  approved_version: string;
+  approvals: Record<string, { visual_cases: VisualCase[] }>;
+  slices: Record<string, { status: string }>;
+};
 
 const projectRoot = resolve(process.env.REDESIGN_PROJECT_ROOT ?? process.cwd());
 const initiativeId = process.env.REDESIGN_INITIATIVE_ID;
@@ -66,7 +72,7 @@ function lockedBytes(relativePath: string, hashes: Record<string, string>): Buff
   return bytes;
 }
 
-const manifest = JSON.parse(readFileSync(artifact('manifest.json'), 'utf-8'));
+const manifest = JSON.parse(readFileSync(artifact('manifest.json'), 'utf-8')) as ApprovedManifest;
 const packet: SliceContract = JSON.parse(readFileSync(artifact(`slices/${sliceId}/contract.json`), 'utf-8'));
 if (manifest.approved_version !== packet.prototype_version ||
     !manifest.active_approval_id || manifest.slices?.[sliceId]?.status === 'cancelled') {
@@ -74,6 +80,21 @@ if (manifest.approved_version !== packet.prototype_version ||
 }
 for (const path of Object.keys(packet.approved_artifact_hashes)) {
   lockedBytes(path, packet.approved_artifact_hashes);
+}
+// A screenshot from an unrelated page/state is not a reference even if its dimensions match.
+// The approved prototype B case is the ONLY pixel baseline for that implementation case.
+const approvedCases = manifest.approvals?.[manifest.active_approval_id]?.visual_cases ?? [];
+for (const visualCase of packet.visual_cases) {
+  const approved = approvedCases.find(item => item.case_id === visualCase.case_id);
+  if (!approved ||
+      approved.reference_file !== visualCase.reference_file ||
+      approved.route !== visualCase.route ||
+      approved.fixture !== visualCase.fixture ||
+      approved.state_setup !== visualCase.state_setup ||
+      approved.viewport.width !== visualCase.viewport.width ||
+      approved.viewport.height !== visualCase.viewport.height) {
+    throw new Error(`BLOCKED: ${visualCase.case_id} does not match the exact approved B route/reference/fixture/state/viewport`);
+  }
 }
 
 /**
@@ -142,6 +163,11 @@ for (const visualCase of packet.visual_cases) {
       }
       return { differentPixels, width: observed.width, height: observed.height };
     }, { referenceBase64: reference.toString('base64'), actualBase64: actual.toString('base64') });
+    // If the count is nonzero, retain the original failed screenshot, diagnose the
+    // correct comparison pair and capture three additional clean browser contexts.
+    // Do not blindly use Playwright's `retries` setting: independent fresh contexts,
+    // saved retry PNGs, changed-pixel counts and a human review are mandatory before
+    // the coordinator may classify an isolated capture-only WARNING. See visual-qa.md.
     expect(comparison.differentPixels,
       `Visual mismatch (${comparison.differentPixels} pixels) in ${visualCase.case_id}; inspect ${screenshotFile} against ${visualCase.reference_file}`
     ).toBe(0);

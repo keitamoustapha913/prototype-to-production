@@ -98,7 +98,19 @@ class ContractTests(unittest.TestCase):
         self.assertIn("differentPixels", source)
         self.assertNotIn("actual.equals(reference)", source)
         self.assertIn("reference", source)
+        self.assertIn("approved.route !== visualCase.route", source)
+        self.assertIn("approved.reference_file !== visualCase.reference_file", source)
         self.assertNotIn("--update-snapshots", source)
+
+    def test_comparison_matrix_and_three_retry_warning_policy_are_documented(self):
+        source = (SKILL_ROOT / "references/visual-qa.md").read_text(encoding="utf-8")
+        for rule in (
+            "Original **A before-change**", "**Approved B**", "A-to-B change illustration",
+            "Retry exactly three times", "independent reviewer", "provisional",
+            "accept-warning", "capture_instability", "visible_ui_defect",
+        ):
+            with self.subTest(rule=rule):
+                self.assertIn(rule, source)
 
 
 if __name__ == "__main__":

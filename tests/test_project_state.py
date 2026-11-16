@@ -184,6 +184,33 @@ class ProjectStateTests(unittest.TestCase):
             }],
         }
 
+    def warning_review(self, approval):
+        """An independently reviewed capture-only mismatch, not a visual PASS."""
+        review = self.review(approval, result="WARNING")
+        visual = review["visual_evidence"][0]
+        retry_paths = [
+            f"slices/invoice-list/evidence/retry-{n}.png" for n in range(1, 4)
+        ]
+        for n, retry in enumerate(retry_paths):
+            self.artifact(retry, png(color=(245 + n, 247, 252)))
+        diagnosis_path = "slices/invoice-list/evidence/capture-diagnosis.json"
+        self.artifact(diagnosis_path, json.dumps({
+            "case_id": "invoices-desktop",
+            "classification": "capture_instability",
+            "comparison_scope": "approved_to_implementation",
+            "investigation": "Fresh contexts and identical layout/text/interaction checks; only edge raster varies.",
+            "retry_different_pixels": [20, 17, 21],
+            "retry_context_ids": ["isolated-context-1", "isolated-context-2", "isolated-context-3"],
+            "browser_version": "Chromium pinned-test-version",
+            "visible_ui_defect": False,
+        }).encode("utf-8"))
+        visual["capture_warning"] = {
+            "diagnosis_file": diagnosis_path,
+            "retry_screenshots": retry_paths,
+            "reviewer_notes": "Compared every retry: geometry, copy, controls and interactions are unchanged.",
+        }
+        return review
+
     def events(self):
         return [json.loads(line) for line in (self.initiative / "decisions.jsonl").read_text().splitlines()]
 
@@ -683,6 +710,106 @@ class ProjectStateTests(unittest.TestCase):
                             "--review-file", self.write_input("review.json", review), success=False)
         self.assertNotEqual(rejected.returncode, 0)
         self.assertIn("PNG", rejected.stderr)
+
+    def test_three_reviewed_capture_retries_allow_provisional_progress_not_acceptance(self):
+        self.init()
+        approval = self.approval()
+        self.approve(approval)
+        self.slice_create(self.slice_packet(approval))
+        dependent = self.slice_packet(approval, slice_id="invoice-export", paths=["src/features/export/**"])
+        dependent["dependencies"] = ["invoice-list"]
+        self.slice_create(dependent)
+        self.submit_slice()
+        review = self.warning_review(approval)
+        self.cli("reconcile", "--slice-id", "invoice-list", "--action", "verify",
+                 "--review-file", self.write_input("warning-review.json", review))
+        self.assertEqual(self.manifest()["slices"]["invoice-list"]["status"], "provisional")
+        self.assertEqual(self.manifest()["slices"]["invoice-export"]["status"], "ready")
+        checkpoint = (self.initiative / "CHECKPOINT.md").read_text(encoding="utf-8")
+        self.assertIn("Capture warnings needing user review", checkpoint)
+        self.assertIn("invoices-desktop (provisional, NOT accepted)", checkpoint)
+        recorded = json.loads((self.initiative / "slices/invoice-list/verification.json").read_text())
+        self.assertEqual(recorded["status"], "WARNING")
+        self.assertEqual(recorded["warning_case_ids"], ["invoices-desktop"])
+        self.assertEqual(len(recorded["visual_evidence"][0]["capture_warning"]["retry_screenshots"]), 3)
+        self.assertNotEqual(self.cli("reconcile", "--slice-id", "invoice-list",
+                                     "--action", "accept", success=False).returncode, 0)
+        self.cli("validate")
+
+    def test_capture_warning_rejects_missing_retries_and_real_ui_defects(self):
+        self.init()
+        approval = self.approval()
+        self.approve(approval)
+        self.slice_create(self.slice_packet(approval))
+        self.submit_slice()
+        review = self.warning_review(approval)
+        review["visual_evidence"][0]["capture_warning"]["retry_screenshots"].pop()
+        self.assertNotEqual(self.cli("reconcile", "--slice-id", "invoice-list", "--action", "verify",
+                                     "--review-file", self.write_input("warning-review.json", review),
+                                     success=False).returncode, 0)
+        review = self.warning_review(approval)
+        diagnosis = self.initiative / review["visual_evidence"][0]["capture_warning"]["diagnosis_file"]
+        details = json.loads(diagnosis.read_text())
+        details["visible_ui_defect"] = True
+        diagnosis.write_text(json.dumps(details), encoding="utf-8")
+        self.assertNotEqual(self.cli("reconcile", "--slice-id", "invoice-list", "--action", "verify",
+                                     "--review-file", self.write_input("warning-review.json", review),
+                                     success=False).returncode, 0)
+
+    def test_capture_warning_rejects_wrong_comparison_scope_and_reused_contexts(self):
+        self.init()
+        approval = self.approval()
+        self.approve(approval)
+        self.slice_create(self.slice_packet(approval))
+        self.submit_slice()
+        review = self.warning_review(approval)
+        diagnosis = self.initiative / review["visual_evidence"][0]["capture_warning"]["diagnosis_file"]
+        details = json.loads(diagnosis.read_text())
+        details["comparison_scope"] = "unrelated_a_to_b"
+        diagnosis.write_text(json.dumps(details), encoding="utf-8")
+        self.assertNotEqual(self.cli("reconcile", "--slice-id", "invoice-list", "--action", "verify",
+                                     "--review-file", self.write_input("warning-review.json", review),
+                                     success=False).returncode, 0)
+        details["comparison_scope"] = "approved_to_implementation"
+        details["retry_context_ids"] = ["same-context"] * 3
+        diagnosis.write_text(json.dumps(details), encoding="utf-8")
+        self.assertNotEqual(self.cli("reconcile", "--slice-id", "invoice-list", "--action", "verify",
+                                     "--review-file", self.write_input("warning-review.json", review),
+                                     success=False).returncode, 0)
+
+    def test_provisional_warning_requires_later_explicit_user_review_and_keeps_hashes_locked(self):
+        self.init()
+        approval = self.approval()
+        self.approve(approval)
+        self.slice_create(self.slice_packet(approval))
+        self.submit_slice()
+        review = self.warning_review(approval)
+        self.cli("reconcile", "--slice-id", "invoice-list", "--action", "verify",
+                 "--review-file", self.write_input("warning-review.json", review))
+        rejected = {
+            "slice_id": "invoice-list", "approved_by_user": False,
+            "warning_case_ids": ["invoices-desktop"], "user_note": "I reviewed the capture warning.",
+        }
+        self.assertNotEqual(self.cli("reconcile", "--slice-id", "invoice-list", "--action", "accept-warning",
+                                     "--review-file", self.write_input("user-decision.json", rejected),
+                                     success=False).returncode, 0)
+        accepted = {**rejected, "approved_by_user": True,
+                    "approval_id": self.manifest()["active_approval_id"]}
+        self.cli("reconcile", "--slice-id", "invoice-list", "--action", "accept-warning",
+                 "--review-file", self.write_input("user-decision.json", accepted))
+        self.assertEqual(self.manifest()["slices"]["invoice-list"]["status"], "accepted")
+        self.cli("validate")
+        verification_path = self.initiative / "slices/invoice-list/verification.json"
+        saved = json.loads(verification_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["status"], "WARNING_USER_ACCEPTED")
+        saved["status"] = "PASS"
+        verification_path.write_text(json.dumps(saved), encoding="utf-8")
+        self.assertNotEqual(self.cli("validate", success=False).returncode, 0)
+        saved["status"] = "WARNING_USER_ACCEPTED"
+        verification_path.write_text(json.dumps(saved), encoding="utf-8")
+        self.cli("validate")
+        self.artifact("slices/invoice-list/evidence/retry-2.png", png(color=(10, 20, 30)))
+        self.assertNotEqual(self.cli("validate", success=False).returncode, 0)
 
 
 if __name__ == "__main__":

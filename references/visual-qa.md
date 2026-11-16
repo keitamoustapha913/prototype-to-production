@@ -15,9 +15,34 @@ Full-page images are useful for review but are not approval `visual_cases` when 
 ## Browser setup
 
 1. Inspect the project's existing browser-test tooling first. Use its Playwright/Cypress/browser workflow when present; do not add dependencies or bypass login policies without user permission. If the browser, test runner, fonts, fixture, credentials, or app server are unavailable, record `BLOCKED` and ask for the missing setup. Do not mark a case PASS.
-2. Adapt `assets/project/redesign.visual.spec.ts` to the app's actual routes, service mocks, auth, and fixture/state preparation. Its `prepareCase` intentionally **throws** until you provide a real deterministic setup; no stub can pass. It discovers the hidden or legacy initiative directory and decodes/compares pixels against the locked screenshot, never creating new golden baselines. It requires exact pixel equality until you explicitly document an allowed deviation.
+2. Adapt `assets/project/redesign.visual.spec.ts` to the app's actual routes, service mocks, auth, and fixture/state preparation. Its `prepareCase` intentionally **throws** until you provide a real deterministic setup; no stub can pass. It discovers the hidden or legacy initiative directory and decodes/compares pixels against the locked screenshot, never creating new golden baselines. Each test must match the **same `case_id`, locked route, viewport, fixture and state** in the active approval and slice contract. Initial comparison is strict decoded-pixel equality; capture-only warnings have their own reviewed path below, never a silent tolerance increase.
 3. Set `REDESIGN_PROJECT_ROOT`, `REDESIGN_INITIATIVE_ID`, `REDESIGN_SLICE_ID`, and `REDESIGN_APP_BASE_URL`, and run the test from the app's existing Playwright setup. The environment should match the approved prototype capture: viewport, device scale, browser/font versions, theme, locale, timezone, realistic fixture, loading state, modal state, timestamps and animations.
 4. Capture implementation PNGs under `slices/<id>/evidence/`, plus useful diffs/overlays if tooling permits. Keep real test output logs. The reference files under `references/<version>/` remain **untouched**.
+
+## Comparison targets: never cross the wrong pages
+
+Before comparing, write a case matrix containing `comparison_purpose`, actual URL/route, selected record, role, locale, state, viewport/DPR and the **specific reference path and SHA-256**. Check each row against the active approval and slice contract. A visually similar page, an unrelated tab or a convenient screenshot with the same dimensions is **not** the same test case. Never select the nearest-looking baseline automatically.
+
+| Purpose | Expected/reference | Actual | Gate |
+| --- | --- | --- | --- |
+| Prototype replay before approval | Prototype B case/reference in first clean context | **The same B case** in a second fresh context | Required repeatability check; no warning bypass at approval |
+| In-scope redesign implementation | **Approved B** reference for the exact locked case | Production implementation of **that same B case**, with the same fixture, role, locale, state and viewport | Strict visual check; may enter the documented capture-only warning path below |
+| Unchanged/out-of-scope regression | Original **A before-change** screenshot | The same **A after-change** page/state | Detect regressions; real deviations block, but this comparison cannot demand that A look like B |
+| A-to-B change illustration | Original A | Prototype B | Informational design-diff only; **never** an exact-pixel acceptance gate |
+
+Do not use an original-A screenshot as an approved-B baseline. Do not let a diagnostic cross-document A-vs-B comparison block unrelated implementation. Conversely, never dismiss a real out-of-scope A regression as harmless just because B's main cases pass. Preserve and inspect independent before/after A regression evidence.
+
+## When exact pixels disagree: investigate before classifying
+
+Distinguish **real UI defects** (wrong layout/alignment, overlapping or clipped controls, missing content/actions, wrong state, wrong text, broken behavior) from **capture instability** (minor antialiasing, subpixel/font rasterization, color-rounding, browser/environment variance with independently confirmed identical layout and behavior). A tiny pixel count alone **does not prove** capture instability; small differences may signal a real missing indicator or border.
+
+1. **Validate the comparison pair first.** Confirm approved `case_id`, URL/route, reference hash, fixture ID, role, language, state, viewport, device scale factor and screenshot crop. Confirm both pictures depict the **same page and UI state**. A wrong reference is a **test setup bug**: fix the mapping and rerun; do not waive it as a warning.
+2. **Make capture deterministic.** Pin browser and OS/font versions, screenshot scale/DPR, zoom, theme, locale, timezone and clock; await assets/fonts/data readiness and stable animations; remove caret/hover artifacts. Isolate fixtures/storage/network responses. Run captures **sequentially** in fresh contexts and record environment and browser version. Do not compare files of different dimensions or infer equality from filenames.
+3. **Localize the mismatch.** Preserve the original failed PNG and reference; calculate changed-pixel count, bounding rectangles, representative RGB/channel deltas and a diff/overlay. Inspect the affected area at full resolution, verify DOM bounding boxes, computed styles, visible text, control reachability and interaction/functional tests. If layout, semantics, accessibility or business behavior is wrong, it is a **real defect → BLOCKED** and must be fixed.
+4. **Retry exactly three times** after the initial failure, in **three independent clean browser contexts**, rerunning the fixture and capture. Save each PNG and changed-pixel count. If one stable retry exactly matches and there is no defect, mark visual `PASS` and log the intermittent capture problem. If the retries reveal a real defect, inconsistent data/state, a wrong mapping, missing functional verification or an unresolved cause, keep **BLOCKED**.
+5. **Narrow warning exception:** If all three retries still fail exact equality but an **independent reviewer** has directly inspected all captures/diffs and confirmed the same geometry, text, states, interactions and accessibility, with only insignificant raster noise, save a case-level `WARNING` plus diagnosis JSON and all three retry PNGs. **Do not claim PASS**. Run `reconcile --action verify` to mark the slice `provisional` and allow dependent implementation to proceed. Preserve the warning in the checkpoint for the user's **later explicit acceptance or rejection**. Never automatically treat it as user-approved.
+
+The exception is only for **approved-B → in-scope implementation** screenshot comparisons. It cannot waive prototype approval replay, out-of-scope functional regressions, missing tests, unknown discrepancies, broken UI, or inaccessible elements. Never mutate approved references, crop away defects, mask changed regions, manufacture retry captures, increase a global threshold, or convert a test tool error into PASS. Browser unavailability is **BLOCKED**.
 
 ## What to inspect visibly
 
@@ -54,7 +79,37 @@ The coordinator writes a JSON review file (the CLI consumes `--review-file`) wit
 }
 ```
 
-Each visual `case_id` and screenshot hash must match the **currently approved** contract. Every case must have an actual implementation PNG and PASS, a working tool/command, and review notes. Each functional requirement must be named in a `covers` list with a real passing test result and stored log. The reviewer must differ from the worker. The utility hashes the reviewed screenshot, functional log and implementation source; subsequent changes cause `validate`/`resume` to BLOCK further acceptance.
+Each visual `case_id` and screenshot hash must match the **currently approved** contract. Every case must have an actual implementation PNG and either `PASS` or the independently reviewed, fully documented capture-only `WARNING` described below; a working browser tool/command and comparison notes are mandatory. Each functional requirement must be named in a `covers` list with a real passing test result and stored log. The reviewer must differ from the worker. The utility hashes the reviewed screenshots, all retry PNGs, diagnostic JSON, functional logs and implementation source; subsequent changes cause `validate`/`resume` to BLOCK further acceptance.
+
+For a capture-only warning, replace that visual item's `result` with `"WARNING"` and add:
+
+```json
+"capture_warning": {
+  "diagnosis_file": "slices/invoice-list/evidence/capture-diagnosis.json",
+  "retry_screenshots": [
+    "slices/invoice-list/evidence/retry-1.png",
+    "slices/invoice-list/evidence/retry-2.png",
+    "slices/invoice-list/evidence/retry-3.png"
+  ],
+  "reviewer_notes": "Compared three fresh captures with the locked case: DOM geometry, copy and interactions match; only edge raster varies."
+}
+```
+
+The diagnosis JSON must contain `case_id` matching the approved case, `classification: "capture_instability"`, `comparison_scope: "approved_to_implementation"`, `visible_ui_defect: false`, a substantive `investigation` explanation, `retry_different_pixels` with **three positive integer counts**, `retry_context_ids` with **three distinct, nonempty fresh-context IDs** in retry order, and a nonempty `browser_version`. Store other environment details and diff reports there too. The CLI checks for the required records and files, but cannot independently prove human visual equivalence: the reviewer must make that judgment honestly.
+
+`verify` marks warnings as `provisional`, **not accepted**, and unlocks downstream implementation tasks. `accept` refuses a provisional slice. At final review, show the user the exact warning screenshots and diagnostics. Only after the user explicitly accepts those warnings, save a decision JSON like:
+
+```json
+{
+  "slice_id": "invoice-list",
+  "approval_id": "THE_CURRENT_APPROVAL_ID",
+  "warning_case_ids": ["invoices-desktop"],
+  "approved_by_user": true,
+  "user_note": "I reviewed this minor capture-only border mismatch and accept it."
+}
+```
+
+Then run `reconcile --action accept-warning --review-file <user-decision.json>`. This retains `WARNING_USER_ACCEPTED` and the original evidence, rather than claiming exact visual equality. If the user rejects or any evidence/code changes, fix and reverify. **No final all-accepted integration status until every provisional warning is resolved by the user.**
 
 After the worker has filed a slice-local report and the coordinator has reconciled it:
 
@@ -64,4 +119,4 @@ python <skill>/scripts/project_state.py reconcile --project-root <repo> --initia
 python <skill>/scripts/project_state.py validate --project-root <repo> --initiative-id <id>
 ```
 
-A missing screenshot, failing browser test, modified approved reference, unverified behavior, self-review, or altered implementation code must never be recorded as accepted. Record reasons as durable blockers and seek reapproval if the design itself changes. A manual review is a genuine review of captured pixels, not a claim in a log. The CLI checks that evidence records and files exist and match hashes; it cannot attest that someone actually looked at the images, and the coordinator remains responsible for honest review.
+A missing screenshot, failing browser setup, real UI defect, modified approved reference, unverified behavior, self-review, or altered implementation code must never be recorded as accepted. An **isolated capture comparison** may be provisionally warned only through the three-retry and independent-review evidence path; it is never a visual PASS and needs the user's final decision. Record all reasons and seek reapproval if the design itself changes. A manual review is a genuine review of captured pixels, not a claim in a log. The CLI checks that evidence records and files exist and match hashes; it cannot attest that someone actually looked at the images, and the coordinator remains responsible for honest review.

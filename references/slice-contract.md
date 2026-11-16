@@ -15,7 +15,7 @@ Read the `assets/project/slice.template.json` example. Fill every field with **a
 - `design_tokens`, `acceptance_checks`, `prohibited_deviations`: explicit component hierarchy, spacing scale, grid columns, alignment, widths/heights, typography, row density, labels, truncation, icons and error/help text. Tie numerical requirements to approved CSS and pixels, even when the approved design is intentionally spacious, dense or unconventional. **Exclude prototype-only fixture selectors, reset buttons, harness banners and testing affordances** from production source. Prevent accidental overflow, inaccessible controls and false status claims; do not restyle the user's approved visual direction.
 - `evidence`, `blockers`: actual screenshots and test output must be produced in verification; do not mark a task accepted merely because it compiles.
 
-The utility locks the contract's hash. Alterations after dispatch invalidate reconciliation. A task whose dependency is not accepted is `blocked`, not ready for parallel work.
+The utility locks the contract's hash. Alterations after dispatch invalidate reconciliation. A task whose dependency is neither accepted nor **provisionally verified under an independently reviewed three-retry capture warning** is `blocked`. Provisional dependencies may release downstream implementation, but remain outstanding for final user acceptance.
 
 ## Worker protocol
 
@@ -28,4 +28,4 @@ The utility locks the contract's hash. Alterations after dispatch invalidate rec
 
 ## Coordinator acceptance
 
-Confirm current prototype lock hashes, contract hash, screenshot case coverage, reviewer confirmation, interaction/behavior tests, code scope, existing user changes, and no unresolved blockers. Record explicit PASS/FAIL/BLOCKED per case; no visual browser or missing screenshot means BLOCKED. If discrepancies require new design invention, request user decision, save it, version the prototype and dispatch a replacement slice.
+Confirm current prototype lock hashes, contract hash, correct screenshot-to-route/state mapping, reviewer confirmation, interaction/behavior tests, code scope, existing user changes, and no unresolved blockers. Record explicit PASS/FAIL/BLOCKED per case, with **WARNING only for documented negligible capture instability after three clean retries and independent visual review**. A warning is `provisional`, not accepted; its screenshot/diagnostic hashes are preserved and downstream implementation can continue. Final acceptance requires explicit user warning acceptance via `reconcile --action accept-warning --review-file ...`. Real UI defects, missing screenshot/browser, unknown or incorrect comparison targets, and functional failures remain BLOCKED. If discrepancies require new design invention, request user decision, save it, version the prototype and dispatch a replacement slice.

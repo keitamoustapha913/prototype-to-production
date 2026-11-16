@@ -482,6 +482,13 @@ def render_checkpoint(manifest: dict) -> str:
     lines += ["", "## Slices", ""]
     for slice_id, item in sorted(manifest.get("slices", {}).items()):
         lines.append(f"- {slice_id}: {item.get('status', 'unknown')} ({item.get('owner', 'unassigned')})")
+    lines += ["", "## Capture warnings needing user review", ""]
+    pending = [
+        f"- {slice_id}: {', '.join(item.get('warning_case_ids') or [])} (provisional, NOT accepted)"
+        for slice_id, item in sorted(manifest.get("slices", {}).items())
+        if item.get("status") == "provisional"
+    ]
+    lines.extend(pending or ["None pending."])
     lines += ["", "## Recorded repository provenance", ""]
     for key, value in manifest.get("provenance", {}).items():
         lines.append(f"- {key}: {value}")
@@ -823,6 +830,7 @@ def validate_verification(directory: Path, slice_id: str, manifest: dict, review
         errors.append("Verification needs visual evidence records")
     seen: set[str] = set()
     artifact_hashes: dict[str, str] = {}
+    warning_case_ids: list[str] = []
     for item in visual:
         if not isinstance(item, dict):
             errors.append("Visual evidence must be a JSON object")
@@ -836,8 +844,67 @@ def validate_verification(directory: Path, slice_id: str, manifest: dict, review
         ref_hash = approval["artifact_hashes"].get(frozen_case["reference_file"])
         if item.get("reference_sha256") != ref_hash:
             errors.append(f"Visual case {case_id}: reference_sha256 does not match approved screenshot")
-        if item.get("result") != "PASS":
-            errors.append(f"Visual case {case_id}: result is {item.get('result') or 'BLOCKED'}, not PASS")
+        result = item.get("result")
+        if result == "WARNING":
+            warning_case_ids.append(case_id)
+            capture_warning = item.get("capture_warning")
+            if not isinstance(capture_warning, dict):
+                errors.append(f"Visual case {case_id}: WARNING needs an independently reviewed capture_warning record")
+                continue
+            if not str(capture_warning.get("reviewer_notes") or "").strip():
+                errors.append(f"Visual case {case_id}: capture WARNING needs explicit reviewer notes")
+            diagnostic_path = capture_warning.get("diagnosis_file")
+            diagnosis = None
+            if (not isinstance(diagnostic_path, str)
+                    or not diagnostic_path.startswith(f"slices/{slice_id}/evidence/")
+                    or not diagnostic_path.endswith(".json")):
+                errors.append(f"Visual case {case_id}: capture diagnosis must be a JSON file in this slice's evidence directory")
+            else:
+                try:
+                    diagnosis_file = artifact_file(directory, diagnostic_path)
+                    diagnosis = read_json(diagnosis_file)
+                    artifact_hashes[diagnostic_path] = digest_of(diagnosis_file)
+                except (StateError, OSError, ValueError) as error:
+                    errors.append(str(error))
+            retries = capture_warning.get("retry_screenshots")
+            if (not isinstance(retries, list) or len(retries) != 3
+                    or any(not isinstance(path, str) for path in retries)
+                    or len(set(map(str, retries))) != 3
+                    or item.get("implementation_screenshot") in retries):
+                errors.append(f"Visual case {case_id}: exactly three distinct clean-browser retry PNGs are required")
+            else:
+                for retry_path in retries:
+                    if (not isinstance(retry_path, str)
+                            or not retry_path.startswith(f"slices/{slice_id}/evidence/")
+                            or not retry_path.endswith(".png")):
+                        errors.append(f"Visual case {case_id}: invalid retry screenshot path")
+                        continue
+                    try:
+                        path = artifact_file(directory, retry_path)
+                        requested = frozen_case["viewport"]
+                        if png_dimensions(path) != (requested["width"], requested["height"]):
+                            errors.append(f"Visual case {case_id}: retry PNG viewport mismatch")
+                        artifact_hashes[retry_path] = digest_of(path)
+                    except (StateError, OSError) as error:
+                        errors.append(str(error))
+            if not isinstance(diagnosis, dict) or (
+                diagnosis.get("case_id") != case_id
+                or diagnosis.get("classification") != "capture_instability"
+                or diagnosis.get("comparison_scope") != "approved_to_implementation"
+                or diagnosis.get("visible_ui_defect") is not False
+                or not str(diagnosis.get("investigation") or "").strip()
+                or not isinstance(diagnosis.get("retry_different_pixels"), list)
+                or len(diagnosis["retry_different_pixels"]) != 3
+                or any(type(count) is not int or count <= 0 for count in diagnosis["retry_different_pixels"])
+                or not isinstance(diagnosis.get("retry_context_ids"), list)
+                or len(diagnosis["retry_context_ids"]) != 3
+                or any(not isinstance(ctx, str) or not ctx.strip() for ctx in diagnosis["retry_context_ids"])
+                or len(set(diagnosis["retry_context_ids"])) != 3
+                or not str(diagnosis.get("browser_version") or "").strip()
+            ):
+                errors.append(f"Visual case {case_id}: diagnosis must confirm three distinct-context residual capture-only mismatches without a visible UI defect")
+        elif result != "PASS":
+            errors.append(f"Visual case {case_id}: result is {result or 'BLOCKED'}, not PASS or a documented capture WARNING")
         if item.get("tool") in {None, "", "none", "unavailable"} or not str(item.get("command") or "").strip():
             errors.append(f"Visual case {case_id}: working browser tool and command are required")
         if not str(item.get("notes") or "").strip():
@@ -902,9 +969,17 @@ def validate_verification(directory: Path, slice_id: str, manifest: dict, review
         "contract_sha256": assignment["contract_sha256"],
         "evidence_hashes": artifact_hashes,
         "implementation_hashes": source_hashes,
-        "status": "PASS" if not errors else "BLOCKED",
+        "warning_case_ids": sorted(warning_case_ids),
+        "status": "BLOCKED" if errors else ("WARNING" if warning_case_ids else "PASS"),
     }
     return record, errors
+
+
+def warning_ids_match(decision: dict, expected: object) -> bool:
+    ids = decision.get("warning_case_ids")
+    return (isinstance(ids, list) and all(isinstance(item, str) for item in ids)
+            and isinstance(expected, list) and all(isinstance(item, str) for item in expected)
+            and sorted(ids) == sorted(expected))
 
 
 def check_saved_verification(directory: Path, slice_id: str, assignment: dict, manifest: dict) -> list[str]:
@@ -913,8 +988,36 @@ def check_saved_verification(directory: Path, slice_id: str, assignment: dict, m
     except StateError as error:
         return [str(error)]
     errors: list[str] = []
-    if review.get("status") != "PASS" or review.get("approval_id") != manifest.get("active_approval_id"):
-        errors.append(f"Slice {slice_id}: missing PASS verification for active approval")
+    expected_statuses = {
+        "verified": {"PASS"},
+        "provisional": {"WARNING"},
+        "accepted": {"PASS", "WARNING_USER_ACCEPTED"},
+    }
+    if (review.get("status") not in expected_statuses.get(assignment.get("status"), set())
+            or review.get("approval_id") != manifest.get("active_approval_id")):
+        errors.append(f"Slice {slice_id}: missing valid verification for active approval and slice status")
+    visual_records = review.get("visual_evidence")
+    if not isinstance(visual_records, list) or any(not isinstance(item, dict) for item in visual_records):
+        errors.append(f"Slice {slice_id}: saved visual evidence must be a list of reviewed cases")
+        visual_records = []
+    warning_items = [item for item in visual_records if item.get("result") == "WARNING"]
+    if any(not isinstance(item.get("case_id"), str) for item in warning_items):
+        errors.append(f"Slice {slice_id}: malformed warning case ID")
+    actual_warning_ids = sorted(item["case_id"] for item in warning_items if isinstance(item.get("case_id"), str))
+    if actual_warning_ids != review.get("warning_case_ids", []) or (
+        review.get("status") == "PASS" and actual_warning_ids
+    ):
+        errors.append(f"Slice {slice_id}: capture warnings cannot be silently promoted to a visual PASS")
+    if review.get("status") == "WARNING_USER_ACCEPTED":
+        decision = review.get("user_warning_acceptance")
+        if (not isinstance(decision, dict) or decision.get("approved_by_user") is not True
+                or decision.get("approval_id") != manifest.get("active_approval_id")
+                or decision.get("slice_id") != slice_id
+                or not warning_ids_match(decision, review.get("warning_case_ids"))
+                or not str(decision.get("user_note") or "").strip()):
+            errors.append(f"Slice {slice_id}: missing explicit user acceptance of the exact capture warnings")
+    if review.get("status") in {"WARNING", "WARNING_USER_ACCEPTED"} and not review.get("warning_case_ids"):
+        errors.append(f"Slice {slice_id}: capture warning must identify its visual cases")
     if review.get("contract_sha256") != assignment.get("contract_sha256"):
         errors.append(f"Slice {slice_id}: verification is for a different contract version")
     if not review.get("evidence_hashes") or not review.get("implementation_hashes"):
@@ -945,9 +1048,29 @@ def check_initiative(directory: Path, manifest: dict) -> list[str]:
                 errors.append(f"Slice {slice_id}: sha256 mismatch in handoff contract")
         except (StateError, OSError, KeyError) as error:
             errors.append(str(error))
-        if assignment.get("status") in {"verified", "accepted"}:
+        if assignment.get("status") in {"verified", "provisional", "accepted"}:
             errors.extend(check_saved_verification(directory, slice_id, assignment, manifest))
     return errors
+
+
+def unblock_dependents(directory: Path, manifest: dict) -> None:
+    """Release implementation dependencies, not final acceptance, after reviewed warnings."""
+    for dependent_id, dependent in manifest["slices"].items():
+        if dependent["status"] != "blocked" or not dependent["dependencies"]:
+            continue
+        if any(manifest["slices"][dep]["status"] not in {"accepted", "provisional"}
+               for dep in dependent["dependencies"]):
+            continue
+        if any(not str(blocker).startswith("Waiting for accepted dependency:") for blocker in dependent["blockers"]):
+            continue
+        packet_path = artifact_file(directory, dependent["contract_file"])
+        packet = read_json(packet_path)
+        packet["status"], packet["blockers"] = "ready", []
+        atomic_json(packet_path, packet)
+        dependent["status"], dependent["blockers"] = "ready", []
+        dependent["contract_sha256"] = digest_of(packet_path)
+        journal(directory, {"type": "slice_unblocked", "slice_id": dependent_id,
+                            "reason": "Dependencies accepted or provisionally verified with capture warnings"})
 
 
 def reconcile_slice(directory: Path, slice_id: str, action: str, review_file: str | None = None) -> None:
@@ -962,7 +1085,7 @@ def reconcile_slice(directory: Path, slice_id: str, action: str, review_file: st
         if errors:
             raise StateError("Cannot reconcile: " + "; ".join(errors))
         if action == "report":
-            if assignment["status"] in {"verified", "accepted"}:
+            if assignment["status"] in {"verified", "provisional", "accepted"}:
                 raise StateError("Cannot replace verification/acceptance with a later worker report")
             report = read_json(directory / "slices" / slice_id / "worker-report.json")
             if report.get("owner") != assignment["owner"] or report.get("slice_id") != slice_id:
@@ -982,6 +1105,7 @@ def reconcile_slice(directory: Path, slice_id: str, action: str, review_file: st
             if failures:
                 assignment["status"] = "blocked"
                 assignment["blockers"] = failures
+                assignment["warning_case_ids"] = []
                 manifest["stage"] = "verify"
                 manifest["next_action"] = "Fix verification blockers, rerun visual/functional checks and submit review"
                 journal(directory, {"type": "verification_blocked", "slice_id": slice_id, "errors": failures, "review": review})
@@ -989,11 +1113,20 @@ def reconcile_slice(directory: Path, slice_id: str, action: str, review_file: st
                 atomic_text(directory / "CHECKPOINT.md", render_checkpoint(manifest))
                 raise StateError("Verification BLOCKED: " + "; ".join(failures))
             atomic_json(directory / "slices" / slice_id / "verification.json", verified)
-            assignment["status"] = "verified"
+            assignment["status"] = "provisional" if verified["status"] == "WARNING" else "verified"
             assignment["blockers"] = []
+            assignment["warning_case_ids"] = verified["warning_case_ids"]
             manifest["stage"] = "verify"
-            manifest["next_action"] = "Coordinator: verify source and evidence hashes, then explicitly accept the slice"
-            journal(directory, {"type": "slice_verified", "slice_id": slice_id, "reviewer": verified["reviewer"], "verified_at": verified["reviewed_at"]})
+            if assignment["status"] == "provisional":
+                manifest["next_action"] = ("Continue dependent implementation; capture warning cases "
+                                           f"{', '.join(verified['warning_case_ids'])} require later explicit user review before final acceptance")
+                journal(directory, {"type": "slice_provisional_capture_warning", "slice_id": slice_id,
+                                    "warning_case_ids": verified["warning_case_ids"],
+                                    "reviewer": verified["reviewer"], "verified_at": verified["reviewed_at"]})
+                unblock_dependents(directory, manifest)
+            else:
+                manifest["next_action"] = "Coordinator: verify source and evidence hashes, then explicitly accept the slice"
+                journal(directory, {"type": "slice_verified", "slice_id": slice_id, "reviewer": verified["reviewer"], "verified_at": verified["reviewed_at"]})
         elif action == "accept":
             if assignment["status"] != "verified":
                 raise StateError("Slice must have PASS verification and independent reviewer before acceptance")
@@ -1003,27 +1136,37 @@ def reconcile_slice(directory: Path, slice_id: str, action: str, review_file: st
             assignment["status"] = "accepted"
             assignment["blockers"] = []
             journal(directory, {"type": "slice_accepted", "slice_id": slice_id, "approved_version": manifest["approved_version"]})
-            for dependent_id, dependent in manifest["slices"].items():
-                if dependent["status"] != "blocked" or not dependent["dependencies"]:
-                    continue
-                if any(manifest["slices"][dep]["status"] != "accepted" for dep in dependent["dependencies"]):
-                    continue
-                # A dependency-blocked contract has not been dispatched. Unlock under coordinator control.
-                packet_path = artifact_file(directory, dependent["contract_file"])
-                packet = read_json(packet_path)
-                if any(not str(blocker).startswith("Waiting for accepted dependency:") for blocker in dependent["blockers"]):
-                    continue
-                packet["status"], packet["blockers"] = "ready", []
-                atomic_json(packet_path, packet)
-                dependent["status"], dependent["blockers"] = "ready", []
-                dependent["contract_sha256"] = digest_of(packet_path)
-                journal(directory, {"type": "slice_unblocked", "slice_id": dependent_id, "reason": "All dependencies accepted"})
+            unblock_dependents(directory, manifest)
+            manifest["stage"] = "integrate" if all(item["status"] == "accepted" for item in manifest["slices"].values()) else "implement"
+            manifest["next_action"] = "Review accepted slice integration and remaining dependencies; do not merge/deploy without user authorization"
+        elif action == "accept-warning":
+            if assignment["status"] != "provisional":
+                raise StateError("Only a provisional capture WARNING can receive explicit later user acceptance")
+            if not review_file:
+                raise StateError("Capture WARNING acceptance needs --review-file with the user's explicit decision")
+            decision = read_json(Path(review_file))
+            saved = read_json(directory / "slices" / slice_id / "verification.json")
+            if (decision.get("approved_by_user") is not True
+                    or decision.get("slice_id") != slice_id
+                    or decision.get("approval_id") != manifest.get("active_approval_id")
+                    or not warning_ids_match(decision, saved.get("warning_case_ids"))
+                    or not str(decision.get("user_note") or "").strip()):
+                raise StateError("Explicit user decision must name current approval, slice and exact warnings with a note")
+            if check_saved_verification(directory, slice_id, assignment, manifest):
+                raise StateError("Capture warning evidence or code changed; reverify before user acceptance")
+            saved["status"] = "WARNING_USER_ACCEPTED"
+            saved["user_warning_acceptance"] = {**decision, "accepted_at": utc_now()}
+            atomic_json(directory / "slices" / slice_id / "verification.json", saved)
+            assignment["status"], assignment["blockers"] = "accepted", []
+            journal(directory, {"type": "capture_warning_user_accepted", "slice_id": slice_id,
+                                "warning_case_ids": saved["warning_case_ids"], "decision": decision})
+            unblock_dependents(directory, manifest)
             manifest["stage"] = "integrate" if all(item["status"] == "accepted" for item in manifest["slices"].values()) else "implement"
             manifest["next_action"] = "Review accepted slice integration and remaining dependencies; do not merge/deploy without user authorization"
         else:
             raise StateError(f"Unknown reconciliation action: {action}")
         note_progress(manifest, f"Slice {slice_id}: {assignment['status']} ({action})",
-                      completed=f"Accepted {slice_id}" if action == "accept" else None)
+                      completed=f"Accepted {slice_id}" if action in {"accept", "accept-warning"} else None)
         atomic_json(directory / "manifest.json", manifest)
         atomic_text(directory / "CHECKPOINT.md", render_checkpoint(manifest))
     print(f"Reconciled slice {slice_id}: {assignment['status']} ({action})")
@@ -1097,7 +1240,7 @@ def main(argv: list[str] | None = None) -> int:
             sub.add_argument("--report-file", required=True)
         if name == "reconcile":
             sub.add_argument("--slice-id", required=True)
-            sub.add_argument("--action", choices=["report", "verify", "accept"], required=True)
+            sub.add_argument("--action", choices=["report", "verify", "accept", "accept-warning"], required=True)
             sub.add_argument("--review-file")
     args = parser.parse_args(argv)
     try:
