@@ -85,7 +85,7 @@ python3 scripts/project_state.py validate \
   --project-root /path/to/app --initiative-id billing-redesign
 ```
 
-Use the initiative directory printed by `init`. In Git worktrees, new evidence lives under ignored `.artifacts/prototype-to-production/<id>/`; older initiative locations remain supported. Store project evidence in the app's initiative directory rather than the installed skill.
+Use the initiative directory printed by `init`. In every Git repository, new designs live under ignored `.artifacts/prototype-to-production/<id>/`. This includes design documents, plans, runnable prototype source, preview assets, screenshots, and evidence. Paths in the templates are relative to that initiative directory. Only the approved implementation goes into tracked app code. Every CLI command checks that existing initiative files are untracked and ignored; legacy locations remain supported under the same rule. Store project evidence in the app's initiative directory rather than the installed skill.
 
 The utility does not install a browser, start the app, spawn agents, commit, merge, or deploy. Browser setup and actual visual review remain part of the workflow.
 

@@ -95,7 +95,7 @@ def location(project_root: str, initiative_id: str) -> Path:
 
 
 def ensure_local_git_ignore(project_root: Path, directory: Path) -> None:
-    """Keep a new Git-backed initiative local without modifying tracked .gitignore."""
+    """Keep new and resumed Git-backed artifacts ignored without changing the index."""
     root = git_workspace_root(project_root)
     if root is None:
         return
@@ -113,13 +113,18 @@ def ensure_local_git_ignore(project_root: Path, directory: Path) -> None:
     )
     if tracked.returncode != 0 or tracked.stdout.strip():
         raise StateError("Existing tracked redesign artifacts cannot be made untracked by an ignore rule; ask before any Git index change")
-    target = directory / "manifest.json"
+    # A manifest-only check misses rules that expose prototype source or screenshots.
+    targets = {directory / "manifest.json"}
+    if directory.exists():
+        targets.update(path for path in directory.rglob("*") if path.is_file())
 
     def is_ignored() -> bool:
-        return subprocess.run(
-            ["git", "-C", str(root), "check-ignore", "-q", "--", str(target)],
-            capture_output=True,
-        ).returncode == 0
+        result = subprocess.run(
+            ["git", "-C", str(root), "check-ignore", "--stdin", "-z"],
+            input="\0".join(str(path) for path in targets) + "\0",
+            capture_output=True, text=True,
+        )
+        return result.returncode == 0 and set(result.stdout.rstrip("\0").split("\0")) == {str(path) for path in targets}
 
     if is_ignored():
         return
@@ -1631,8 +1636,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         directory = location(args.project_root, args.initiative_id)
+        ensure_local_git_ignore(Path(args.project_root).resolve(), directory)
         if args.command == "init":
-            ensure_local_git_ignore(Path(args.project_root).resolve(), directory)
             initialize(directory, args.scope, args.next_action)
         elif args.command == "event":
             add_event(directory, args.event_file)

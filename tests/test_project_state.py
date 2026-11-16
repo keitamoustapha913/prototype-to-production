@@ -256,6 +256,52 @@ class ProjectStateTests(unittest.TestCase):
         self.assertTrue((self.initiative / "manifest.json").is_file())
         self.assertFalse((self.root / ".artifacts/prototype-to-production/billing-refresh").exists())
 
+    def test_resumed_legacy_initiative_is_ignored_without_rerunning_init(self):
+        self.init()
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        self.cli("resume")
+        ignored = subprocess.run(
+            ["git", "-C", str(self.root), "check-ignore", "-q", "--",
+             str(self.initiative / "manifest.json")], capture_output=True,
+        )
+        self.assertEqual(ignored.returncode, 0)
+
+    def test_event_refuses_tracked_legacy_artifacts_without_modifying_them(self):
+        self.init()
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        subprocess.run(["git", "-C", str(self.root), "add", "design"], check=True)
+        before = (self.initiative / "manifest.json").read_bytes()
+        event = self.write_input("event.json", {"type": "progress", "summary": "Continue design"})
+        failure = self.cli("event", "--event-file", event, success=False)
+        self.assertNotEqual(failure.returncode, 0)
+        self.assertIn("tracked redesign artifacts", failure.stderr)
+        self.assertEqual((self.initiative / "manifest.json").read_bytes(), before)
+        self.assertEqual(self.events(), [])
+
+    def test_validate_refuses_force_added_prototype_source(self):
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        self.init()
+        self.initiative = self.root / ".artifacts/prototype-to-production/billing-refresh"
+        prototype = self.artifact("prototype/versions/v1/index.html", b"<h1>Preview</h1>")
+        subprocess.run(["git", "-C", str(self.root), "add", "-f", str(prototype)], check=True)
+        failure = self.cli("validate", success=False)
+        self.assertNotEqual(failure.returncode, 0)
+        self.assertIn("tracked redesign artifacts", failure.stderr)
+
+    def test_resume_ignores_prototype_even_when_only_manifest_was_ignored(self):
+        self.init()
+        prototype = self.artifact("prototype/versions/v1/index.html", b"<h1>Preview</h1>")
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        (self.root / ".gitignore").write_text(
+            "/design/redesigns/billing-refresh/manifest.json\n", encoding="utf-8",
+        )
+        self.cli("resume")
+        ignored = subprocess.run(
+            ["git", "-C", str(self.root), "check-ignore", "-q", "--", str(prototype)],
+            capture_output=True,
+        )
+        self.assertEqual(ignored.returncode, 0)
+
     def test_hidden_parent_symlink_cannot_redirect_git_artifacts(self):
         subprocess.run(["git", "init", "-q", str(self.root)], check=True)
         elsewhere = self.root / "elsewhere"
