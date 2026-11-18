@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import fcntl
@@ -21,6 +22,8 @@ import zlib
 
 
 VALID_SCOPES = frozenset({"feature", "page", "app"})
+VALID_STAGES = frozenset({"discover", "prototype", "approved", "sliced", "implement", "verify", "integrate"})
+VALID_WORK_STATUSES = frozenset({"in_progress", "blocked", "waiting_user", "done"})
 INITIATIVE_ID = re.compile(r"^[a-z][a-z0-9-]{2,60}$")
 VERSION_ID = re.compile(r"^[a-z][a-z0-9-]{1,60}$")
 SKILL_ROOT = Path(__file__).resolve().parents[1]
@@ -225,6 +228,391 @@ def digest_of(path: Path) -> str:
     return digest.hexdigest()
 
 
+def project_source_file(project_root: Path, relative: str) -> Path:
+    """Resolve an observed application-A source file without following escapes."""
+    if not isinstance(relative, str) or not relative.strip():
+        raise StateError("Discovery source path must be a nonempty project-relative string")
+    raw = Path(relative)
+    if raw.is_absolute() or ".." in raw.parts:
+        raise StateError(f"Discovery source must stay inside the project: {relative!r}")
+    try:
+        path = (project_root / raw).resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise StateError(f"Missing application-A source file {relative!r}: {error}") from error
+    if not path.is_relative_to(project_root.resolve()) or not path.is_file():
+        raise StateError(f"Discovery source escapes the project or is not a file: {relative!r}")
+    return path
+
+
+def validate_discovery_audit(directory: Path, project_root: Path, candidate: dict,
+                             previous: dict | None) -> tuple[dict[str, str], dict[str, str], list[str]]:
+    """Validate genuine A evidence and an exhaustive final zero-new sweep."""
+    errors: list[str] = []
+    if not isinstance(candidate.get("audit_id"), str) or not VERSION_ID.fullmatch(candidate["audit_id"]):
+        errors.append("Discovery requires a stable audit_id")
+    if candidate.get("scope") not in VALID_SCOPES:
+        errors.append("Discovery scope must be feature, page or app")
+    routes = candidate.get("routes")
+    if not isinstance(routes, list) or not routes or any(not isinstance(route, str) or not route.startswith("/") for route in routes):
+        errors.append("Discovery must enumerate concrete in-scope routes")
+        routes = []
+    if len(routes) != len(set(routes)):
+        errors.append("Discovery routes must be unique")
+    if candidate.get("unresolved") != []:
+        errors.append("Unresolved application-A functionality must be investigated before prototype work")
+    features = candidate.get("features")
+    if not isinstance(features, list) or not features:
+        errors.append("Discovery needs at least one source-backed application-A behavior")
+        features = []
+    indexed: dict[str, dict] = {}
+    evidence_hashes: dict[str, str] = {}
+    source_hashes: dict[str, str] = {}
+    previous_features = {
+        item["feature_id"]: item for item in previous.get("features", [])
+    } if isinstance(previous, dict) else {}
+    for item in features:
+        if not isinstance(item, dict):
+            errors.append("Discovery feature must be an object")
+            continue
+        feature_id = item.get("feature_id")
+        if not isinstance(feature_id, str) or not VERSION_ID.fullmatch(feature_id) or feature_id in indexed:
+            errors.append(f"Discovery feature IDs must be unique and stable: {feature_id!r}")
+            continue
+        indexed[feature_id] = item
+        if item.get("route") not in routes or not str(item.get("behavior") or "").strip():
+            errors.append(f"Feature {feature_id}: missing valid route or actual behavior")
+        for field in ("roles", "states", "source_anchors", "browser_evidence"):
+            if not isinstance(item.get(field), list) or not item[field]:
+                errors.append(f"Feature {feature_id}: concrete {field} is required")
+        for field in ("roles", "states"):
+            if isinstance(item.get(field), list) and any(not isinstance(label, str) or not label.strip() for label in item[field]):
+                errors.append(f"Feature {feature_id}: {field} must be meaningful named values")
+        for anchor in item.get("source_anchors", []) if isinstance(item.get("source_anchors"), list) else []:
+            if not isinstance(anchor, dict) or not isinstance(anchor.get("contains"), str) or not anchor["contains"].strip():
+                errors.append(f"Feature {feature_id}: source anchor needs a file and unique code text")
+                continue
+            if previous_features.get(feature_id) == item:
+                # A was source-verified in a previous immutable audit, whose
+                # hashes are still checked. Production code may since change.
+                # Keep the old A source anchor as historical proof rather than
+                # pretending it must still exist in the new implementation.
+                continue
+            try:
+                path = project_source_file(project_root, anchor.get("path"))
+                if anchor["contains"] not in path.read_text(encoding="utf-8"):
+                    errors.append(f"Feature {feature_id}: source anchor not found in {anchor.get('path')}")
+                else:
+                    source_hashes[anchor["path"]] = digest_of(path)
+            except (StateError, OSError, UnicodeError) as error:
+                errors.append(f"Feature {feature_id}: {error}")
+        for relative in item.get("browser_evidence", []) if isinstance(item.get("browser_evidence"), list) else []:
+            try:
+                path = artifact_file(directory, relative)
+                if not path.stat().st_size:
+                    errors.append(f"Feature {feature_id}: empty browser evidence {relative}")
+                if relative.endswith(".png"):
+                    png_dimensions(path)
+                evidence_hashes[relative] = digest_of(path)
+            except (StateError, OSError) as error:
+                errors.append(f"Feature {feature_id}: {error}")
+    for feature_id, item in previous_features.items():
+        if feature_id not in indexed:
+            errors.append(f"Cannot remove previously discovered feature {feature_id}; past decisions are immutable")
+        elif indexed[feature_id] != item:
+            errors.append(f"Cannot overwrite previously discovered feature {feature_id}; record a user decision and a new addendum")
+    new_ids = set(indexed) - set(previous_features)
+    sweeps = candidate.get("sweeps")
+    minimum_sweeps = 1 if previous else 2
+    if not isinstance(sweeps, list) or len(sweeps) < minimum_sweeps:
+        errors.append("Discovery requires an initial source/browser sweep and a full zero-new sweep; later reviews need at least one full zero-new sweep")
+        sweeps = []
+    found: list[str] = []
+    seen_sweeps: set[str] = set()
+    required_sources = {
+        anchor["path"]
+        for feature in features if isinstance(feature, dict)
+        for anchor in feature.get("source_anchors", []) if isinstance(anchor, dict)
+        and isinstance(anchor.get("path"), str)
+    }
+    for sweep in sweeps:
+        if not isinstance(sweep, dict):
+            errors.append("Each discovery sweep must be an object")
+            continue
+        sweep_id = sweep.get("sweep_id")
+        if not isinstance(sweep_id, str) or not sweep_id.strip() or sweep_id in seen_sweeps:
+            errors.append("Discovery sweep IDs must be distinct and named")
+        else:
+            seen_sweeps.add(sweep_id)
+        checked_routes = sweep.get("routes_checked")
+        if not isinstance(checked_routes, list) or any(not isinstance(item, str) for item in checked_routes) or not set(routes).issubset(set(checked_routes)):
+            errors.append(f"Sweep {sweep_id}: every in-scope route must be revisited")
+        checked_sources = sweep.get("source_files_checked")
+        if not isinstance(checked_sources, list) or any(not isinstance(item, str) for item in checked_sources) or not required_sources.issubset(set(checked_sources)):
+            errors.append(f"Sweep {sweep_id}: inspect all relevant A source files")
+        new = sweep.get("new_feature_ids")
+        if not isinstance(new, list) or any(not isinstance(item, str) for item in new):
+            errors.append(f"Sweep {sweep_id}: new_feature_ids must be a list")
+        else:
+            found.extend(new)
+    if sweeps and isinstance(sweeps[-1], dict) and sweeps[-1].get("new_feature_ids") != []:
+        errors.append("One full discovery sweep with zero new features is required before returning")
+    if len(found) != len(set(found)) or set(found) != new_ids:
+        errors.append("Sweep discoveries must account exactly once for newly inventoried A features")
+    return evidence_hashes, source_hashes, errors
+
+
+def record_discovery(directory: Path, project_root: Path, audit_file: str) -> None:
+    candidate = read_json(Path(audit_file))
+    with coordinator_lock(directory):
+        manifest = manifest_at(directory)
+        audits = manifest.setdefault("discovery_audits", {})
+        audit_id = candidate.get("audit_id")
+        if not isinstance(audit_id, str) or not VERSION_ID.fullmatch(audit_id):
+            raise StateError("Discovery audit_id must be a stable lowercase identifier")
+        if audit_id in audits:
+            raise StateError("Discovery audit already exists; keep earlier evidence immutable")
+        previous_id = manifest.get("active_discovery_id")
+        previous = read_json(artifact_file(directory, audits[previous_id]["path"])) if previous_id else None
+        evidence, sources, errors = validate_discovery_audit(directory, project_root, candidate, previous)
+        if candidate.get("scope") != manifest.get("scope"):
+            errors.append("Discovery scope must match the redesign initiative")
+        resolutions = candidate.get("missing_report_resolutions", [])
+        if not isinstance(resolutions, list):
+            errors.append("Discovery missing_report_resolutions must be a list")
+            resolutions = []
+        resolved_ids: set[str] = set()
+        for resolution in resolutions:
+            if not isinstance(resolution, dict):
+                errors.append("Each missing-report resolution must be an object")
+                continue
+            report_id = resolution.get("report_id")
+            report = manifest.get("missing_reports", {}).get(report_id) if isinstance(report_id, str) else None
+            if (not isinstance(report_id, str) or report_id in resolved_ids or not report
+                    or report.get("status") != "open"):
+                errors.append(f"Unknown, repeated or already resolved missing report: {report_id!r}")
+                continue
+            resolved_ids.add(report_id)
+            if (resolution.get("resolution") != "not_missing"
+                    or resolution.get("confirmed_by_user") is not True
+                    or not str(resolution.get("user_note") or "").strip()):
+                errors.append(f"Missing report {report_id}: only explicit user-confirmed not_missing corrections can dismiss a report")
+            paths = resolution.get("evidence_paths")
+            if not isinstance(paths, list) or not paths:
+                errors.append(f"Missing report {report_id}: dismissal requires fresh investigation evidence")
+            for relative in paths if isinstance(paths, list) else []:
+                try:
+                    evidence[relative] = digest_of(artifact_file(directory, relative))
+                except (StateError, OSError) as error:
+                    errors.append(f"Missing report {report_id}: {error}")
+        if errors:
+            raise StateError("Discovery BLOCKED: " + "; ".join(errors))
+        relative = f"discovery/audits/{audit_id}.json"
+        if (directory / relative).exists():
+            raise StateError("Refusing to overwrite an existing discovery audit")
+        atomic_json(directory / relative, candidate)
+        audits[audit_id] = {
+            "path": relative, "sha256": digest_of(directory / relative),
+            "evidence_hashes": evidence, "source_hashes_at_discovery": sources,
+            "feature_ids": [item["feature_id"] for item in candidate["features"]],
+        }
+        manifest["active_discovery_id"] = audit_id
+        previous_ids = {item["feature_id"] for item in previous["features"]} if previous else set()
+        newly_found = set(audits[audit_id]["feature_ids"]) - previous_ids
+        for report_id in resolved_ids:
+            manifest["missing_reports"][report_id]["status"] = "dismissed"
+            manifest["missing_reports"][report_id]["resolution_audit_id"] = audit_id
+        active_approval = manifest.get("approvals", {}).get(manifest.get("active_approval_id"))
+        original_audit_id = (active_approval.get("functionality_coverage") or {}).get("audit_id") if active_approval else None
+        original_features = set(audits.get(original_audit_id, {}).get("feature_ids", []))
+        uncovered_ids = set(audits[audit_id]["feature_ids"]) - original_features if active_approval else set()
+        open_reports = [report_id for report_id, report in manifest.get("missing_reports", {}).items()
+                        if report.get("status") == "open"]
+        if active_approval and (uncovered_ids or open_reports):
+            manifest["coverage_pending"] = True
+            manifest["stage"] = "prototype"
+            if newly_found:
+                message = ("Discovered additional application-A behavior after prototype approval: "
+                           + ", ".join(sorted(newly_found)))
+                if message not in manifest["blockers"]:
+                    manifest["blockers"].append(message)
+            manifest["next_action"] = ("Completed a full discovery sweep. Repair missing A-to-B behaviors in NEW B source and "
+                                       "verify a NEW version for user reapproval; preserve old decisions. "
+                                       "Unconfirmed false alarms require explicit user-approved dismissal")
+        elif active_approval and manifest.get("coverage_pending"):
+            manifest["coverage_pending"] = False
+            manifest["stage"] = next(
+                (report.get("stage_before_report", "approved")
+                 for report in manifest.get("missing_reports", {}).values()
+                 if report.get("resolution_audit_id") == audit_id),
+                "approved",
+            )
+            manifest["blockers"] = [item for item in manifest["blockers"]
+                                    if not item.startswith(("Missing application-A functionality reported:",
+                                                           "Discovered additional application-A behavior after prototype approval:"))]
+            manifest["next_action"] = "All reports were explicitly corrected and a full zero-new A sweep completed; resume the unchanged approval"
+        elif not active_approval:
+            manifest["stage"] = "prototype"
+            manifest["next_action"] = "Build prototype B from the frozen A functionality inventory, then record parity"
+        journal(directory, {"type": "functionality_discovery_frozen", "audit_id": audit_id,
+                            "new_feature_ids": sorted(newly_found), "source_hashes": sources,
+                            "user_confirmed_resolutions": sorted(resolved_ids)})
+        note_progress(manifest, f"Discovery {audit_id}: {len(candidate['features'])} behaviors; final sweep found zero new")
+        atomic_json(directory / "manifest.json", manifest)
+        atomic_text(directory / "CHECKPOINT.md", render_checkpoint(manifest))
+    print(f"Frozen application-A discovery {audit_id} ({len(candidate['features'])} source-backed behaviors)")
+
+
+def report_missing_feature(directory: Path, report_file: str) -> None:
+    """Protect a suspected postapproval A->B gap without rewriting any approval."""
+    candidate = read_json(Path(report_file))
+    with coordinator_lock(directory):
+        manifest = manifest_at(directory)
+        if not manifest.get("active_approval_id"):
+            raise StateError("Missing-feature recovery needs an existing approved prototype")
+        report_id = candidate.get("report_id")
+        if not isinstance(report_id, str) or not VERSION_ID.fullmatch(report_id):
+            raise StateError("Missing-feature report needs a stable report_id")
+        if report_id in manifest.setdefault("missing_reports", {}):
+            raise StateError("Missing-feature report already exists; do not overwrite its evidence")
+        suspected = candidate.get("suspected_features")
+        if (not isinstance(suspected, list) or not suspected
+                or any(not isinstance(item, str) or not VERSION_ID.fullmatch(item) for item in suspected)
+                or len(set(suspected)) != len(suspected)
+                or not str(candidate.get("summary") or "").strip()):
+            raise StateError("Missing-feature report needs a real summary and distinct suspected feature IDs")
+        paths = candidate.get("evidence_paths")
+        if not isinstance(paths, list) or not paths:
+            raise StateError("Missing-feature report needs actual observation evidence")
+        hashes: dict[str, str] = {}
+        for relative in paths:
+            path = artifact_file(directory, relative)
+            if path.stat().st_size == 0:
+                raise StateError(f"Missing-feature report has empty evidence: {relative}")
+            hashes[relative] = digest_of(path)
+        relative = f"discovery/missing/{report_id}.json"
+        if (directory / relative).exists():
+            raise StateError("Refusing to overwrite previous missing-feature evidence")
+        atomic_json(directory / relative, candidate)
+        manifest["missing_reports"][report_id] = {
+            "path": relative, "sha256": digest_of(directory / relative),
+            "evidence_hashes": hashes, "status": "open",
+            "discovery_at_report": manifest.get("active_discovery_id"),
+            "approval_id": manifest["active_approval_id"],
+            "stage_before_report": manifest.get("stage"),
+            "suspected_features": suspected,
+        }
+        manifest["coverage_pending"] = True
+        manifest["stage"] = "discover"
+        blocker = f"Missing application-A functionality reported: {report_id} ({', '.join(suspected)})"
+        if blocker not in manifest["blockers"]:
+            manifest["blockers"].append(blocker)
+        manifest["next_action"] = ("Investigate missing A functionality across affected UI, source, API, roles and "
+                                   "states. Freeze a follow-up discovery with a complete zero-new sweep; "
+                                   "then create and verify new B and seek explicit reapproval")
+        journal(directory, {"type": "application_a_functionality_missing", "report_id": report_id,
+                            "approval_id": manifest["active_approval_id"], "suspected_features": suspected})
+        note_progress(manifest, f"Postapproval A-to-B coverage gap {report_id}: investigation required")
+        atomic_json(directory / "manifest.json", manifest)
+        atomic_text(directory / "CHECKPOINT.md", render_checkpoint(manifest))
+    print(f"Recorded missing application-A behavior {report_id}; old user approval unchanged, follow-up sweep REQUIRED")
+
+
+def record_prototype_coverage(directory: Path, coverage_file: str) -> None:
+    """Freeze exact A-feature -> B-interaction proof before prototype review."""
+    candidate = read_json(Path(coverage_file))
+    with coordinator_lock(directory):
+        manifest = manifest_at(directory)
+        audit_id = manifest.get("active_discovery_id")
+        audits = manifest.get("discovery_audits", {})
+        if not audit_id or audit_id not in audits:
+            raise StateError("Functionality coverage BLOCKED: first freeze a source/browser application-A discovery")
+        version = candidate.get("prototype_version")
+        if not isinstance(version, str) or not VERSION_ID.fullmatch(version):
+            raise StateError("Prototype functionality coverage needs a stable prototype_version")
+        if candidate.get("audit_id") != audit_id:
+            raise StateError("Prototype functionality coverage must use the latest A discovery audit")
+        if version in manifest.setdefault("prototype_coverage", {}):
+            raise StateError("Prototype functionality coverage is already frozen; use a new prototype version")
+        audit = read_json(artifact_file(directory, audits[audit_id]["path"]))
+        required = {item["feature_id"] for item in audit["features"]}
+        for report_id, report in manifest.get("missing_reports", {}).items():
+            if report.get("status") != "open":
+                continue
+            if audit_id == report.get("discovery_at_report"):
+                raise StateError(f"Functionality coverage BLOCKED: missing report {report_id} still needs a full follow-up A sweep")
+            if not set(report.get("suspected_features", [])).issubset(required):
+                raise StateError(f"Functionality coverage BLOCKED: reported feature {report_id} is absent from A; seek explicit user correction")
+        mappings = candidate.get("mappings")
+        if not isinstance(mappings, list):
+            raise StateError("Prototype needs a concrete mapping for every application-A behavior")
+        seen: set[str] = set()
+        errors: list[str] = []
+        evidence_hashes: dict[str, str] = {}
+        for entry in mappings:
+            if not isinstance(entry, dict):
+                errors.append("Prototype behavior mapping must be an object")
+                continue
+            feature_id = entry.get("feature_id")
+            if not isinstance(feature_id, str) or feature_id not in required or feature_id in seen:
+                errors.append(f"Unknown or repeated prototype feature mapping: {feature_id!r}")
+                continue
+            seen.add(feature_id)
+            status = entry.get("status")
+            if status not in {"PASS", "IMAGE_ONLY_EXCEPTION"}:
+                errors.append(f"Feature {feature_id}: functionality must pass an interaction replay")
+                continue
+            sources = entry.get("prototype_source_paths")
+            if status == "PASS" and (not isinstance(sources, list) or not sources):
+                errors.append(f"Feature {feature_id}: B requires runnable source paths, not a visual imitation")
+            for relative in sources if isinstance(sources, list) else []:
+                if not isinstance(relative, str) or not relative.startswith(f"prototype/versions/{version}/"):
+                    errors.append(f"Feature {feature_id}: source must belong to prototype version {version}")
+                    continue
+                try:
+                    evidence_hashes[relative] = digest_of(artifact_file(directory, relative))
+                except (StateError, OSError) as error:
+                    errors.append(f"Feature {feature_id}: {error}")
+            proofs = entry.get("test_evidence")
+            if status == "PASS" and (not isinstance(proofs, list) or not proofs):
+                errors.append(f"Feature {feature_id}: passing browser/interaction evidence is required")
+            for relative in proofs if isinstance(proofs, list) else []:
+                try:
+                    proof = read_json(artifact_file(directory, relative))
+                    if (proof.get("feature_id") != feature_id or proof.get("result") != "PASS"
+                            or not str(proof.get("command") or "").strip()
+                            or not isinstance(proof.get("observed_steps"), list)
+                            or not proof["observed_steps"]):
+                        errors.append(f"Feature {feature_id}: test proof must identify real exercised actions and PASS")
+                    evidence_hashes[relative] = digest_of(artifact_file(directory, relative))
+                except (StateError, OSError) as error:
+                    errors.append(f"Feature {feature_id}: {error}")
+        if seen != required:
+            errors.append("Unmapped application-A functionality: " + ", ".join(sorted(required - seen)))
+        if errors:
+            raise StateError("Functionality coverage BLOCKED: " + "; ".join(errors))
+        relative = f"coverage/versions/{version}.json"
+        if (directory / relative).exists():
+            raise StateError("Refusing to overwrite a previous prototype functionality contract")
+        atomic_json(directory / relative, candidate)
+        manifest["prototype_coverage"][version] = {
+            "audit_id": audit_id, "path": relative,
+            "sha256": digest_of(directory / relative),
+            "evidence_hashes": evidence_hashes,
+            "feature_ids": sorted(required),
+            "exception_ids": [entry["feature_id"] for entry in mappings
+                              if entry["status"] == "IMAGE_ONLY_EXCEPTION"],
+        }
+        manifest["stage"] = "prototype"
+        manifest["next_action"] = ("Prototype parity evidence frozen. Present exact runnable B and screenshots "
+                                   "for user review; no production implementation before explicit approval")
+        journal(directory, {"type": "prototype_functionality_verified", "version": version,
+                            "audit_id": audit_id, "feature_ids": sorted(required)})
+        note_progress(manifest, f"Prototype {version}: all {len(required)} A behaviors mapped with evidence")
+        atomic_json(directory / "manifest.json", manifest)
+        atomic_text(directory / "CHECKPOINT.md", render_checkpoint(manifest))
+    print(f"Prototype {version} functionality coverage verified ({len(required)} A behaviors)")
+
+
 def png_dimensions(path: Path) -> tuple[int, int]:
     """Reject bogus/truncated PNG evidence and return its actual pixel dimensions."""
     data = path.read_bytes()
@@ -377,6 +765,23 @@ def validate_approval_record(directory: Path, value: dict, existing: dict) -> tu
     mode = value.get("mode")
     if mode not in {"source", "image-only"}:
         errors.append("Approval mode must be source or image-only")
+    parity = existing.get("prototype_coverage", {}).get(version)
+    audit_id = existing.get("active_discovery_id")
+    if not parity or not audit_id or parity.get("audit_id") != audit_id:
+        errors.append("Mandatory A-to-B functionality coverage is missing or stale; run discovery-record and prototype-coverage before presenting approval")
+    elif parity.get("exception_ids") and not (
+        mode == "image-only" and value.get("image_only_approved") is True
+        and str(value.get("image_only_reason") or "").strip()
+    ):
+        errors.append("Prototype has unverified functionality exceptions without explicit user-approved image-only mode")
+    latest_features = set(existing.get("discovery_audits", {}).get(audit_id, {}).get("feature_ids", []))
+    for report_id, report in existing.get("missing_reports", {}).items():
+        if report.get("status") != "open":
+            continue
+        if report.get("discovery_at_report") == audit_id:
+            errors.append(f"Missing report {report_id} requires a new full A discovery sweep before reapproval")
+        if not set(report.get("suspected_features", [])).issubset(latest_features):
+            errors.append(f"Missing report {report_id} must be inventoried in A or explicitly dismissed by the user")
     sources = value.get("source_paths", [])
     assets = value.get("asset_paths", [])
     if not isinstance(sources, list) or not isinstance(assets, list):
@@ -424,7 +829,12 @@ def validate_approval_record(directory: Path, value: dict, existing: dict) -> tu
             except (StateError, OSError) as error:
                 errors.append(str(error))
     frozen = {**value, "approved_at": utc_now(), "artifact_hashes": digests,
-              "replay_required": mode == "source"}
+              "replay_required": mode == "source",
+              "functionality_coverage": {
+                  "audit_id": audit_id,
+                  "prototype_version": version,
+                  "contract_sha256": parity.get("sha256"),
+              } if parity else None}
     return frozen, errors
 
 
@@ -471,6 +881,7 @@ def journal(directory: Path, item: dict) -> None:
 
 def render_checkpoint(manifest: dict) -> str:
     recent = manifest.get("last_checkpoint") or {}
+    work = manifest.get("work_items", {}).get(manifest.get("active_work_id"))
     lines = [
         f"# Redesign checkpoint: {manifest['initiative_id']}", "",
         "This is a recovery index. The manifest, journal, approved files, and live repository are authoritative.",
@@ -478,6 +889,23 @@ def render_checkpoint(manifest: dict) -> str:
         f"Approved prototype: {manifest.get('approved_version') or 'none'}",
         f"Active approval: {manifest.get('active_approval_id') or 'none'}",
         f"Next action: {manifest.get('next_action') or 'UNSET'}", "",
+        "## Exact continuation cursor", "",
+    ]
+    if work:
+        lines.extend([
+            f"- Task: {work['task_id']}",
+            f"- Phase: {work['phase']}",
+            f"- Status: {work['status'].upper()}",
+            f"- Last saved: {work.get('updated_at', 'unknown')}",
+            f"- Resume action: {work['next_action']}",
+            "- Completed steps: " + ("; ".join(work.get("completed_steps", [])) or "none"),
+            "- Pending steps: " + ("; ".join(work.get("pending_steps", [])) or "none"),
+            "- Code paths: " + ("; ".join(work.get("code_paths", [])) or "none"),
+            "- Evidence paths: " + ("; ".join(work.get("artifact_paths", [])) or "none"),
+        ])
+    else:
+        lines.append("No unfinished task cursor; follow the next action above and start a work task before acting.")
+    lines += ["",
         "## Recent progress", "",
         recent.get("summary") or "No checkpoint summary yet.", "",
         "## Completed", "",
@@ -491,6 +919,10 @@ def render_checkpoint(manifest: dict) -> str:
     lines += ["", "## Slices", ""]
     for slice_id, item in sorted(manifest.get("slices", {}).items()):
         lines.append(f"- {slice_id}: {item.get('status', 'unknown')} ({item.get('owner', 'unassigned')})")
+    lines += ["", "## Functionality coverage", ""]
+    lines.append(f"- Latest application-A audit: {manifest.get('active_discovery_id') or 'none'}")
+    lines.append(f"- Prototype parity versions: {', '.join(sorted(manifest.get('prototype_coverage', {}))) or 'none'}")
+    lines.append(f"- Additional A functionality pending review: {'YES — BLOCKED' if manifest.get('coverage_pending') else 'no'}")
     lines += ["", "## Capture warnings needing user review", ""]
     pending = [
         f"- {slice_id}: {', '.join(item.get('warning_case_ids') or [])} (provisional, NOT accepted); gallery: {item.get('warning_gallery_file', 'UNAVAILABLE')}"
@@ -560,6 +992,14 @@ def add_event(directory: Path, event_file: str) -> None:
         raise StateError("Event needs a recognized type and nonempty summary")
     with coordinator_lock(directory):
         manifest = manifest_at(directory)
+        active = manifest.get("work_items", {}).get(manifest.get("active_work_id"))
+        if active and "next_action" in value and value["next_action"] != active.get("next_action"):
+            raise StateError("An active task owns its next action; use work-update to change the continuation cursor")
+        if active and active.get("status") == "blocked" and "blockers" in value:
+            prefix = f"Work {active['task_id']}:"
+            expected = {f"{prefix} {reason}" for reason in active["blockers"]}
+            if not isinstance(value["blockers"], list) or not expected.issubset(value["blockers"]):
+                raise StateError("Cannot hide a blocked task by clearing checkpoint blockers; use work-update")
         journal(directory, value)
         if "next_action" in value:
             manifest["next_action"] = value["next_action"]
@@ -578,6 +1018,14 @@ def checkpoint(directory: Path, checkpoint_file: str) -> None:
         raise StateError("Checkpoint needs a summary and only allowed recovery fields")
     with coordinator_lock(directory):
         manifest = manifest_at(directory)
+        active = manifest.get("work_items", {}).get(manifest.get("active_work_id"))
+        if active and "next_action" in value and value["next_action"] != active.get("next_action"):
+            raise StateError("An active task owns its next action; use work-update to change the continuation cursor")
+        if active and active.get("status") == "blocked" and "blockers" in value:
+            prefix = f"Work {active['task_id']}:"
+            expected = {f"{prefix} {reason}" for reason in active["blockers"]}
+            if not isinstance(value["blockers"], list) or not expected.issubset(value["blockers"]):
+                raise StateError("Cannot hide a blocked task by clearing checkpoint blockers; use work-update")
         manifest["last_checkpoint"] = {
             "at": utc_now(), "summary": value["summary"],
             "completed": value.get("completed", []), "owner": value.get("owner", "coordinator"),
@@ -595,6 +1043,80 @@ def checkpoint(directory: Path, checkpoint_file: str) -> None:
     print(f"Checkpoint saved: {directory / 'CHECKPOINT.md'}")
 
 
+def work_update(directory: Path, project_root: Path, work_file: str) -> None:
+    """Persist an exact restart cursor before/after each meaningful work step."""
+    value = read_json(Path(work_file))
+    required = {"task_id", "phase", "status", "summary", "next_action",
+                "completed_steps", "pending_steps", "blockers", "code_paths", "artifact_paths"}
+    if set(value) != required:
+        raise StateError("Work cursor needs exactly: " + ", ".join(sorted(required)))
+    task_id = value["task_id"]
+    if not isinstance(task_id, str) or not INITIATIVE_ID.fullmatch(task_id):
+        raise StateError("Task ID must be a stable lowercase identifier")
+    if (not isinstance(value["phase"], str) or value["phase"] not in VALID_STAGES
+            or not isinstance(value["status"], str) or value["status"] not in VALID_WORK_STATUSES):
+        raise StateError("Work cursor needs an actual redesign phase and recognized status")
+    for field in ("summary", "next_action"):
+        if not isinstance(value[field], str) or not value[field].strip():
+            raise StateError(f"Work cursor requires a concrete {field}")
+    for field in ("completed_steps", "pending_steps", "blockers", "code_paths", "artifact_paths"):
+        entries = value[field]
+        if (not isinstance(entries, list) or any(not isinstance(item, str) or not item.strip() for item in entries)
+                or len(entries) != len(set(entries))):
+            raise StateError(f"Work cursor {field} must be a list of distinct, meaningful strings")
+    if value["status"] == "done" and (value["pending_steps"] or value["blockers"]):
+        raise StateError("A task cannot be done with pending steps or blockers")
+    if value["status"] == "blocked" and not value["blockers"]:
+        raise StateError("Blocked work needs a recorded concrete blocker")
+    if value["status"] != "blocked" and value["blockers"]:
+        raise StateError("Only blocked work may have unresolved task blockers")
+    if value["status"] != "done" and not value["pending_steps"]:
+        raise StateError("Unfinished work needs an explicit pending step for resumption")
+    with coordinator_lock(directory):
+        manifest = manifest_at(directory)
+        items = manifest.setdefault("work_items", {})
+        existing = items.get(task_id)
+        active_id = manifest.get("active_work_id")
+        if active_id and active_id != task_id:
+            raise StateError(f"Another task is active ({active_id}); finish it before starting {task_id}")
+        if existing and existing["status"] == "done":
+            raise StateError("Completed task history cannot be rewritten; use a new task ID")
+        if existing:
+            if value["phase"] != existing["phase"]:
+                raise StateError("An existing work task cannot silently change phase")
+            old_completed = set(existing["completed_steps"])
+            old_pending = set(existing["pending_steps"])
+            if not old_completed.issubset(value["completed_steps"]):
+                raise StateError("Previously completed task steps cannot be forgotten")
+            if not old_pending.issubset(set(value["completed_steps"]) | set(value["pending_steps"])):
+                raise StateError("Previously pending task steps cannot disappear without being completed")
+        elif value["phase"] != manifest.get("stage"):
+            raise StateError(f"New work phase {value['phase']} conflicts with current stage {manifest.get('stage')}")
+        code_paths = sorted(set(value["code_paths"]) | set(existing.get("code_paths", []) if existing else []))
+        artifact_paths = sorted(set(value["artifact_paths"]) | set(existing.get("artifact_paths", []) if existing else []))
+        code_hashes = {path: digest_of(project_source_file(project_root, path)) for path in code_paths}
+        artifact_hashes = {path: digest_of(artifact_file(directory, path)) for path in artifact_paths}
+        repository_head, worktree_status = git_info(project_root)
+        recorded = {**value, "code_paths": code_paths, "artifact_paths": artifact_paths,
+                    "code_hashes": code_hashes, "artifact_hashes": artifact_hashes,
+                    "repository_head": repository_head, "worktree_status": worktree_status,
+                    "created_at": existing["created_at"] if existing else utc_now(),
+                    "updated_at": utc_now(), "revision": existing["revision"] + 1 if existing else 1}
+        items[task_id] = recorded
+        manifest["active_work_id"] = None if value["status"] == "done" else task_id
+        manifest["next_action"] = value["next_action"]
+        prefix = f"Work {task_id}:"
+        manifest["blockers"] = [item for item in manifest.get("blockers", []) if not item.startswith(prefix)]
+        if value["status"] == "blocked":
+            manifest["blockers"].extend(f"{prefix} {reason}" for reason in value["blockers"])
+        journal(directory, {"type": "work_cursor_updated", "task": recorded})
+        note_progress(manifest, f"Task {task_id}: {value['status']} — {value['summary']}",
+                      completed=f"Finished task {task_id}" if value["status"] == "done" else None)
+        atomic_json(directory / "manifest.json", manifest)
+        atomic_text(directory / "CHECKPOINT.md", render_checkpoint(manifest))
+    print(f"Work cursor {task_id}: {value['status']} (revision {recorded['revision']})")
+
+
 def approve(directory: Path, approval_file: str) -> None:
     candidate = read_json(Path(approval_file))
     with coordinator_lock(directory):
@@ -609,12 +1131,21 @@ def approve(directory: Path, approval_file: str) -> None:
             "approval": approval,
         })
         manifest["approvals"][approval["decision_id"]] = approval
+        for report in manifest.get("missing_reports", {}).values():
+            if report.get("status") == "open":
+                report["status"] = "addressed"
+                report["addressed_by_approval"] = approval["decision_id"]
         manifest.update({
             "active_approval_id": approval["decision_id"],
             "approved_version": approval["approved_version"],
             "stage": "approved",
             "references": approval["visual_cases"],
-            "blockers": [],
+            "blockers": [
+                item for item in manifest.get("blockers", [])
+                if not item.startswith(("Missing application-A functionality reported:",
+                                        "Discovered additional application-A behavior after prototype approval:"))
+            ],
+            "coverage_pending": False,
             "next_action": "Create complete slice contracts grounded in the locked prototype",
         })
         note_progress(manifest, f"Approved prototype {approval['approved_version']}, decision {approval['decision_id']}",
@@ -666,7 +1197,7 @@ def create_slice(directory: Path, contract_file: str) -> None:
     candidate = read_json(Path(contract_file))
     with coordinator_lock(directory):
         manifest = manifest_at(directory)
-        approval_errors = check_approval(directory, manifest)
+        approval_errors = check_approval(directory, manifest) + check_coverage_records(directory, manifest)
         if approval_errors:
             raise StateError("Cannot assign slice: " + "; ".join(approval_errors))
         active_id = manifest.get("active_approval_id")
@@ -791,6 +1322,8 @@ def worker_report(directory: Path, slice_id: str, owner: str, report_file: str) 
         raise StateError("Worker identity and slice assignment must match exactly")
     if report.get("status") not in {"submitted", "blocked"} or not str(report.get("summary") or "").strip():
         raise StateError("Worker report needs status submitted/blocked and a summary")
+    if manifest.get("coverage_pending") and report.get("status") != "blocked":
+        raise StateError("New application-A functionality is pending investigation; implementation reports cannot claim completion")
     if not isinstance(report.get("implementation_paths"), list) or not all(
         isinstance(p, str) and any(ownership_overlaps(p, q) for q in assigned["allowed_paths"])
         for p in report["implementation_paths"]
@@ -1323,8 +1856,111 @@ def decide_warning(directory: Path, warning_id: str, decision_file: str) -> None
     print(f"Visual warning {warning_id}: {warning['status']}")
 
 
+def check_coverage_records(directory: Path, manifest: dict) -> list[str]:
+    """Protect approved source/browser discoveries across sessions and compaction."""
+    errors: list[str] = []
+    audits = manifest.get("discovery_audits", {})
+    active_id = manifest.get("active_discovery_id")
+    if active_id and active_id not in audits:
+        errors.append("Active A discovery audit is missing from the manifest")
+    for audit_id, item in audits.items():
+        for relative, expected in {item["path"]: item["sha256"], **item.get("evidence_hashes", {})}.items():
+            try:
+                if digest_of(artifact_file(directory, relative)) != expected:
+                    errors.append(f"Discovery {audit_id}: changed protected evidence {relative}")
+            except (StateError, OSError) as error:
+                errors.append(f"Discovery {audit_id}: {error}")
+    for version, item in manifest.get("prototype_coverage", {}).items():
+        if item.get("audit_id") not in audits:
+            errors.append(f"Functionality coverage {version}: referenced A audit is missing")
+        for relative, expected in {item["path"]: item["sha256"], **item.get("evidence_hashes", {})}.items():
+            try:
+                if digest_of(artifact_file(directory, relative)) != expected:
+                    errors.append(f"Functionality coverage {version}: changed protected evidence {relative}")
+            except (StateError, OSError) as error:
+                errors.append(f"Functionality coverage {version}: {error}")
+    for report_id, item in manifest.get("missing_reports", {}).items():
+        for relative, expected in {item["path"]: item["sha256"], **item.get("evidence_hashes", {})}.items():
+            try:
+                if digest_of(artifact_file(directory, relative)) != expected:
+                    errors.append(f"Missing feature {report_id}: changed protected evidence {relative}")
+            except (StateError, OSError) as error:
+                errors.append(f"Missing feature {report_id}: {error}")
+    for approval_id, approval in manifest.get("approvals", {}).items():
+        bound = approval.get("functionality_coverage")
+        if not bound:
+            # Read-only compatibility for approvals frozen before this stronger gate existed.
+            continue
+        record = manifest.get("prototype_coverage", {}).get(bound.get("prototype_version"))
+        if (not record or bound.get("contract_sha256") != record.get("sha256")
+                or bound.get("audit_id") != record.get("audit_id")):
+            errors.append(f"Approved {approval_id}: immutable A-to-B functionality contract is missing or changed")
+    if manifest.get("coverage_pending"):
+        errors.append("New or suspected application-A functionality needs a complete follow-up sweep and prototype parity review")
+    return errors
+
+
+def check_work_state(directory: Path, manifest: dict) -> list[str]:
+    """Detect progress/status drift before a session trusts its restart cursor."""
+    errors: list[str] = []
+    items = manifest.get("work_items", {})
+    if not isinstance(items, dict):
+        return ["Work history is not a task dictionary"]
+    active_id = manifest.get("active_work_id")
+    if active_id and active_id not in items:
+        return [f"Active work cursor {active_id} is missing"]
+    unfinished = [task_id for task_id, item in items.items()
+                  if isinstance(item, dict) and item.get("status") != "done"]
+    if not active_id and unfinished:
+        errors.append("Unfinished work exists but its active cursor was lost: " + ", ".join(sorted(unfinished)))
+    if active_id and any(task_id != active_id for task_id in unfinished):
+        errors.append("Multiple unfinished work tasks conflict with the active cursor")
+    for task_id, item in items.items():
+        if not isinstance(item, dict) or item.get("task_id") != task_id:
+            errors.append(f"Task {task_id}: malformed work cursor")
+            continue
+        if item.get("status") not in VALID_WORK_STATUSES or item.get("phase") not in VALID_STAGES:
+            errors.append(f"Task {task_id}: invalid saved phase or status")
+        if item.get("status") == "done" and (item.get("pending_steps") or item.get("blockers")):
+            errors.append(f"Task {task_id}: marked done with unfinished work")
+    if active_id and active_id in items:
+        active = items[active_id]
+        if active.get("status") == "done":
+            errors.append(f"Completed task {active_id} cannot remain the active cursor")
+        if active.get("phase") != manifest.get("stage"):
+            errors.append(f"Task {active_id}: phase {active.get('phase')} disagrees with stage {manifest.get('stage')}")
+        if active.get("next_action") != manifest.get("next_action"):
+            errors.append(f"Task {active_id}: next action contradicts manifest; update the work cursor")
+        prefix = f"Work {active_id}:"
+        recorded = [item for item in manifest.get("blockers", []) if item.startswith(prefix)]
+        expected = [f"{prefix} {reason}" for reason in active.get("blockers", [])]
+        if active.get("status") == "blocked" and sorted(recorded) != sorted(expected):
+            errors.append(f"Task {active_id}: blocked status/reasons contradict canonical blockers")
+        if active.get("status") != "blocked" and recorded:
+            errors.append(f"Task {active_id}: old blocker remains after recovery")
+    latest_journal_tasks: dict[str, dict] = {}
+    try:
+        with (directory / "decisions.jsonl").open("r", encoding="utf-8") as handle:
+            for line in handle:
+                event = json.loads(line)
+                if isinstance(event, dict) and event.get("type") == "work_cursor_updated":
+                    task = event.get("task")
+                    if isinstance(task, dict) and isinstance(task.get("task_id"), str):
+                        latest_journal_tasks[task["task_id"]] = task
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        errors.append(f"Work decision journal is unreadable: {error}")
+    for task_id, saved in latest_journal_tasks.items():
+        if saved != items.get(task_id):
+            errors.append(f"Task {task_id}: manifest differs from the append-only journal; reconcile task progress")
+    for task_id in set(items) - set(latest_journal_tasks):
+        errors.append(f"Task {task_id}: missing append-only journal history")
+    return errors
+
+
 def check_initiative(directory: Path, manifest: dict) -> list[str]:
     errors = check_approval(directory, manifest)
+    errors.extend(check_coverage_records(directory, manifest))
+    errors.extend(check_work_state(directory, manifest))
     for slice_id, assignment in manifest.get("slices", {}).items():
         status = assignment.get("status")
         blockers = assignment.get("blockers", [])
@@ -1568,7 +2204,112 @@ def git_info(project_root: Path) -> tuple[str | None, str | None]:
     return run("rev-parse", "HEAD"), run("status", "--short")
 
 
+def discover_single_initiative(project_root: Path) -> str:
+    """Find the only existing initiative; never guess between multiple projects."""
+    candidates: set[str] = set()
+    for relative in (HIDDEN_ARTIFACT_ROOT, LEGACY_ARTIFACT_ROOT):
+        base = project_root / relative
+        if base.is_symlink():
+            raise StateError("Initiative root is a symlink; select a verified project directory")
+        if not base.is_dir():
+            continue
+        for candidate in base.iterdir():
+            if (candidate.is_dir() and not candidate.is_symlink()
+                    and INITIATIVE_ID.fullmatch(candidate.name)
+                    and (candidate / "manifest.json").is_file()):
+                candidates.add(candidate.name)
+    if not candidates:
+        raise StateError("No saved redesign initiative in this project; initialize one before resuming")
+    if len(candidates) != 1:
+        raise StateError("Multiple redesign initiatives found: " + ", ".join(sorted(candidates))
+                         + "; select the intended initiative with --initiative-id")
+    return next(iter(candidates))
+
+
+def recent_journal_events(directory: Path, limit: int = 30) -> list[dict]:
+    """Surface recent decisions while retaining the full append-only history on disk."""
+    path = directory / "decisions.jsonl"
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            lines = deque(handle, maxlen=limit)
+        result: list[dict] = []
+        for line in lines:
+            event = json.loads(line)
+            if not isinstance(event, dict):
+                raise ValueError("Non-object event in decision journal")
+            summary = (event.get("summary") or (event.get("task") or {}).get("summary")
+                       or event.get("approved_version") or event.get("type"))
+            result.append({"type": event.get("type"), "at": event.get("at"),
+                           "summary": summary, "decision_id": event.get("decision_id")})
+        return result
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        raise StateError(f"Cannot reconstruct recent decision history from {path}: {error}") from error
+
+
+def build_resume_packet(directory: Path, project_root: Path) -> dict:
+    """Create a read-only, machine-usable continuation plan from durable files."""
+    manifest = manifest_at(directory)
+    active = manifest.get("approvals", {}).get(manifest.get("active_approval_id"))
+    work = manifest.get("work_items", {}).get(manifest.get("active_work_id"))
+    actual_head, actual_status = git_info(project_root)
+    recorded = manifest.get("provenance", {})
+    reconciliation: list[str] = []
+    if recorded.get("repository_head") and recorded["repository_head"] != actual_head:
+        reconciliation.append("Git HEAD changed since the saved repository checkpoint")
+    if recorded.get("worktree_status") and recorded["worktree_status"].strip() != (actual_status or ""):
+        reconciliation.append("Git worktree status changed since the saved repository checkpoint")
+    if work:
+        if work.get("repository_head") and work["repository_head"] != actual_head:
+            reconciliation.append("Git HEAD changed since the task's last saved step")
+        if work.get("worktree_status") is not None and work["worktree_status"] != actual_status:
+            reconciliation.append("Git worktree status changed since the task's last saved step")
+        for path, expected in work.get("code_hashes", {}).items():
+            try:
+                if digest_of(project_source_file(project_root, path)) != expected:
+                    reconciliation.append(f"Code changed since the saved task step: {path}")
+            except (StateError, OSError) as error:
+                reconciliation.append(f"Code from the saved task is unavailable: {path} ({error})")
+        for path, expected in work.get("artifact_hashes", {}).items():
+            try:
+                if digest_of(artifact_file(directory, path)) != expected:
+                    reconciliation.append(f"Task evidence changed since the saved step: {path}")
+            except (StateError, OSError) as error:
+                reconciliation.append(f"Saved task evidence is unavailable: {path} ({error})")
+    errors = check_initiative(directory, manifest)
+    blockers = list(manifest.get("blockers", []))
+    if work:
+        for item in work.get("blockers", []):
+            if item not in blockers:
+                blockers.append(item)
+    return {
+        "initiative_id": manifest["initiative_id"], "initiative_directory": str(directory),
+        "scope": manifest["scope"], "phase": manifest["stage"],
+        "approved_version": manifest.get("approved_version"),
+        "approval_id": manifest.get("active_approval_id"),
+        "approved_source_paths": active.get("source_paths", []) if active else [],
+        "visual_cases": active.get("visual_cases", []) if active else [],
+        "design_direction": manifest.get("design_direction", {}),
+        "decision_journal_file": str(directory / "decisions.jsonl"),
+        "recent_decisions": recent_journal_events(directory),
+        "last_checkpoint": manifest.get("last_checkpoint"),
+        "latest_a_audit": manifest.get("active_discovery_id"),
+        "coverage_pending": manifest.get("coverage_pending", False),
+        "active_work": work,
+        "finished_tasks": sorted(task_id for task_id, item in manifest.get("work_items", {}).items()
+                                 if item.get("status") == "done"),
+        "slices": {key: item.get("status") for key, item in manifest.get("slices", {}).items()},
+        "warnings": {key: item.get("status") for key, item in manifest.get("warnings", {}).items()},
+        "next_action": work.get("next_action") if work else manifest.get("next_action"),
+        "blockers": blockers, "validation_errors": errors,
+        "reconciliation_required": reconciliation,
+        "git_head": actual_head, "git_worktree_status": actual_status,
+        "safe_to_continue": not errors and not reconciliation and not blockers
+        and (not work or work.get("status") == "in_progress"),
+    }
+
+
 def print_resume(directory: Path, project_root: Path) -> list[str]:
+    packet = build_resume_packet(directory, project_root)
     manifest = manifest_at(directory)
     print(render_checkpoint(manifest))
     active = manifest.get("approvals", {}).get(manifest.get("active_approval_id"))
@@ -1580,30 +2321,30 @@ def print_resume(directory: Path, project_root: Path) -> list[str]:
         print("Approved prototype source files:")
         for path in active.get("source_paths", []):
             print(f"- {path}")
-    actual_head, actual_status = git_info(project_root)
-    print(f"Current Git HEAD: {actual_head or 'unavailable (inspect code manually)'}")
-    print(f"Current Git status: {actual_status or ('clean' if actual_status is not None else 'unavailable')}")
-    recorded = manifest.get("provenance", {})
-    if recorded.get("repository_head") and recorded["repository_head"] != actual_head:
-        print("RECONCILE: Git HEAD differs from the recorded checkpoint; inspect changes before continuing")
-    if recorded.get("worktree_status") and recorded["worktree_status"].strip() != (actual_status or ""):
-        print("RECONCILE: Worktree status differs from the recorded checkpoint; inspect changes before continuing")
-    errors = check_initiative(directory, manifest)
-    for error in errors:
+    print(f"Current Git HEAD: {packet['git_head'] or 'unavailable (inspect code manually)'}")
+    print(f"Current Git status: {packet['git_worktree_status'] or ('clean' if packet['git_worktree_status'] is not None else 'unavailable')}")
+    if packet["active_work"]:
+        print(f"RESUME TASK: {packet['active_work']['task_id']} ({packet['active_work']['status']})")
+        print(f"NEXT: {packet['next_action']}")
+    for issue in packet["reconciliation_required"]:
+        print(f"RECONCILE: {issue}")
+    for error in packet["validation_errors"]:
         print(f"BLOCKED: {error}")
-    return errors
+    if packet["active_work"] and packet["active_work"]["status"] == "waiting_user":
+        print("WAITING FOR USER: do not infer or invent the pending approval or decision")
+    return packet["validation_errors"]
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     for name in (
-        "init", "event", "checkpoint", "approve", "revoke-approval", "slice-create", "slice-cancel",
+        "init", "event", "checkpoint", "work-update", "discovery-record", "missing-feature", "prototype-coverage", "approve", "revoke-approval", "slice-create", "slice-cancel",
         "slice-report", "reconcile", "warning-record", "warning-decide", "resume", "validate",
     ):
         sub = commands.add_parser(name)
         sub.add_argument("--project-root", required=True)
-        sub.add_argument("--initiative-id", required=True)
+        sub.add_argument("--initiative-id", required=name not in {"resume", "validate"})
         if name == "init":
             sub.add_argument("--scope", choices=sorted(VALID_SCOPES), required=True)
             sub.add_argument("--next-action")
@@ -1611,6 +2352,14 @@ def main(argv: list[str] | None = None) -> int:
             sub.add_argument("--event-file", required=True)
         if name == "checkpoint":
             sub.add_argument("--checkpoint-file", required=True)
+        if name == "work-update":
+            sub.add_argument("--work-file", required=True)
+        if name == "discovery-record":
+            sub.add_argument("--audit-file", required=True)
+        if name == "missing-feature":
+            sub.add_argument("--report-file", required=True)
+        if name == "prototype-coverage":
+            sub.add_argument("--coverage-file", required=True)
         if name == "approve":
             sub.add_argument("--approval-file", required=True)
         if name == "revoke-approval":
@@ -1633,16 +2382,28 @@ def main(argv: list[str] | None = None) -> int:
         if name == "warning-decide":
             sub.add_argument("--warning-id", required=True)
             sub.add_argument("--decision-file", required=True)
+        if name == "resume":
+            sub.add_argument("--format", choices=["text", "json"], default="text")
     args = parser.parse_args(argv)
     try:
-        directory = location(args.project_root, args.initiative_id)
-        ensure_local_git_ignore(Path(args.project_root).resolve(), directory)
+        project_root = Path(args.project_root).resolve(strict=True)
+        initiative_id = args.initiative_id or discover_single_initiative(project_root)
+        directory = location(str(project_root), initiative_id)
+        ensure_local_git_ignore(project_root, directory)
         if args.command == "init":
             initialize(directory, args.scope, args.next_action)
         elif args.command == "event":
             add_event(directory, args.event_file)
         elif args.command == "checkpoint":
             checkpoint(directory, args.checkpoint_file)
+        elif args.command == "work-update":
+            work_update(directory, project_root, args.work_file)
+        elif args.command == "discovery-record":
+            record_discovery(directory, project_root, args.audit_file)
+        elif args.command == "missing-feature":
+            report_missing_feature(directory, args.report_file)
+        elif args.command == "prototype-coverage":
+            record_prototype_coverage(directory, args.coverage_file)
         elif args.command == "approve":
             approve(directory, args.approval_file)
         elif args.command == "revoke-approval":
@@ -1660,7 +2421,11 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "warning-decide":
             decide_warning(directory, args.warning_id, args.decision_file)
         elif args.command == "resume":
-            return 2 if print_resume(directory, Path(args.project_root).resolve()) else 0
+            if args.format == "json":
+                packet = build_resume_packet(directory, project_root)
+                print(json.dumps(packet, indent=2, ensure_ascii=False, sort_keys=True))
+                return 2 if packet["validation_errors"] else 0
+            return 2 if print_resume(directory, project_root) else 0
         elif args.command == "validate":
             manifest = manifest_at(directory)
             errors = check_initiative(directory, manifest)

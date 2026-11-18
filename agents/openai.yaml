@@ -1,8 +1,10 @@
 interface:
   display_name: Prototype to Production
-  short_description: Prototype and lock faithful web UI redesigns
-  default_prompt: Use $prototype-to-production to redesign this page. Build and visually
-    check a runnable preview, then stop for my approval.
+  short_description: Redesign faithfully and resume saved progress
+  default_prompt: Use $prototype-to-production. If this project has an unfinished
+    redesign, resume its exact saved phase and task. Otherwise discover the existing
+    app, prototype the requested design, verify coverage and visuals, then wait for
+    my approval.
   icon_small: assets/icon.svg
   icon_large: assets/icon.svg
 policy:

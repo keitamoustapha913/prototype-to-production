@@ -1,0 +1,6 @@
+{
+  "report_id": "gap-001",
+  "summary": "REPLACE with the observed, previously uncovered application-A behavior and the B mismatch.",
+  "suspected_features": ["missing-action"],
+  "evidence_paths": ["discovery/evidence/REPLACE_WITH_ACTUAL_BROWSER_OBSERVATION.png"]
+}

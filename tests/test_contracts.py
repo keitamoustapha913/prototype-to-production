@@ -121,6 +121,35 @@ class ContractTests(unittest.TestCase):
         self.assertIn("reconcile --action block", workflow)
         self.assertIn("reconcile --action unblock", workflow)
 
+    def test_discovery_and_parity_are_mandatory_prior_to_prototype_review(self):
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        workflow = (SKILL_ROOT / "references/workflow.md").read_text(encoding="utf-8")
+        reference = (SKILL_ROOT / "references/functionality-discovery.md")
+        self.assertTrue(reference.is_file())
+        self.assertIn("references/functionality-discovery.md", skill)
+        for command in ("discovery-record", "prototype-coverage", "missing-feature"):
+            self.assertIn(command, skill)
+            self.assertIn(command, workflow)
+        for template in ("discovery.template.json", "prototype-coverage.template.json",
+                         "missing-feature.template.json"):
+            with self.subTest(template=template):
+                self.assertTrue((SKILL_ROOT / "assets/project" / template).is_file())
+        self.assertIn("one full zero-new sweep", reference.read_text(encoding="utf-8"))
+        self.assertIn("Never silently dismiss", reference.read_text(encoding="utf-8"))
+
+    def test_compaction_and_fresh_session_recovery_are_mandatory(self):
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        continuity = (SKILL_ROOT / "references/continuity.md").read_text(encoding="utf-8")
+        workflow = (SKILL_ROOT / "references/workflow.md").read_text(encoding="utf-8")
+        self.assertIn("work-update", skill)
+        self.assertIn("resume --project-root", skill)
+        self.assertIn("--format json", skill)
+        self.assertIn("work-update", workflow)
+        self.assertIn("before context compaction", continuity)
+        self.assertIn("after an interruption", continuity.lower())
+        template = json.loads((SKILL_ROOT / "assets/project/work.template.json").read_text())
+        self.assertTrue({"task_id", "phase", "status", "completed_steps", "pending_steps", "next_action"}.issubset(template))
+
 
 if __name__ == "__main__":
     unittest.main()

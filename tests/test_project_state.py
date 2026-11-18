@@ -49,6 +49,29 @@ class ProjectStateTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return result
 
+    def cli_without_id(self, command, *extra, success=True):
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), command, "--project-root", str(self.root), *map(str, extra)],
+            text=True, capture_output=True, env=self.test_env,
+        )
+        if success:
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return result
+
+    def work_update(self, *, task_id="inspect-roles", phase="discover", status="in_progress",
+                    completed_steps=None, pending_steps=None, blockers=None, code_paths=None):
+        payload = {
+            "task_id": task_id, "phase": phase, "status": status,
+            "summary": "Traced the invoice flow and authorization checks",
+            "next_action": "Inspect the permission guard and record the behavior",
+            "completed_steps": completed_steps if completed_steps is not None else ["Identify invoice route"],
+            "pending_steps": pending_steps if pending_steps is not None else ["Inspect permission guard"],
+            "blockers": blockers if blockers is not None else [],
+            "code_paths": code_paths if code_paths is not None else [],
+            "artifact_paths": [],
+        }
+        return self.cli("work-update", "--work-file", self.write_input("work.json", payload))
+
     def init(self):
         self.cli("init", "--scope", "page", "--next-action", "Map billing states")
 
@@ -56,6 +79,83 @@ class ProjectStateTests(unittest.TestCase):
         path = self.root / name
         path.write_text(json.dumps(data), encoding="utf-8")
         return path
+
+    def discovery_audit(self, audit_id="audit-v1", *, include_note=False):
+        source = self.root / "src" / "invoices.ts"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text("export function invoiceSearch() { return 'rows'; }\n", encoding="utf-8")
+        self.artifact("discovery/evidence/invoices.png", png(width=390, height=844))
+        features = [{
+            "feature_id": "invoice-search",
+            "route": "/invoices",
+            "behavior": "Search and filter invoices with retained search state.",
+            "roles": ["manager", "viewer"],
+            "states": ["default", "filtered", "empty"],
+            "source_anchors": [{"path": "src/invoices.ts", "contains": "invoiceSearch"}],
+            "browser_evidence": ["discovery/evidence/invoices.png"],
+        }]
+        if include_note:
+            features.append({
+                "feature_id": "invoice-note",
+                "route": "/invoices",
+                "behavior": "Append an invoice note for permitted users.",
+                "roles": ["manager"],
+                "states": ["detail", "saved"],
+                "source_anchors": [{"path": "src/invoices.ts", "contains": "invoiceSearch"}],
+                "browser_evidence": ["discovery/evidence/invoices.png"],
+            })
+        prior = self.manifest().get("active_discovery_id")
+        new_features = (["invoice-note"] if include_note else []) if prior else [
+            item["feature_id"] for item in features
+        ]
+        return {
+            "audit_id": audit_id, "scope": self.manifest()["scope"], "routes": ["/invoices"],
+            "features": features, "unresolved": [],
+            "sweeps": [
+                {"sweep_id": "source-and-browser", "routes_checked": ["/invoices"],
+                 "source_files_checked": ["src/invoices.ts"],
+                 "new_feature_ids": new_features},
+                {"sweep_id": "independent-cross-check", "routes_checked": ["/invoices"],
+                 "source_files_checked": ["src/invoices.ts"], "new_feature_ids": []},
+            ],
+        }
+
+    def discovery_record(self, audit):
+        return self.cli("discovery-record", "--audit-file", self.write_input("audit.json", audit))
+
+    def prototype_coverage(self, approval, *, features=("invoice-search",)):
+        version = approval["approved_version"]
+        mappings = []
+        for feature_id in features:
+            proof = f"coverage/evidence/{version}/{feature_id}.json"
+            self.artifact(proof, json.dumps({
+                "feature_id": feature_id, "result": "PASS",
+                "command": f"npx playwright test {feature_id}",
+                "observed_steps": ["Open the A-derived flow", "Exercise and confirm its behavior"],
+            }).encode("utf-8"))
+            mappings.append({
+                "feature_id": feature_id,
+                "status": "IMAGE_ONLY_EXCEPTION" if approval["mode"] == "image-only" else "PASS",
+                "prototype_source_paths": approval["source_paths"],
+                "test_evidence": [proof],
+            })
+        return {
+            "prototype_version": version, "audit_id": self.manifest()["active_discovery_id"],
+            "mappings": mappings,
+        }
+
+    def parity_record(self, parity):
+        return self.cli("prototype-coverage", "--coverage-file", self.write_input("parity.json", parity))
+
+    def missing_report(self, report_id="gap-001"):
+        self.artifact("discovery/evidence/missing-feature.png", png(width=390, height=844))
+        report = {
+            "report_id": report_id,
+            "summary": "An unrepresented invoice note action was found after prototype approval.",
+            "suspected_features": ["invoice-note"],
+            "evidence_paths": ["discovery/evidence/missing-feature.png"],
+        }
+        return self.cli("missing-feature", "--report-file", self.write_input("missing.json", report))
 
     def manifest(self):
         return json.loads((self.initiative / "manifest.json").read_text(encoding="utf-8"))
@@ -125,6 +225,12 @@ class ProjectStateTests(unittest.TestCase):
         }
 
     def approve(self, approval):
+        # Model a complete prior discovery/parity stage for unrelated acceptance tests.
+        # Tests that assert the mandatory gate call the CLI directly instead.
+        if not self.manifest().get("active_discovery_id"):
+            self.discovery_record(self.discovery_audit())
+        if approval["approved_version"] not in self.manifest()["prototype_coverage"]:
+            self.parity_record(self.prototype_coverage(approval))
         approval_file = self.write_input("approve.json", approval)
         return self.cli("approve", "--approval-file", approval_file)
 
@@ -413,6 +519,124 @@ class ProjectStateTests(unittest.TestCase):
         self.assertIn("abcd1234", rehydrated)
         self.assertIn("Prototype B working", (self.initiative / "CHECKPOINT.md").read_text())
 
+    def test_fresh_cli_session_recovers_exact_in_progress_work_without_initiative_id(self):
+        self.init()
+        self.cli("event", "--event-file", self.write_input("design-decision.json", {
+            "type": "style", "summary": "User chose high-contrast table styling",
+        }))
+        self.work_update()
+        packet = json.loads(self.cli_without_id("resume", "--format", "json").stdout)
+        self.assertTrue(packet["safe_to_continue"])
+        self.assertEqual(packet["initiative_id"], "billing-refresh")
+        self.assertEqual(packet["phase"], "discover")
+        self.assertEqual(packet["active_work"]["task_id"], "inspect-roles")
+        self.assertEqual(packet["active_work"]["status"], "in_progress")
+        self.assertEqual(packet["active_work"]["completed_steps"], ["Identify invoice route"])
+        self.assertEqual(packet["active_work"]["pending_steps"], ["Inspect permission guard"])
+        self.assertIn("Inspect the permission guard", packet["next_action"])
+        self.assertIn("User chose high-contrast table styling",
+                      [item["summary"] for item in packet["recent_decisions"]])
+        self.assertTrue(Path(packet["decision_journal_file"]).is_file())
+        self.assertIn("inspect-roles", (self.initiative / "CHECKPOINT.md").read_text())
+
+    def test_resume_without_id_rejects_ambiguous_projects(self):
+        self.init()
+        self.cli("init", "--initiative-id", "other-refresh", "--scope", "page")
+        ambiguous = self.cli_without_id("resume", "--format", "json", success=False)
+        self.assertEqual(ambiguous.returncode, 2)
+        self.assertIn("billing-refresh", ambiguous.stderr)
+        self.assertIn("other-refresh", ambiguous.stderr)
+
+    def test_task_cursor_cannot_skip_unfinished_steps_or_replace_an_active_task(self):
+        self.init()
+        self.work_update()
+        rejected = self.cli("work-update", "--work-file", self.write_input("other.json", {
+            "task_id": "build-prototype", "phase": "discover", "status": "in_progress",
+            "summary": "Skipped ahead", "next_action": "Make new design",
+            "completed_steps": [], "pending_steps": ["Build"],
+            "blockers": [], "code_paths": [], "artifact_paths": [],
+        }), success=False)
+        self.assertIn("active", rejected.stderr.lower())
+        incomplete = self.cli("work-update", "--work-file", self.write_input("done.json", {
+            "task_id": "inspect-roles", "phase": "discover", "status": "done",
+            "summary": "Finished all", "next_action": "Start prototype",
+            "completed_steps": ["Identify invoice route"],
+            "pending_steps": ["Inspect permission guard"],
+            "blockers": [], "code_paths": [], "artifact_paths": [],
+        }), success=False)
+        self.assertIn("pending", incomplete.stderr.lower())
+        self.assertEqual(self.manifest()["active_work_id"], "inspect-roles")
+
+    def test_blocked_cursor_survives_compaction_and_never_says_ready(self):
+        self.init()
+        self.work_update(status="blocked", blockers=["API fixture missing"])
+        packet = json.loads(self.cli("resume", "--format", "json").stdout)
+        self.assertFalse(packet["safe_to_continue"])
+        self.assertEqual(packet["active_work"]["status"], "blocked")
+        self.assertIn("API fixture missing", packet["blockers"])
+        self.assertIn("BLOCKED", (self.initiative / "CHECKPOINT.md").read_text())
+
+    def test_resume_detects_external_code_changes_since_last_saved_work_step(self):
+        self.init()
+        code = self.root / "src" / "invoice.tsx"
+        code.parent.mkdir()
+        code.write_text("export const Invoice = () => null;", encoding="utf-8")
+        self.work_update(code_paths=["src/invoice.tsx"])
+        code.write_text("export const Invoice = () => <table />;", encoding="utf-8")
+        packet = json.loads(self.cli("resume", "--format", "json").stdout)
+        self.assertFalse(packet["safe_to_continue"])
+        self.assertIn("src/invoice.tsx", " ".join(packet["reconciliation_required"]))
+
+    def test_completed_work_is_preserved_and_fresh_session_uses_next_phase_step(self):
+        self.init()
+        self.work_update()
+        self.work_update(status="done", completed_steps=["Identify invoice route", "Inspect permission guard"],
+                         pending_steps=[])
+        packet = json.loads(self.cli_without_id("resume", "--format", "json").stdout)
+        self.assertIsNone(packet["active_work"])
+        self.assertEqual(packet["finished_tasks"], ["inspect-roles"])
+        self.assertEqual(self.manifest()["work_items"]["inspect-roles"]["status"], "done")
+        self.assertTrue(packet["safe_to_continue"])
+
+    def test_waiting_for_user_is_not_interpreted_as_permission_to_continue(self):
+        self.init()
+        self.work_update(status="waiting_user", pending_steps=["Wait for user to select design option"])
+        packet = json.loads(self.cli("resume", "--format", "json").stdout)
+        self.assertFalse(packet["safe_to_continue"])
+        self.assertEqual(packet["active_work"]["status"], "waiting_user")
+
+    def test_generic_checkpoint_cannot_clear_a_blocked_work_cursor(self):
+        self.init()
+        self.work_update(status="blocked", blockers=["Unavailable preview server"])
+        blocked = self.cli("checkpoint", "--checkpoint-file", self.write_input("bad-checkpoint.json", {
+            "summary": "Everything ready", "next_action": "Inspect the permission guard and record the behavior",
+            "blockers": [],
+        }), success=False)
+        self.assertIn("cannot hide", blocked.stderr.lower())
+        self.assertEqual(self.manifest()["work_items"]["inspect-roles"]["status"], "blocked")
+        self.cli("validate")
+
+    def test_lost_active_cursor_is_not_mistaken_for_finished_work_after_interruption(self):
+        self.init()
+        self.work_update()
+        manifest = self.manifest()
+        manifest["active_work_id"] = None
+        (self.initiative / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+        packet = json.loads(self.cli("resume", "--format", "json", success=False).stdout)
+        self.assertFalse(packet["safe_to_continue"])
+        self.assertIn("unfinished work", " ".join(packet["validation_errors"]).lower())
+
+    def test_journal_catches_accidentally_reverted_task_progress(self):
+        self.init()
+        self.work_update()
+        self.work_update(completed_steps=["Identify invoice route", "Inspect permission guard"],
+                         pending_steps=["Inspect error route"])
+        manifest = self.manifest()
+        manifest["work_items"]["inspect-roles"]["revision"] = 1
+        (self.initiative / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+        packet = json.loads(self.cli("resume", "--format", "json", success=False).stdout)
+        self.assertIn("journal", " ".join(packet["validation_errors"]).lower())
+
     def test_approval_is_hash_locked_and_can_be_resumed(self):
         self.init()
         self.approve(self.approval())
@@ -423,6 +647,181 @@ class ProjectStateTests(unittest.TestCase):
         self.assertEqual(len(locked), 7)
         self.assertTrue(all(len(digest) == 64 for digest in locked.values()))
         self.assertIn("v1", self.cli("resume").stdout)
+
+    def test_new_prototype_cannot_be_approved_before_a_to_b_coverage(self):
+        self.init()
+        approval = self.approval()
+        result = self.cli(
+            "approve", "--approval-file", self.write_input("uncovered.json", approval),
+            success=False,
+        )
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("functionality coverage", result.stderr.lower())
+
+    def test_discovery_record_requires_real_source_and_a_zero_new_sweep(self):
+        self.init()
+        audit = self.discovery_audit()
+        audit["sweeps"][-1]["new_feature_ids"] = ["invoice-search"]
+        blocked = self.cli(
+            "discovery-record", "--audit-file", self.write_input("audit.json", audit),
+            success=False,
+        )
+        self.assertEqual(blocked.returncode, 2)
+        self.assertIn("zero new", blocked.stderr.lower())
+
+    def test_discovery_record_is_durable_and_hash_protected(self):
+        self.init()
+        self.discovery_record(self.discovery_audit())
+        self.assertEqual(self.manifest()["active_discovery_id"], "audit-v1")
+        self.cli("validate")
+        self.artifact("discovery/evidence/invoices.png", png(width=390, height=844, color=(0, 0, 0)))
+        blocked = self.cli("validate", success=False)
+        self.assertIn("discovery", blocked.stderr.lower())
+
+    def test_prototype_coverage_rejects_unmapped_a_features(self):
+        self.init()
+        self.discovery_record(self.discovery_audit())
+        approval = self.approval()
+        parity = self.prototype_coverage(approval, features=())
+        blocked = self.cli(
+            "prototype-coverage", "--coverage-file", self.write_input("parity.json", parity),
+            success=False,
+        )
+        self.assertEqual(blocked.returncode, 2)
+        self.assertIn("unmapped", blocked.stderr.lower())
+
+    def test_verified_prototype_parity_allows_approval_and_is_hashed(self):
+        self.init()
+        self.discovery_record(self.discovery_audit())
+        approval = self.approval()
+        self.parity_record(self.prototype_coverage(approval))
+        self.approve(approval)
+        self.cli("validate")
+        proof = "coverage/evidence/v1/invoice-search.json"
+        self.artifact(proof, b"tampered")
+        blocked = self.cli("validate", success=False)
+        self.assertIn("functionality", blocked.stderr.lower())
+
+    def test_postapproval_missing_feature_blocks_without_erasing_user_decision(self):
+        self.init()
+        approval = self.approval()
+        self.approve(approval)
+        original = self.manifest()["approvals"]["decision-v1"]
+        self.missing_report()
+        after = self.manifest()
+        self.assertEqual(after["approvals"]["decision-v1"], original)
+        self.assertEqual(after["approved_version"], "v1")
+        self.assertTrue(after["coverage_pending"])
+        blocked = self.cli("validate", success=False)
+        self.assertIn("functionality", blocked.stderr.lower())
+
+    def test_missing_feature_requires_wider_sweep_and_new_version(self):
+        self.init()
+        first = self.approval()
+        self.approve(first)
+        self.missing_report()
+        expanded = self.discovery_audit("audit-v2", include_note=True)
+        expanded["sweeps"][-1]["new_feature_ids"] = ["invoice-note"]
+        blocked = self.cli("discovery-record", "--audit-file",
+                           self.write_input("expanded.json", expanded), success=False)
+        self.assertIn("zero new", blocked.stderr.lower())
+        expanded["sweeps"][-1]["new_feature_ids"] = []
+        self.discovery_record(expanded)
+        self.assertTrue(self.manifest()["coverage_pending"])
+        blocked = self.cli("validate", success=False)
+        self.assertIn("functionality", blocked.stderr.lower())
+        # The original A behavior is still mandatory in a new prototype.
+        second = self.approval("v2")
+        self.parity_record(self.prototype_coverage(second, features=("invoice-search", "invoice-note")))
+        self.approve(second)
+        self.assertFalse(self.manifest()["coverage_pending"])
+        self.assertEqual(set(self.manifest()["approvals"]), {"decision-v1", "decision-v2"})
+        self.cli("validate")
+
+    def test_no_new_feature_in_one_full_sweep_does_not_silently_dismiss_user_report(self):
+        self.init()
+        self.approve(self.approval())
+        self.missing_report()
+        followup = self.discovery_audit("audit-v2")
+        followup["sweeps"] = [followup["sweeps"][-1]]
+        self.discovery_record(followup)
+        self.assertTrue(self.manifest()["coverage_pending"])
+        self.assertEqual(self.manifest()["approved_version"], "v1")
+        self.assertIn("needs a complete follow-up sweep", self.cli("validate", success=False).stderr)
+
+    def test_one_full_clean_sweep_and_explicit_user_correction_resume_same_design(self):
+        self.init()
+        self.approve(self.approval())
+        self.missing_report()
+        self.artifact("discovery/evidence/resolution.json", b'{"verified_a_actions": ["search"], "new_actions": []}')
+        followup = self.discovery_audit("audit-v2")
+        followup["sweeps"] = [followup["sweeps"][-1]]
+        followup["missing_report_resolutions"] = [{
+            "report_id": "gap-001", "resolution": "not_missing",
+            "confirmed_by_user": True, "user_note": "I checked and retract the reported gap",
+            "evidence_paths": ["discovery/evidence/resolution.json"],
+        }]
+        self.discovery_record(followup)
+        self.assertFalse(self.manifest()["coverage_pending"])
+        self.assertEqual(self.manifest()["approved_version"], "v1")
+        self.assertEqual(self.manifest()["missing_reports"]["gap-001"]["status"], "dismissed")
+        self.cli("validate")
+
+    def test_pending_report_cannot_be_bypassed_by_a_new_version_without_resweep(self):
+        self.init()
+        self.approve(self.approval())
+        self.missing_report()
+        next_approval = self.approval("v2")
+        rejected_parity = self.cli(
+            "prototype-coverage", "--coverage-file",
+            self.write_input("coverage-v2.json", self.prototype_coverage(next_approval)),
+            success=False,
+        )
+        self.assertIn("full follow-up a sweep", rejected_parity.stderr.lower())
+        blocked = self.cli("approve", "--approval-file",
+                           self.write_input("next.json", next_approval), success=False)
+        self.assertIn("functionality coverage is missing", blocked.stderr.lower())
+
+    def test_postapproval_missing_evidence_is_hash_protected(self):
+        self.init()
+        self.approve(self.approval())
+        self.missing_report()
+        self.artifact("discovery/evidence/missing-feature.png", b"changed")
+        blocked = self.cli("validate", success=False)
+        self.assertIn("changed protected evidence", blocked.stderr.lower())
+
+    def test_postapproval_missing_feature_stops_new_slice_assignments(self):
+        self.init()
+        approval = self.approval()
+        self.approve(approval)
+        self.missing_report()
+        blocked = self.cli("slice-create", "--contract-file",
+                           self.write_input("slice.json", self.slice_packet(approval)), success=False)
+        self.assertIn("functionality", blocked.stderr.lower())
+
+    def test_new_discovery_cannot_rewrite_previous_a_behavior(self):
+        self.init()
+        self.discovery_record(self.discovery_audit())
+        changed = self.discovery_audit("audit-v2")
+        changed["features"][0]["behavior"] = "Rewrite prior behavior silently"
+        blocked = self.cli("discovery-record", "--audit-file",
+                           self.write_input("changed.json", changed), success=False)
+        self.assertIn("overwrite", blocked.stderr.lower())
+
+    def test_reaudit_keeps_original_a_source_proof_when_production_code_was_replaced(self):
+        self.init()
+        self.discovery_record(self.discovery_audit())
+        self.approve(self.approval())
+        self.missing_report()
+        audit = self.discovery_audit("audit-v2")
+        audit["sweeps"] = [audit["sweeps"][-1]]
+        (self.root / "src/invoices.ts").write_text(
+            "export function redesignedInvoiceView() { return 'current production'; }\n",
+            encoding="utf-8",
+        )
+        self.discovery_record(audit)
+        self.assertEqual(self.manifest()["active_discovery_id"], "audit-v2")
+        self.assertTrue(self.manifest()["coverage_pending"])
 
     def test_source_approval_without_reproducible_visual_evidence_is_blocked(self):
         self.init()
@@ -544,12 +943,15 @@ class ProjectStateTests(unittest.TestCase):
         manifest = self.manifest()
         self.assertEqual(manifest["approved_version"], "v2")
         self.assertEqual(set(manifest["approvals"]), {"decision-v1", "decision-v2"})
-        self.assertEqual([event["type"] for event in self.events()], ["approval", "approval"])
-        self.assertEqual(self.events()[1]["supersedes"], "decision-v1")
+        approvals = [event for event in self.events() if event["type"] == "approval"]
+        self.assertEqual(len(approvals), 2)
+        self.assertEqual(approvals[1]["supersedes"], "decision-v1")
         self.cli("revoke-approval", "--reason", "User withdrew v2 approval")
         self.assertIsNone(self.manifest()["approved_version"])
         self.assertEqual(self.manifest()["stage"], "prototype")
-        self.assertEqual([event["type"] for event in self.events()], ["approval", "approval", "approval_revoked"])
+        self.assertEqual([event["type"] for event in self.events()
+                          if event["type"] in {"approval", "approval_revoked"}],
+                         ["approval", "approval", "approval_revoked"])
 
     def test_approval_requires_user_decision_and_new_version_id(self):
         self.init()
@@ -561,7 +963,7 @@ class ProjectStateTests(unittest.TestCase):
         self.approve(approval)
         rejected = self.cli("approve", "--approval-file", self.write_input("approve.json", approval), success=False)
         self.assertNotEqual(rejected.returncode, 0)
-        self.assertEqual(len(self.events()), 1)
+        self.assertEqual(len([event for event in self.events() if event["type"] == "approval"]), 1)
 
     def test_slice_packet_is_reproducible_without_chat(self):
         self.init()

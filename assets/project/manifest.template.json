@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 3,
   "initiative_id": "example-redesign",
   "scope": "page",
   "stage": "discover",
@@ -9,6 +9,13 @@
   "references": [],
   "slices": {},
   "warnings": {},
+  "discovery_audits": {},
+  "active_discovery_id": null,
+  "prototype_coverage": {},
+  "missing_reports": {},
+  "coverage_pending": false,
+  "work_items": {},
+  "active_work_id": null,
   "next_action": "Inspect existing routes, behaviors, states and design references.",
   "last_checkpoint": null,
   "provenance": {

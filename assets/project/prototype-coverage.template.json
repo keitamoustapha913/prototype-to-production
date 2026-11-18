@@ -1,0 +1,12 @@
+{
+  "prototype_version": "v1",
+  "audit_id": "audit-v1",
+  "mappings": [
+    {
+      "feature_id": "record-search",
+      "status": "BLOCKED",
+      "prototype_source_paths": ["prototype/versions/v1/REPLACE_WITH_REAL_RUNNABLE_SOURCE.tsx"],
+      "test_evidence": ["coverage/evidence/v1/REPLACE_WITH_REAL_BROWSER_RESULT.json"]
+    }
+  ]
+}
