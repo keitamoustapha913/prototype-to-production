@@ -1,5 +1,6 @@
 // Capture evidence through the browser controlled by the coordinator.
 import { execFile, spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -65,7 +66,46 @@ async function markerPaints(evaluate, screenshot, captureScreenshot, selector, r
     })()`);
 }
 
-async function capture({ browser, appUrl, renderCase, checks }) {
+async function checkBuild(send, responses, build, url) {
+    const relevant = responses.filter(response =>
+        new URL(response.url).origin === url.origin &&
+        ['Document', 'Script', 'Stylesheet', 'Fetch', 'XHR'].includes(response.type));
+    if (!relevant.some(response => response.type === 'Document' && response.url === url.href)) {
+        throw new Error('Could not identify the served build document');
+    }
+    const evidence = [];
+    for (const response of relevant) {
+        const headers = Object.fromEntries(Object.entries(response.headers).map(
+            ([name, value]) => [name.toLowerCase(), value]));
+        const fingerprint = headers['x-p2p-build-fingerprint'];
+        if (fingerprint !== undefined) {
+            if (fingerprint !== build.fingerprint) throw new Error('The served build fingerprint is stale');
+            evidence.push({ url: response.url, fingerprint });
+            continue;
+        }
+        const path = decodeURIComponent(new URL(response.url).pathname).replace(/^\//, '');
+        const candidates = new Set([path]);
+        if (response.type === 'Document') {
+            if (!path || path.endsWith('/')) candidates.add(path + 'index.html');
+            else if (!path.endsWith('.html')) {
+                candidates.add(path + '.html');
+                candidates.add(path + '/index.html');
+            }
+        }
+        const matches = Object.entries(build.sources).filter(([file]) =>
+            [...candidates].some(candidate => candidate && (file === candidate || file.endsWith('/' + candidate))));
+        const { body, base64Encoded } = await send('Network.getResponseBody', { requestId: response.requestId });
+        const digest = createHash('sha256').update(Buffer.from(body, base64Encoded ? 'base64' : 'utf8')).digest('hex');
+        if (matches.length !== 1 || matches[0][1].split(':').at(-1) !== digest) {
+            throw new Error('The served build does not match current source for /' + path +
+                '. Serve current source bytes or a build-time X-P2P-Build-Fingerprint.');
+        }
+        evidence.push({ url: response.url, source: matches[0][0], sha256: digest });
+    }
+    return evidence;
+}
+
+async function capture({ browser, appUrl, renderCase, checks, build }) {
     const url = new URL(renderCase.route, appUrl);
     if (!['http:', 'https:'].includes(url.protocol) || url.origin !== new URL(appUrl).origin) {
         throw new Error('The approved route must be on the configured HTTP(S) application');
@@ -114,6 +154,19 @@ async function capture({ browser, appUrl, renderCase, checks }) {
             });
         }
 
+        const responses = [];
+        if (build) {
+            socket.addEventListener('message', event => {
+                const message = JSON.parse(event.data);
+                if (message.method === 'Network.responseReceived') {
+                    const { requestId, type, response } = message.params;
+                    responses.push({ requestId, type, url: response.url, headers: response.headers });
+                }
+            });
+            await send('Network.enable');
+            await send('Network.setCacheDisabled', { cacheDisabled: true });
+            await send('Network.setBypassServiceWorker', { bypass: true });
+        }
         const { width, height } = renderCase.viewport;
         await send('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false });
         async function navigate(destination) {
@@ -133,34 +186,33 @@ async function capture({ browser, appUrl, renderCase, checks }) {
                 env: { ...process.env, P2P_BROWSER_ENDPOINT: endpoint, P2P_BROWSER_PAGE: page.webSocketDebuggerUrl },
                 timeout: 45000,
             });
-        } else {
-            for (const step of renderCase.setup ?? []) {
-                if (step.action === 'navigate') {
-                    await navigate(new URL(step.route, url.origin));
-                    continue;
-                }
-                await waitFor(async () => {
-                    const expression = `(() => {
-                        const step = ${JSON.stringify(step)};
-                        if (location.origin !== ${JSON.stringify(url.origin)}) throw new Error('Outside the application origin');
-                        const target = document.querySelector(step.selector);
-                        if (!target) return false;
-                        if (step.action === 'click') target.click();
-                        if (step.action === 'fill') {
-                            const proto = target instanceof HTMLInputElement ? HTMLInputElement.prototype :
-                                target instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : null;
-                            if (!proto) throw new Error('Expected a text input or textarea');
-                            Object.getOwnPropertyDescriptor(proto, 'value').set.call(target, step.value);
-                            target.dispatchEvent(new Event('input', { bubbles: true }));
-                            target.dispatchEvent(new Event('change', { bubbles: true }));
-                        }
-                        return true;
-                    })()`;
-                    const { result, exceptionDetails } = await send('Runtime.evaluate', { expression, returnByValue: true });
-                    if (exceptionDetails) throw new Error(`Could not perform browser setup action ${step.action}: ${step.selector}`);
-                    return result.value;
-                }, `Browser setup selector did not appear: ${step.selector}`);
+        }
+        for (const step of renderCase.setup ?? []) {
+            if (step.action === 'navigate') {
+                await navigate(new URL(step.route, url.origin));
+                continue;
             }
+            await waitFor(async () => {
+                const expression = `(() => {
+                    const step = ${JSON.stringify(step)};
+                    if (location.origin !== ${JSON.stringify(url.origin)}) throw new Error('Outside the application origin');
+                    const target = document.querySelector(step.selector);
+                    if (!target) return false;
+                    if (step.action === 'click') target.click();
+                    if (step.action === 'fill') {
+                        const proto = target instanceof HTMLInputElement ? HTMLInputElement.prototype :
+                            target instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : null;
+                        if (!proto) throw new Error('Expected a text input or textarea');
+                        Object.getOwnPropertyDescriptor(proto, 'value').set.call(target, step.value);
+                        target.dispatchEvent(new Event('input', { bubbles: true }));
+                        target.dispatchEvent(new Event('change', { bubbles: true }));
+                    }
+                    return true;
+                })()`;
+                const { result, exceptionDetails } = await send('Runtime.evaluate', { expression, returnByValue: true });
+                if (exceptionDetails) throw new Error(`Could not perform browser setup action ${step.action}: ${step.selector}`);
+                return result.value;
+            }, `Browser setup selector did not appear: ${step.selector}`);
         }
 
         const { frameTree } = await send('Page.getFrameTree');
@@ -176,23 +228,23 @@ async function capture({ browser, appUrl, renderCase, checks }) {
             const { data } = await send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false });
             return data;
         }
-        const discoveryObservations = renderCase.command ? null : renderCase.observations;
+        const identityRules = renderCase.observations;
         const observation = await evaluate(`(async () => {
             const measure = ({ selector, property }) => {
                 const element = document.querySelector(selector);
                 return element ? getComputedStyle(element).getPropertyValue(property).trim() : null;
             };
             const ready = document.querySelector(${JSON.stringify(renderCase.ready_selector)});
-            const requestedIdentities = ${JSON.stringify(discoveryObservations)};
+            const requestedIdentities = ${JSON.stringify(identityRules)};
             const identities = requestedIdentities && Object.fromEntries(Object.entries(requestedIdentities)
                 .map(([name, rule]) => {
                     const node = document.querySelector(rule.selector);
                     const actual = rule.attribute ? node?.getAttribute(rule.attribute) : node?.textContent;
                     return [name, actual?.trim() ?? null];
                 }));
-            const state = ready && ready.checkVisibility({
+            const visible = element => element && element.checkVisibility({
                 checkOpacity: true, checkVisibilityCSS: true, contentVisibilityAuto: true
-            }) && await new Promise(resolve => {
+            }) && new Promise(resolve => {
                 const observer = new IntersectionObserver(([entry]) => {
                     observer.disconnect();
                     const rect = entry.intersectionRect;
@@ -200,17 +252,28 @@ async function capture({ browser, appUrl, renderCase, checks }) {
                         rect: rect.toJSON(), visiblyUnobstructed: entry.isVisible === true,
                     });
                 }, { trackVisibility: true, delay: 100 });
-                observer.observe(ready);
+                observer.observe(element);
             });
+            const criteria = ${JSON.stringify(checks)};
+            const [state, ...targets] = await Promise.all([visible(ready), ...criteria.map(rule =>
+                rule.visibility === 'hidden' ? null : visible(document.querySelector(rule.selector))
+            )]);
             return {
                 url: location.href,
                 viewport: { width: innerWidth, height: innerHeight },
                 state,
-                actual: ${JSON.stringify(checks)}.map(measure),
+                targets,
+                actual: criteria.map(rule => {
+                    const element = document.querySelector(rule.selector);
+                    if (rule.visibility === 'hidden' && (!element || element.checkVisibility({
+                        checkOpacity: true, checkVisibilityCSS: true, contentVisibilityAuto: true
+                    }))) return null;
+                    return measure(rule);
+                }),
                 ...(identities ? { identities } : {}),
             };
         })()`);
-        const { state, ...measurements } = observation;
+        const { state, targets, ...measurements } = observation;
         if (observation.url !== url.href || observation.viewport.width !== width ||
             observation.viewport.height !== height || !state) {
             throw new Error('The browser did not show the approved route, viewport and visible state');
@@ -220,7 +283,16 @@ async function capture({ browser, appUrl, renderCase, checks }) {
             !await markerPaints(evaluate, screenshot, captureScreenshot, renderCase.ready_selector, state.rect)) {
             throw new Error('The browser did not show the approved visible state in the screenshot');
         }
-        return { ...measurements, stateVisible: true, screenshot };
+        for (const [index, rule] of checks.entries()) {
+            if (rule.visibility === 'hidden') continue;
+            const target = targets[index];
+            if (!target || (!target.visiblyUnobstructed &&
+                !await markerPaints(evaluate, screenshot, captureScreenshot, rule.selector, target.rect))) {
+                throw new Error('The browser did not show the approved visible measurement target: ' + rule.selector);
+            }
+        }
+        const buildEvidence = build && await checkBuild(send, responses, build, url);
+        return { ...measurements, stateVisible: true, ...(build ? { buildEvidence } : {}), screenshot };
     } finally {
         socket?.close();
         if (chrome.pid && chrome.exitCode === null && chrome.signalCode === null) {

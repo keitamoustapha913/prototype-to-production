@@ -506,6 +506,28 @@ class BlueprintState:
         self.manifest['next_action'] = 'Discuss the roadmap, then record a new blueprint; preserve prior approvals'
         self.persist()
 
+    def check_browser_setup(self, setup):
+        self.require(isinstance(setup, list), 'Browser setup must be a list of actions')
+        for step in setup:
+            self.require(isinstance(step, dict) and step.get('action') in {'navigate', 'wait', 'click', 'fill'},
+                         'Browser setup actions must be navigate, wait, click or fill')
+            if step['action'] == 'navigate':
+                route = step.get('route')
+                self.require(isinstance(route, str) and route.startswith('/') and not route.startswith('//'),
+                             'Browser setup navigation needs a local app route')
+            else:
+                self.require(self.text(step.get('selector')), 'Browser setup action needs a selector')
+            if step['action'] == 'fill':
+                self.require(isinstance(step.get('value'), str), 'Browser fill needs a string value')
+    def check_browser_observations(self, observations):
+        self.require(isinstance(observations, dict) and set(observations) == {'role', 'state'},
+                     'Discovery needs browser observations for the role and state')
+        for name, observation in observations.items():
+            self.require(isinstance(observation, dict) and self.text(observation.get('selector'))
+                         and self.text(observation.get('expected'))
+                         and ('attribute' not in observation or self.text(observation['attribute'])),
+                         f'Discovery needs a selector and expected observed {name}')
+
     def discovery_capture(self, value):
         key = value.get('capture_id')
         self.require(self.identifier(key) and self.identifier(value.get('feature_id')),
@@ -519,27 +541,9 @@ class BlueprintState:
         self.require(isinstance(viewport, dict) and all(type(viewport.get(k)) is int and viewport[k] > 0
                      for k in ('width', 'height')), 'Browser capture requires positive viewport dimensions')
         self.require('command' not in value, 'Discovery does not accept host commands; use browser setup actions')
-        setup = value.get('setup', [])
-        self.require(isinstance(setup, list), 'Browser setup must be a list of actions')
-        for step in setup:
-            self.require(isinstance(step, dict) and step.get('action') in {'navigate', 'wait', 'click', 'fill'},
-                         'Browser setup actions must be navigate, wait, click or fill')
-            if step['action'] == 'navigate':
-                route = step.get('route')
-                self.require(isinstance(route, str) and route.startswith('/') and not route.startswith('//'),
-                             'Browser setup navigation needs a local app route')
-            else:
-                self.require(self.text(step.get('selector')), 'Browser setup action needs a selector')
-            if step['action'] == 'fill':
-                self.require(isinstance(step.get('value'), str), 'Browser fill needs a string value')
+        self.check_browser_setup(value.get('setup', []))
         observations = value.get('observations')
-        self.require(isinstance(observations, dict) and set(observations) == {'role', 'state'},
-                     'Discovery needs browser observations for the role and state')
-        for name, observation in observations.items():
-            self.require(isinstance(observation, dict) and self.text(observation.get('selector'))
-                         and self.text(observation.get('expected'))
-                         and ('attribute' not in observation or self.text(observation['attribute'])),
-                         f'Discovery needs a selector and expected observed {name}')
+        self.check_browser_observations(observations)
         paths = value.get('source_paths', [])
         self.require(self.strings(paths, False), 'Capture source paths must be distinct project files')
         receipt_path = f"{GROUP_PATHS['browser_captures']}/{key}.json"
@@ -551,7 +555,9 @@ class BlueprintState:
         else:
             source_snapshot = self.discovery_snapshot(paths)
             try:
-                observation, image = self.capture_render(value, [])
+                observation, image = self.capture_render(value, [], build={
+                    'fingerprint': self.build_fingerprint(source_snapshot), 'sources': source_snapshot,
+                })
             except subprocess.TimeoutExpired as error:
                 raise self.api.StateError('Browser discovery capture timed out') from error
             after = self.discovery_snapshot(paths)
@@ -570,6 +576,10 @@ class BlueprintState:
                     self.hashes([relative]), screenshot=relative)
         self.persist()
         print(f'Browser discovery evidence: {relative}')
+
+    @staticmethod
+    def build_fingerprint(snapshot):
+        return sha256(json.dumps(snapshot, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 
     def discovery_snapshot(self, extra_paths):
         snapshot = self.workspace_snapshot()
@@ -598,7 +608,7 @@ class BlueprintState:
                          and capture['state'] in feature['states'] and capture['role'] in feature['roles'],
                          'Browser discovery receipt does not match the feature, route, role and state')
             snapshot = capture.get('source_snapshot')
-            if not isinstance(snapshot, dict):
+            if not isinstance(snapshot, dict) or not capture['browser'].get('buildEvidence'):
                 continue  # Old receipts remain in history and need fresh evidence for new approval.
             changed = set()
             for path, expected in sources.items():
@@ -651,6 +661,7 @@ class BlueprintState:
                 self.check_roadmap_indexes(recovering)
             approvals = {e['decision_id']:e['approval'] for e in journal if e.get('type') == 'approval'}
             self.require(approvals == self.manifest.get('approvals', {}), 'Approval history differs from immutable journal')
+            self.check_delivery_journal(journal)
             retired = {slice_id: e['decision_id'] for e in journal if e.get('type') == 'approval'
                        for slice_id in e.get('superseded_slice_ids', [])}
             self.require(retired == {key: item['superseded_by'] for key, item in self.manifest.get('slices', {}).items()
@@ -660,6 +671,35 @@ class BlueprintState:
         except (self.api.StateError, OSError, ValueError, KeyError, TypeError) as error:
             errors.append(str(error))
         return errors
+
+    def check_delivery_journal(self, journal):
+        """Detect interrupted delivery writes from initiatives created before staged transitions."""
+        active = None
+        explicit_blocks = {}
+        reports = set()
+        for event in journal:
+            kind = event.get('type')
+            if kind == 'approval':
+                active = event['decision_id']
+            elif kind == 'approval_revoked':
+                active = None
+            elif kind == 'application_a_functionality_missing':
+                reports.add(event['report_id'])
+            elif kind == 'slice_blocked':
+                explicit_blocks[event['slice_id']] = event
+            elif kind in {'slice_unblocked_after_resolution', 'slice_cancelled'}:
+                explicit_blocks.pop(event['slice_id'], None)
+        self.require(active == self.manifest.get('active_approval_id'),
+                     'Active approval differs from the approval/withdrawal journal')
+        saved_reports = self.manifest.get('missing_reports', {})
+        files = {path.stem for path in (self.directory / 'discovery/missing').glob('*.json')}
+        self.require(reports == set(saved_reports) == files,
+                     'Missing-feature report files, journal and manifest disagree')
+        for slice_id, event in explicit_blocks.items():
+            assignment = self.manifest.get('slices', {}).get(slice_id, {})
+            self.require((assignment.get('status') == 'blocked' and event['reason'] in assignment.get('blockers', []))
+                         or assignment.get('superseded_by'),
+                         f'Slice {slice_id}: saved status disagrees with its explicit defect blocker')
 
     def bound_hashes(self, group, key):
         self.load(group, key)
@@ -784,11 +824,30 @@ class BlueprintState:
                 self.require(matching_behavior and matching_backend and keeps_states,
                              f'{baseline_id}: KEEP/MOVE must preserve audited behavior, backend rules and states; '
                              'use a user-authorized MODIFY for a behavior change')
+                if 'ui' in parts and len(audited[baseline_id]['roles']) > 1:
+                    self.check_preserved_roles(audited[baseline_id], feature)
                 preserved_surfaces.setdefault(baseline_id, set()).update(parts)
         for baseline_id, parts in preserved_surfaces.items():
             original = audited[baseline_id].get('surface', baseline['surface'])
             self.require(SURFACE_PARTS[original] <= parts,
                          f'{baseline_id}: KEEP/MOVE must cover every audited UI and backend surface')
+
+    def check_preserved_roles(self, audited, feature):
+        cases = feature['visual_contract']['render_cases']
+        receipts = set(audited['browser_evidence'])
+        for key, entry in self.manifest.get('browser_captures', {}).items():
+            if entry['screenshot'] not in receipts:
+                continue
+            capture = self.load('browser_captures', key)
+            self.require(any(
+                case.get('role') == capture['role']
+                and case['state'] == capture['state']
+                and case['ready_selector'] == capture['ready_selector']
+                and all(case.get('observations', {}).get(name, {}).get('expected') == observed['expected']
+                        for name, observed in capture['observations'].items())
+                for case in cases
+            ), f"{audited['feature_id']}: verify audited role/state {capture['role']}/{capture['state']} "
+               f"and its visible marker {capture['ready_selector']} in a render case")
 
     def check_fullstack_acceptance(self, spec):
         for feature in spec['features']:
@@ -921,6 +980,10 @@ class BlueprintState:
                     self.require(isinstance(viewport, dict) and all(type(viewport.get(k)) is int and viewport[k] > 0
                                  for k in ('width','height')), 'Concrete render viewport dimensions required')
                     self.argv(case.get('command'))
+                    self.check_browser_setup(case.get('setup', []))
+                    if 'role' in case or 'observations' in case:
+                        self.require(self.text(case.get('role')), 'Browser identity observations require a role')
+                        self.check_browser_observations(case.get('observations'))
                     case_ids.add(case['case_id']); states.add(case['state'])
                 self.require(states == set(feature['states']), 'Render cases must cover every UI state')
             if surface in {'backend','fullstack'}:
@@ -947,7 +1010,8 @@ class BlueprintState:
                     self.require(surface != 'backend', 'Backend-only features cannot have visual checks')
                     measurement = check.get('measurement')
                     self.require(isinstance(measurement, dict) and all(self.text(measurement.get(key))
-                                 for key in ('selector', 'property')),
+                                 for key in ('selector', 'property'))
+                                 and measurement.get('visibility', 'visible') in ('visible', 'hidden'),
                                  'Each visual check needs a browser selector and computed CSS property')
                     checked_cases.update(check.get('case_ids', case_ids))
             if surface in {'ui','fullstack'}:
@@ -1084,6 +1148,7 @@ class BlueprintState:
             self.require(approval.get('mode') == 'blueprint' and approval['approved_version'] == self.manifest['approved_version'],
                          'Blueprint approval/version mismatch')
             spec = self.load('blueprints', approval['approved_version'])
+            self.check_preserved_behavior(self.baseline(approval['baseline_id'], current=False), spec)
             active_audit = self.manifest.get('active_discovery_id')
             self.require(self.approval_matches_audit(approval, active_audit),
                 'Stale baseline audit; approve a blueprint against the current audit')
@@ -1224,19 +1289,21 @@ class BlueprintState:
             raise self.api.StateError(f'Verification command did not emit a JSON observation: {command!r}') from error
         self.require(observed == expected, 'Executed verification output differs from the reviewed observation')
 
-    def capture_render(self, render_case, checks):
+    def capture_render(self, render_case, checks, *, build=None):
         app_url = os.environ.get('P2P_APP_URL')
         browser = os.environ.get('P2P_CHROMIUM') or shutil.which('google-chrome') or shutil.which('chromium')
         self.require(app_url and browser and shutil.which('node'),
                      'Browser verification requires P2P_APP_URL, Chromium and Node.js 22 or later')
         driver = Path(__file__).with_name('blueprint_browser.mjs')
         payload = {'browser': browser, 'appUrl': app_url, 'renderCase': render_case,
-                   'checks': [check['measurement'] for check in checks]}
+                   'checks': [check['measurement'] for check in checks], 'build': build}
         result = subprocess.run(['node', str(driver)], input=json.dumps(payload), cwd=self.directory.parents[2],
                                 text=True, capture_output=True, timeout=100, check=False)
         self.require(result.returncode == 0, 'Browser verification failed: ' + result.stderr.strip())
         observation = json.loads(result.stdout)
         screenshot = b64decode(observation.pop('screenshot'), validate=True)
+        if render_case.get('observations'):
+            self.check_capture_identity(render_case['observations'], observation)
         self.require(observation.get('actual') == [check['expected'] for check in checks],
                      'Browser measurements differ from the approved visual criteria')
         return observation, screenshot
@@ -1319,7 +1386,7 @@ class BlueprintState:
                                  and self.text(case.get('tool'))
                                  and case['tool'] not in {'none','unavailable'}, 'Real browser route/state/tool required')
                     matches = [c for c in feature['visual_contract']['render_cases'] if all(
-                        case.get(k) == c.get(k) for k in ('case_id','state','route','viewport'))]
+                        case.get(k) == c.get(k) for k in ('case_id','state','route','viewport','role'))]
                     self.require(len(matches) == 1, 'Render route/state/viewport must match exact approved case')
                     command = self.argv(matches[0].get('command'))
                     self.require(case.get('command') == command, 'Render command differs from approval')
@@ -1335,7 +1402,7 @@ class BlueprintState:
                                  and case['screenshot'] != case['dom_file'], 'Each rendered case needs distinct screenshot and DOM evidence')
                     screenshot_paths.add(case['screenshot']); dom_paths.add(case['dom_file'])
                     dom = self.api.read_json(self.api.artifact_file(self.directory,case['dom_file']))
-                    self.require(all(dom.get(k) == case.get(k) for k in ('feature_id','case_id','route','state','viewport')),
+                    self.require(all(dom.get(k) == case.get(k) for k in ('feature_id','case_id','route','state','viewport','role')),
                                  'DOM/style evidence does not describe this approved rendered case')
                     visual_checks = {
                         check['check_id']: check for check in feature['acceptance_checks']
@@ -1371,9 +1438,11 @@ class BlueprintState:
             if execute:
                 for command, observation in executions:
                     self.execute(command, observation)
+                snapshot = self.discovery_snapshot([]) if render_jobs else {}
+                build = {'fingerprint': self.build_fingerprint(snapshot), 'sources': snapshot}
                 with tempfile.TemporaryDirectory() as temporary:
                     for index, (case, checks, reviewed) in enumerate(render_jobs):
-                        observation, image = self.capture_render(case, checks)
+                        observation, image = self.capture_render(case, checks, build=build)
                         screenshot = Path(temporary) / 'capture.png'
                         screenshot.write_bytes(image)
                         viewport = case['viewport']
@@ -1386,6 +1455,8 @@ class BlueprintState:
                         self.api.atomic_bytes(self.directory / (prefix + '.png'), image)
                         self.api.atomic_json(self.directory / (prefix + '.json'), receipt)
                         rendered.update(self.hashes([prefix + '.png', prefix + '.json']))
+                self.require(not render_jobs or self.discovery_snapshot([]) == snapshot,
+                             'Application files changed during browser verification')
                 self.check_hashes(hashes)
                 for path, expected_hash in test_sources.items():
                     self.require(self.api.digest_of(self.api.project_source_file(self.directory.parents[2], path))
@@ -1521,8 +1592,9 @@ class BlueprintState:
         approved_versions = {approval['approved_version']
                              for approval in self.manifest.get('approvals', {}).values()
                              if self.approval_matches_audit(approval, audit_id)}
+        active_id = self.manifest.get('active_approval_id')
         assignments = [assignment for assignment in self.manifest.get('slices', {}).values()
-                       if assignment.get('blueprint_version') in approved_versions
+                       if active_id and assignment.get('blueprint_version') in approved_versions
                        and assignment['status'] != 'cancelled']
         owned = [path for assignment in assignments if not assignment.get('superseded_by')
                  for path in assignment['allowed_paths']]

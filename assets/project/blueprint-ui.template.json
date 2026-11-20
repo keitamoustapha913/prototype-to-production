@@ -42,7 +42,8 @@
           ],
           "measurement": {
             "selector": "#example-list",
-            "property": "gap"
+            "property": "gap",
+            "visibility": "visible"
           }
         },
         {

@@ -498,7 +498,8 @@ document.getElementById('observation').textContent = JSON.stringify({
         state_manager = FIXTURE_CLI.blueprint_state(self.directory, manifest)
         observation = {'url': f"http://fixture.invalid{feature['route']}", 'stateVisible': True,
                        'viewport': capture['viewport'],
-                       'identities': {'role': feature['roles'][0], 'state': state}}
+                       'identities': {'role': feature['roles'][0], 'state': state},
+                       'buildEvidence': [{'source': feature['source_anchors'][0]['path']}]}
         with patch.object(state_manager, 'capture_render', return_value=(observation, png(24, 24))), patch('builtins.print'):
             state_manager.discovery_capture(capture)
         return self.manifest()['browser_captures'][capture_id]['screenshot']
@@ -577,7 +578,7 @@ document.getElementById('observation').textContent = JSON.stringify({
         capture['viewport'] = {'width': 24, 'height': 24}
         state_manager = FIXTURE_CLI.blueprint_state(self.directory, self.manifest())
 
-        def observe(case, checks):
+        def observe(case, checks, *, build):
             source = self.root / 'src/service.py'
             source.write_text(source.read_text() + '\n# Edited during capture\n')
             return {'identities': {'role': 'member', 'state': 'success'}}, png(24, 24)
@@ -614,6 +615,61 @@ document.getElementById('observation').textContent = JSON.stringify({
         feature['browser_evidence'].append(self.record_browser_capture(dict(capture, capture_id='updated-capture')))
         self.cli('discovery-record', '--audit-file', self.payload('audit', audit))
         self.cli('validate')
+
+    def test_discovery_rejects_fresh_capture_of_a_stale_server_response(self):
+        self.start()
+        old = '<div id="state" data-role="member" data-state="success">Old app</div>'
+        if not shutil.which('node') or not (shutil.which('google-chrome') or shutil.which('chromium')):
+            self.skipTest('Node.js and Chromium are required for the browser scenario')
+        parent = self.root / 'src'
+        parent.mkdir()
+        source = parent / 'items.html'
+        source.write_text(old)
+        class CachedItemsHandler(ItemsHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html')
+                self.end_headers()
+                self.wfile.write(old.encode())
+        server = ThreadingHTTPServer(('127.0.0.1', 0), CachedItemsHandler)
+        Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.env['P2P_APP_URL'] = f'http://127.0.0.1:{server.server_port}'
+        self.record_browser_capture(self.discovery_case('old-build'))
+        source.write_text(old.replace('Old app', 'New app'))
+        p = self.payload('stale', self.discovery_case('new-capture'))
+        result = self.cli('discovery-capture', '--capture-file', p, ok=False)
+        self.assertIn('served build', result.stderr)
+
+    def test_dynamic_discovery_requires_the_fingerprint_from_the_running_build(self):
+        self.start()
+        if not shutil.which('node') or not (shutil.which('google-chrome') or shutil.which('chromium')):
+            self.skipTest('Node.js and Chromium are required for the browser scenario')
+        audit = self.baseline()
+        fingerprint = self.cli('browser-build-fingerprint').stdout.strip()
+
+        class BuildHandler(ItemsHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html')
+                self.send_header('X-P2P-Build-Fingerprint', fingerprint)
+                self.end_headers()
+                self.wfile.write(b'<div id="state" data-role="member" data-state="success">Generated</div>')
+
+        server = ThreadingHTTPServer(('127.0.0.1', 0), BuildHandler)
+        Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.env['P2P_APP_URL'] = f'http://127.0.0.1:{server.server_port}'
+        self.record_browser_capture(self.discovery_case('original-build'))
+        source = self.root / audit['features'][0]['source_anchors'][0]['path']
+        source.write_text(source.read_text() + '\n# New source\n')
+        retry = self.discovery_case('updated-build')
+        result = self.cli('discovery-capture', '--capture-file', self.payload('stale', retry), ok=False)
+        self.assertIn('fingerprint is stale', result.stderr)
+        fingerprint = self.cli('browser-build-fingerprint').stdout.strip()
+        self.record_browser_capture(retry)
 
     def discovery_case(self, capture_id='browser-case', *, role='member', state='success'):
         return {'capture_id': capture_id, 'feature_id': 'list-items', 'role': role, 'state': state,
@@ -1356,6 +1412,96 @@ print(json.dumps(output))
                           '--review-file', self.payload('review', self.review('ui')), ok=False)
         self.assertIn('visible', result.stderr)
 
+    def test_preserved_roles_require_real_browser_coverage_of_the_admin_control(self):
+        self.start()
+        self.exchange()
+        audit = self.baseline('ui')
+        original = ('<button id="switch">Switch to admin</button>'
+                    '<div id="state" data-role="member" data-state="success">Items</div>'
+                    '<main id="items" style="display:grid;gap:16px"><div>Items</div></main>'
+                    '<button id="admin-delete" hidden>Delete item</button>'
+                    '<script>document.querySelector("#switch").onclick = () => {'
+                    'document.querySelector("#state").dataset.role = "admin";'
+                    'const button = document.querySelector("#admin-delete");'
+                    'if (button) button.hidden = false;'
+                    '};</script>')
+        self.serve_items(original)
+        feature = audit['features'][0]
+        contract = 'Members can view items and admins can see the Delete item button'
+        feature.update(roles=['member', 'admin'], states=['success'], behavior=contract)
+        feature['source_anchors'].append({'path': 'src/items.html', 'contains': 'id="admin-delete"'})
+        audit['behavior_contracts']['list-items']['behavior_contract'] = contract
+        for sweep in audit['sweeps']:
+            sweep['source_files_checked'].append('src/items.html')
+        cases = {}
+        for role in feature['roles']:
+            capture = self.discovery_case(role + '-discovery', role=role)
+            capture['viewport'] = {'width': 800, 'height': 600}
+            if role == 'admin':
+                capture.update(ready_selector='#admin-delete:not([hidden])',
+                               setup=[{'action': 'click', 'selector': '#switch'}])
+            feature['browser_evidence'].append(self.record_browser_capture(capture))
+            cases[role] = capture
+        self.record_baseline(audit)
+        self.cli('plan-record', '--plan-file', self.payload('plan', self.plan()))
+        spec = self.blueprint(surface='ui')
+        proposed = spec['features'][0]
+        proposed.update(behavior_contract=contract, implementation_paths=['src/items.html'], states=['success'])
+        render = next(case for case in proposed['visual_contract']['render_cases'] if case['state'] == 'success')
+        proposed['visual_contract']['render_cases'] = [render]
+        result = self.cli('blueprint-record', '--blueprint-file', self.payload('role-blind', spec), ok=False)
+        self.assertIn('audited role/state', result.stderr)
+        for role, case in cases.items():
+            roles = {key: case[key] for key in ('role', 'observations', 'ready_selector', 'setup')}
+            cases[role] = dict(render, **roles)
+            if role == 'admin':
+                cases[role]['case_id'] = 'admin-case'
+        proposed['visual_contract']['render_cases'] = list(cases.values())
+        self.cli('blueprint-record', '--blueprint-file', self.payload('spec', spec))
+        self.cli('blueprint-coverage', '--coverage-file', self.payload('coverage', self.coverage(surface='ui')))
+        self.cli('approve', '--approval-file', self.payload('approval', self.approval()))
+        packet = dict(self.slice(), allowed_paths=['src/items.html'], functional_tests=['items-access', 'items-behavior'])
+        self.cli('slice-create', '--contract-file', self.payload('slice', packet))
+        path = self.root / 'src/items.html'
+        path.write_text(original.replace('<button id="admin-delete" hidden>Delete item</button>', ''))
+        report = {'slice_id': 'items-slice', 'owner': 'builder', 'status': 'submitted', 'summary': 'Render items',
+                  'implementation_paths': ['src/items.html'], 'next_action': 'Independent review'}
+        self.cli('slice-report', '--slice-id', 'items-slice', '--owner', 'builder',
+                 '--report-file', self.payload('report', report))
+        self.cli('reconcile', '--slice-id', 'items-slice', '--action', 'report')
+        review = self.review('ui')
+        member = next(case for case in review['rendered_cases'] if case['state'] == 'success')
+        member.update(role='member')
+        admin = dict(member, case_id='admin-case', role='admin',
+                     screenshot=self.artifact('slices/items-slice/evidence/admin.png',
+                                              png(FIXTURE_VIEWPORT['width'], FIXTURE_VIEWPORT['height'])))
+        dom = json.loads((self.directory / member['dom_file']).read_text())
+        admin['dom_file'] = self.artifact('slices/items-slice/evidence/admin.json',
+                                          json.dumps(dict(dom, case_id='admin-case', role='admin')))
+        (self.directory / member['dom_file']).write_text(json.dumps(dict(dom, role='member')))
+        review['rendered_cases'] = [member, admin]
+        result = self.cli('reconcile', '--slice-id', 'items-slice', '--action', 'verify',
+                          '--review-file', self.payload('review', review), ok=False)
+        self.assertIn('visible state', result.stderr)
+        path.write_text(original)
+        resolution = {'slice_id': 'items-slice', 'resolution': 'Restored the admin control', 'next_action': 'Verify'}
+        self.cli('reconcile', '--slice-id', 'items-slice', '--action', 'unblock',
+                 '--review-file', self.payload('resolution', resolution))
+        self.cli('reconcile', '--slice-id', 'items-slice', '--action', 'report')
+        self.cli('reconcile', '--slice-id', 'items-slice', '--action', 'verify',
+                 '--review-file', self.payload('review', review))
+        self.cli('reconcile', '--slice-id', 'items-slice', '--action', 'accept')
+
+    def test_browser_rejects_spacing_from_a_hidden_copy(self):
+        states = ''.join(f'<div id="state-{state}">{state}</div>'
+                         for state in ('loading', 'success', 'forbidden', 'error'))
+        self.serve_items(f'<main style="display:grid;gap:4px">{states}</main>'
+                         '<div id="items" style="display:none;gap:16px">Hidden copy</div>')
+        self.assigned('ui')
+        result = self.cli('reconcile', '--slice-id', 'items-slice', '--action', 'verify',
+                          '--review-file', self.payload('review', self.review('ui')), ok=False)
+        self.assertIn('visible measurement target', result.stderr)
+
     def test_browser_rejects_a_state_outside_the_captured_viewport(self):
         states = ''.join(f'<div id="state-{state}">{state}</div>'
                          for state in ('loading', 'success', 'forbidden', 'error'))
@@ -1685,6 +1831,92 @@ print(json.dumps(output))
         for case in review['rendered_cases']:
             case['screenshot']=same; case['dom_file']=same
         self.cli('reconcile','--slice-id','items-slice','--action','verify','--review-file',self.payload('review',review),ok=False)
+
+    def interrupt_manifest_write(self, operation):
+        write = FIXTURE_CLI.atomic_json
+
+        def fail_manifest(path, value):
+            if path == self.directory / 'manifest.json':
+                raise OSError('interrupted manifest write')
+            return write(path, value)
+
+        with patch.object(FIXTURE_CLI, 'atomic_json', side_effect=fail_manifest):
+            with self.assertRaisesRegex(OSError, 'interrupted manifest write'):
+                operation()
+
+    def test_interrupted_approval_retries_the_same_decision(self):
+        self.prepared()
+        path = self.payload('approval', self.approval())
+        self.interrupt_manifest_write(lambda: FIXTURE_CLI.approve(self.directory, str(path)))
+        self.cli('validate', ok=False)
+        changed = json.loads(path.read_text())
+        changed['user_approval_note'] = 'Different approval'
+        rejected = self.cli('approve', '--approval-file', self.payload('changed', changed), ok=False)
+        self.assertIn('exact original input', rejected.stderr)
+        self.cli('approve', '--approval-file', path)
+        self.cli('validate')
+        self.assertEqual(self.manifest()['active_approval_id'], 'approve-spec-v1')
+        events = map(json.loads, (self.directory / 'decisions.jsonl').read_text().splitlines())
+        self.assertEqual(sum(event['type'] == 'approval' for event in events), 1)
+
+    def test_interrupted_withdrawal_blocks_delivery_and_retries(self):
+        self.prepared()
+        self.cli('approve', '--approval-file', self.payload('approval', self.approval()))
+        reason = 'Withdraw the approved scope'
+        self.interrupt_manifest_write(lambda: FIXTURE_CLI.revoke_approval(self.directory, reason))
+        self.cli('resume', '--format', 'json', ok=False)
+        self.cli('slice-create', '--contract-file', self.payload('slice', self.slice()), ok=False)
+        self.cli('revoke-approval', '--reason', reason)
+        self.assertIsNone(self.manifest()['active_approval_id'])
+        self.cli('validate')
+
+    def test_interrupted_missing_report_blocks_delivery_and_retries(self):
+        self.prepared()
+        self.cli('approve', '--approval-file', self.payload('approval', self.approval()))
+        evidence = self.artifact('discovery/evidence/missing.txt', 'Observed missing action')
+        path = self.payload('gap', {'report_id': 'gap', 'summary': 'Missing action',
+                                    'suspected_features': ['list-items'], 'evidence_paths': [evidence]})
+        self.interrupt_manifest_write(lambda: FIXTURE_CLI.report_missing_feature(self.directory, str(path)))
+        self.cli('resume', '--format', 'json', ok=False)
+        self.cli('slice-create', '--contract-file', self.payload('slice', self.slice()), ok=False)
+        self.cli('missing-feature', '--report-file', path)
+        self.assertEqual(self.manifest()['missing_reports']['gap']['status'], 'open')
+
+    def test_interrupted_blocker_blocks_delivery_and_retries(self):
+        self.assigned()
+        evidence = self.artifact('slices/items-slice/evidence/defect.txt', 'Failure')
+        path = self.payload('blocker', {'slice_id': 'items-slice', 'reason': 'Concrete defect',
+                                       'next_action': 'Fix defect', 'evidence_files': [evidence]})
+        self.interrupt_manifest_write(lambda: FIXTURE_CLI.reconcile_slice(
+            self.directory, 'items-slice', 'block', str(path)))
+        self.cli('resume', '--format', 'json', ok=False)
+        review = self.payload('review', self.review())
+        self.cli('reconcile', '--slice-id', 'items-slice', '--action', 'verify', '--review-file', review, ok=False)
+        self.cli('reconcile', '--slice-id', 'items-slice', '--action', 'block', '--review-file', path)
+        self.assertEqual(self.manifest()['slices']['items-slice']['status'], 'blocked')
+        self.cli('reconcile', '--slice-id', 'items-slice', '--action', 'verify', '--review-file', review, ok=False)
+
+    def test_legacy_withdrawal_journal_mismatch_blocks_new_slices(self):
+        self.prepared()
+        self.cli('approve', '--approval-file', self.payload('approval', self.approval()))
+        FIXTURE_CLI.journal(self.directory, {'type': 'approval_revoked', 'decision_id': 'approve-spec-v1',
+                                             'reason': 'Interrupted before older CLI saved the manifest'})
+        resumed = json.loads(self.cli('resume', '--format', 'json', ok=False).stdout)
+        self.assertFalse(resumed['safe_to_continue'])
+        self.assertIn('approval/withdrawal journal', ' '.join(resumed['validation_errors']))
+        self.cli('slice-create', '--contract-file', self.payload('slice', self.slice()), ok=False)
+
+    def test_reapproval_after_withdrawal_rechecks_old_slice_paths(self):
+        self.prepared()
+        self.cli('approve', '--approval-file', self.payload('approval', self.approval()))
+        self.cli('slice-create', '--contract-file', self.payload('slice', self.slice()))
+        self.cli('revoke-approval', '--reason', 'Withdraw before changing source')
+        source = self.root / 'src/service.py'
+        source.write_text(source.read_text().replace('return []', 'return ["changed"]', 1))
+        self.cli('blueprint-record', '--blueprint-file', self.payload('spec2', self.blueprint('spec-v2')))
+        self.cli('blueprint-coverage', '--coverage-file', self.payload('cov2', self.coverage('spec-v2')))
+        result = self.cli('approve', '--approval-file', self.payload('approval2', self.approval('spec-v2')), ok=False)
+        self.assertIn('A source changed since discovery: src/service.py', result.stderr)
 
     def test_review_explicit_defect_requires_unblock_before_verification(self):
         self.assigned()

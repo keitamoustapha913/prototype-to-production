@@ -210,6 +210,14 @@ def coordinator_lock(directory: Path):
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+def sync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def atomic_text(path: Path, content: str) -> None:
     atomic_bytes(path, content.encode("utf-8"))
 
@@ -223,13 +231,18 @@ def atomic_bytes(path: Path, content: bytes) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp_name, path)
+        sync_directory(path.parent)
     finally:
         if os.path.exists(temp_name):
             os.unlink(temp_name)
 
 
+def json_content(payload: dict) -> str:
+    return json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True) + "\n"
+
+
 def atomic_json(path: Path, payload: dict) -> None:
-    atomic_text(path, json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True) + "\n")
+    atomic_text(path, json_content(payload))
 
 
 def read_json(path: Path) -> dict:
@@ -243,6 +256,10 @@ def read_json(path: Path) -> dict:
 
 
 def manifest_at(directory: Path) -> dict:
+    marker = directory / ".workflow-transition.json"
+    if marker.is_file():
+        command = read_json(marker).get("request", {}).get("command", "workflow transition")
+        raise StateError(f"Interrupted {command}; retry its original command with the exact input")
     if not (directory / "manifest.json").exists():
         raise StateError(f"Initiative not initialized: {directory}. Run init first.")
     manifest = read_json(directory / "manifest.json")
@@ -539,7 +556,10 @@ def record_discovery(directory: Path, project_root: Path, audit_file: str) -> No
 def report_missing_feature(directory: Path, report_file: str) -> None:
     """Protect a suspected postapproval A->B gap without rewriting any approval."""
     candidate = read_json(Path(report_file))
+    request = {"command": "missing-feature", "input": candidate}
     with coordinator_lock(directory):
+        if recover_workflow_transition(directory, request):
+            return
         manifest = manifest_at(directory)
         mode = initiative_mode(manifest)
         if not manifest.get("active_approval_id"):
@@ -567,9 +587,8 @@ def report_missing_feature(directory: Path, report_file: str) -> None:
         relative = f"discovery/missing/{report_id}.json"
         if (directory / relative).exists():
             raise StateError("Refusing to overwrite previous missing-feature evidence")
-        atomic_json(directory / relative, candidate)
         manifest["missing_reports"][report_id] = {
-            "path": relative, "sha256": digest_of(directory / relative),
+            "path": relative, "sha256": hashlib.sha256(json_content(candidate).encode()).hexdigest(),
             "evidence_hashes": hashes, "status": "open",
             "discovery_at_report": manifest.get("active_discovery_id"),
             "approval_id": manifest["active_approval_id"],
@@ -586,11 +605,11 @@ def report_missing_feature(directory: Path, report_file: str) -> None:
                                    "then create and verify new B and seek explicit reapproval")
         if mode == "blueprint":
             manifest["next_action"] = "Re-audit affected source/API behavior, preserve earlier decisions, then freeze a new blueprint with full coverage and explicit user approval"
-        journal(directory, {"type": "application_a_functionality_missing", "report_id": report_id,
-                            "approval_id": manifest["active_approval_id"], "suspected_features": suspected})
+        event = {"type": "application_a_functionality_missing", "report_id": report_id,
+                 "approval_id": manifest["active_approval_id"], "suspected_features": suspected}
         coverage = "A-to-blueprint" if mode == "blueprint" else "A-to-B"
         note_progress(manifest, f"Postapproval {coverage} gap {report_id}: investigation required")
-        save_workflow_state(directory, manifest)
+        save_workflow_state(directory, manifest, transition=(request, [event], {relative: candidate}))
     print(f"Recorded missing application-A behavior {report_id}; old user approval unchanged, follow-up sweep REQUIRED")
 
 
@@ -956,16 +975,59 @@ def check_approval(directory: Path, manifest: dict) -> list[str]:
     return errors
 
 
+def journal_line(event: dict) -> str:
+    return json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n"
+
+
 def journal(directory: Path, item: dict) -> None:
-    event = {**item, "at": utc_now()}
-    encoded = (json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+    encoded = journal_line({**item, "at": utc_now()}).encode("utf-8")
     with (directory / "decisions.jsonl").open("ab") as handle:
         handle.write(encoded)
         handle.flush()
         os.fsync(handle.fileno())
 
 
-def save_workflow_state(directory: Path, manifest: dict, *, slice_retry_cursor: dict | None = None) -> None:
+def recover_workflow_transition(directory: Path, request: dict, *, replay: bool = True) -> bool:
+    """Finish a prepared write under the coordinator lock, without duplicating journal entries."""
+    marker = directory / ".workflow-transition.json"
+    if not marker.is_file():
+        return False
+    pending = read_json(marker)
+    if pending["request"] != request:
+        raise StateError(f"Interrupted {pending['request']['command']}; retry it with the exact original input")
+    writes = pending["artifacts"] | {"manifest.json": pending["manifest"]}
+    journal_path = directory / "decisions.jsonl"
+    before = pending["before"]
+    journal_bytes = journal_path.read_bytes()
+    suffix = "".join(pending["lines"]).encode("utf-8")
+    if hashlib.sha256(journal_bytes).hexdigest() == before["decisions.jsonl"]:
+        append = True
+    elif journal_bytes.endswith(suffix) and hashlib.sha256(journal_bytes[:-len(suffix)]).hexdigest() == before["decisions.jsonl"]:
+        append = False
+    else:
+        raise StateError("Journal changed during interrupted workflow transition")
+    for relative, value in writes.items():
+        path = directory / relative
+        if path.resolve() != directory.resolve() / relative:
+            raise StateError(f"Invalid write path in interrupted transition: {relative}")
+        old = digest_of(path) if path.exists() else None
+        if old not in {before[relative], hashlib.sha256(json_content(value).encode()).hexdigest()}:
+            raise StateError(f"File changed during interrupted workflow transition: {relative}")
+    for relative, value in pending["artifacts"].items():
+        atomic_json(directory / relative, value)
+    if append:
+        atomic_bytes(journal_path, journal_bytes + suffix)
+    atomic_json(directory / "manifest.json", pending["manifest"])
+    atomic_text(directory / "CHECKPOINT.md", render_checkpoint(pending["manifest"]))
+    marker.unlink()
+    sync_directory(directory)
+    if replay:
+        print(f"Recovered interrupted {request['command']} and preserved its journal entries")
+    return True
+
+
+def save_workflow_state(directory: Path, manifest: dict, *, slice_retry_cursor: dict | None = None,
+                        transition: tuple[dict, list[dict], dict] | None = None) -> None:
     """Persist blueprint phase changes together with the active task position."""
     if initiative_mode(manifest) == "blueprint":
         task_id = manifest.get("active_work_id")
@@ -979,13 +1041,28 @@ def save_workflow_state(directory: Path, manifest: dict, *, slice_retry_cursor: 
                 updated = {**work, "phase": phase, "next_action": next_action,
                            "updated_at": utc_now(), "revision": work["revision"] + 1}
                 if slice_retry_cursor is None:
-                    journal(directory, {"type": "work_cursor_updated", "task": updated})
+                    event = {"type": "work_cursor_updated", "task": updated}
+                    if transition is None:
+                        journal(directory, event)
+                    else:
+                        transition[1].append(event)
                 else:
                     expected = {**updated, "updated_at": slice_retry_cursor.get("updated_at")}
                     if slice_retry_cursor != expected:
                         raise StateError("Interrupted slice cursor differs from the expected transition")
                     updated = slice_retry_cursor
                 manifest["work_items"][task_id] = updated
+    if transition is not None:
+        request, events, artifacts = transition
+        paths = ["manifest.json", "decisions.jsonl", *artifacts]
+        before = {relative: digest_of(directory / relative) if (directory / relative).exists() else None
+                  for relative in paths}
+        atomic_json(directory / ".workflow-transition.json", {
+            "request": request, "manifest": manifest, "artifacts": artifacts, "before": before,
+            "lines": [journal_line({**event, "at": utc_now()}) for event in events],
+        })
+        recover_workflow_transition(directory, request, replay=False)
+        return
     atomic_json(directory / "manifest.json", manifest)
     atomic_text(directory / "CHECKPOINT.md", render_checkpoint(manifest))
 
@@ -1274,7 +1351,10 @@ def work_update(directory: Path, project_root: Path, work_file: str) -> None:
 
 def approve(directory: Path, approval_file: str) -> None:
     candidate = read_json(Path(approval_file))
+    request = {"command": "approve", "input": candidate}
     with coordinator_lock(directory):
+        if recover_workflow_transition(directory, request):
+            return
         manifest = manifest_at(directory)
         approval, errors = validate_approval_record(directory, candidate, manifest)
         if errors:
@@ -1287,12 +1367,12 @@ def approve(directory: Path, approval_file: str) -> None:
                 if assignment["status"] != "cancelled" and not assignment.get("superseded_by"):
                     assignment["superseded_by"] = approval["decision_id"]
                     retired.append(slice_id)
-        journal(directory, {
+        event = {
             "type": "approval", "decision_id": approval["decision_id"],
             "approved_version": approval["approved_version"], "supersedes": previous,
             "approval": approval,
             **({"superseded_slice_ids": retired} if retired else {}),
-        })
+        }
         manifest["approvals"][approval["decision_id"]] = approval
         for report in manifest.get("missing_reports", {}).values():
             if report.get("status") == "open":
@@ -1315,19 +1395,22 @@ def approve(directory: Path, approval_file: str) -> None:
         })
         note_progress(manifest, f"Approved {mode} {approval['approved_version']}, decision {approval['decision_id']}",
                       completed=f"Frozen {mode} {approval['approved_version']}")
-        save_workflow_state(directory, manifest)
+        save_workflow_state(directory, manifest, transition=(request, [event], {}))
     print(f"Approved and hash-locked {approval['approved_version']} ({approval['decision_id']})")
 
 
 def revoke_approval(directory: Path, reason: str) -> None:
     if not reason.strip():
         raise StateError("A written reason is required to revoke approval")
+    request = {"command": "revoke-approval", "reason": reason}
     with coordinator_lock(directory):
+        if recover_workflow_transition(directory, request):
+            return
         manifest = manifest_at(directory)
         active = manifest.get("active_approval_id")
         if not active:
             raise StateError("No active approval to revoke")
-        journal(directory, {"type": "approval_revoked", "decision_id": active, "reason": reason})
+        event = {"type": "approval_revoked", "decision_id": active, "reason": reason}
         manifest.update({
             "active_approval_id": None, "approved_version": None, "stage": "blueprint" if initiative_mode(manifest) == "blueprint" else "prototype",
             "references": [], "next_action": "Revise blueprint and seek explicit new approval" if initiative_mode(manifest) == "blueprint" else "Revise prototype and seek explicit new approval",
@@ -1337,7 +1420,7 @@ def revoke_approval(directory: Path, reason: str) -> None:
             )],
         })
         note_progress(manifest, f"Revoked approval {active}: {reason}")
-        save_workflow_state(directory, manifest)
+        save_workflow_state(directory, manifest, transition=(request, [event], {}))
     print(f"Approval revoked (history preserved): {active}")
 
 
@@ -2208,7 +2291,8 @@ def pending_supplemental_warnings(manifest: dict, slice_id: str) -> list[str]:
             and warning.get("status") in {"pending_user_review", "rejected"}]
 
 
-def block_dependents(directory: Path, manifest: dict, prerequisite_id: str) -> None:
+def block_dependents(directory: Path, manifest: dict, prerequisite_id: str,
+                     *, staged: tuple[list[dict], dict] | None = None) -> None:
     """A newly blocked prerequisite cannot leave dependent tasks falsely ready or accepted."""
     for dependent_id, dependent in manifest["slices"].items():
         if prerequisite_id not in dependent.get("dependencies", []) or dependent["status"] == "cancelled":
@@ -2223,11 +2307,18 @@ def block_dependents(directory: Path, manifest: dict, prerequisite_id: str) -> N
             packet_path = artifact_file(directory, dependent["contract_file"])
             packet = read_json(packet_path)
             packet["status"], packet["blockers"] = "blocked", dependent["blockers"]
-            atomic_json(packet_path, packet)
-            dependent["contract_sha256"] = digest_of(packet_path)
-        journal(directory, {"type": "dependent_slice_blocked", "slice_id": dependent_id,
-                            "prerequisite": prerequisite_id, "prior_status": previous})
-        block_dependents(directory, manifest, dependent_id)
+            if staged is None:
+                atomic_json(packet_path, packet)
+            else:
+                staged[1][dependent["contract_file"]] = packet
+            dependent["contract_sha256"] = hashlib.sha256(json_content(packet).encode()).hexdigest()
+        event = {"type": "dependent_slice_blocked", "slice_id": dependent_id,
+                 "prerequisite": prerequisite_id, "prior_status": previous}
+        if staged is None:
+            journal(directory, event)
+        else:
+            staged[0].append(event)
+        block_dependents(directory, manifest, dependent_id, staged=staged)
 
 
 def unblock_dependents(directory: Path, manifest: dict) -> None:
@@ -2251,7 +2342,14 @@ def unblock_dependents(directory: Path, manifest: dict) -> None:
 
 
 def reconcile_slice(directory: Path, slice_id: str, action: str, review_file: str | None = None) -> None:
+    transition = None
     with coordinator_lock(directory):
+        if action == "block" and review_file:
+            blocker = read_json(Path(review_file))
+            request = {"command": "reconcile --action block", "slice_id": slice_id, "input": blocker}
+            if recover_workflow_transition(directory, request):
+                return
+            transition = (request, [], {})
         manifest = manifest_at(directory)
         if initiative_mode(manifest) == "blueprint" and action in {"report", "verify", "accept", "accept-warning"}:
             blueprint_state(directory, manifest).require_ready()
@@ -2266,7 +2364,6 @@ def reconcile_slice(directory: Path, slice_id: str, action: str, review_file: st
         if action == "block":
             if assignment["status"] == "cancelled" or not review_file:
                 raise StateError("Blocking an active slice requires --review-file with the defect and next action")
-            blocker = read_json(Path(review_file))
             if (blocker.get("slice_id") != slice_id
                     or not str(blocker.get("reason") or "").strip()
                     or not str(blocker.get("next_action") or "").strip()):
@@ -2282,12 +2379,13 @@ def reconcile_slice(directory: Path, slice_id: str, action: str, review_file: st
             assignment.setdefault("block_evidence_hashes", {}).update(hashes)
             assignment["status"] = "blocked"
             assignment["blockers"] = [blocker["reason"]]
-            block_dependents(directory, manifest, slice_id)
+            _, events, artifacts = transition
+            block_dependents(directory, manifest, slice_id, staged=(events, artifacts))
             manifest["stage"] = "implement"
             manifest["next_action"] = blocker["next_action"]
-            journal(directory, {"type": "slice_blocked", "slice_id": slice_id,
-                                "reason": blocker["reason"], "evidence_hashes": hashes,
-                                "next_action": blocker["next_action"]})
+            events.append({"type": "slice_blocked", "slice_id": slice_id,
+                           "reason": blocker["reason"], "evidence_hashes": hashes,
+                           "next_action": blocker["next_action"]})
         elif action == "unblock":
             if assignment["status"] != "blocked" or not review_file:
                 raise StateError("Only a blocked slice can be resumed with a written resolution")
@@ -2417,7 +2515,7 @@ def reconcile_slice(directory: Path, slice_id: str, action: str, review_file: st
             raise StateError(f"Unknown reconciliation action: {action}")
         note_progress(manifest, f"Slice {slice_id}: {assignment['status']} ({action})",
                       completed=f"Accepted {slice_id}" if action in {"accept", "accept-warning"} else None)
-        save_workflow_state(directory, manifest)
+        save_workflow_state(directory, manifest, transition=transition)
     print(f"Reconciled slice {slice_id}: {assignment['status']} ({action})")
 
 
@@ -2620,12 +2718,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     for name in (
-        "init", "event", "checkpoint", "conversation-record", "plan-record", "blueprint-record", "blueprint-coverage", "blueprint-index-rebuild", "work-update", "discovery-record", "discovery-capture", "missing-feature", "prototype-coverage", "approve", "revoke-approval", "slice-create", "slice-cancel",
+        "init", "event", "checkpoint", "conversation-record", "plan-record", "blueprint-record", "blueprint-coverage", "blueprint-index-rebuild", "work-update", "discovery-record", "discovery-capture", "browser-build-fingerprint", "missing-feature", "prototype-coverage", "approve", "revoke-approval", "slice-create", "slice-cancel",
         "slice-report", "reconcile", "warning-record", "warning-decide", "resume", "validate",
     ):
         sub = commands.add_parser(name)
         sub.add_argument("--project-root", required=True)
         sub.add_argument("--initiative-id", required=name not in {"resume", "validate"})
+        if name == "browser-build-fingerprint":
+            sub.add_argument("--source-path", action="append", default=[])
         if name == "init":
             sub.add_argument("--scope", choices=sorted(VALID_SCOPES), required=True)
             sub.add_argument("--next-action")
@@ -2707,6 +2807,9 @@ def main(argv: list[str] | None = None) -> int:
             record_blueprint_command(directory, args.command, args.exchange_file, project_root)
         elif args.command == "discovery-capture":
             record_blueprint_command(directory, args.command, args.capture_file, project_root)
+        elif args.command == "browser-build-fingerprint":
+            state = blueprint_state(directory, manifest_at(directory))
+            print(state.build_fingerprint(state.discovery_snapshot(args.source_path)))
         elif args.command == "discovery-record":
             if initiative_mode(manifest_at(directory)) == "blueprint":
                 record_blueprint_command(directory, args.command, args.audit_file, project_root)
