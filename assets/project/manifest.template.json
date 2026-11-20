@@ -1,5 +1,5 @@
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "initiative_id": "example-redesign",
   "scope": "page",
   "stage": "discover",
@@ -10,6 +10,7 @@
   "slices": {},
   "warnings": {},
   "discovery_audits": {},
+  "browser_captures": {},
   "active_discovery_id": null,
   "prototype_coverage": {},
   "missing_reports": {},
@@ -30,5 +31,10 @@
     "approved_style_rules": [],
     "interaction_decisions": []
   },
-  "blockers": []
+  "blockers": [],
+  "initiative_mode": "blueprint",
+  "conversation": {},
+  "blueprint_plans": {},
+  "blueprints": {},
+  "blueprint_coverage": {}
 }

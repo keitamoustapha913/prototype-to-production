@@ -1,5 +1,7 @@
 # Browser-based visual QA and acceptance
 
+The approved-B pixel, replay and capture-warning gates below apply to **prototype** mode. Blueprint-mode UI verification requires actual rendered states, concrete approved criteria and textual-spec limitations; read [blueprint-workflow.md](blueprint-workflow.md). Never claim B pixel parity when no B reference exists.
+
 The approved prototype defines the visual truth; generic opinions about dashboards do not. Verification must be **visible**: run the actual app and capture the rendered UI for each contract case so the coordinator can inspect it side by side with the hash-locked prototype screenshot. Source code and a green build are not visual proof.
 
 ## Before prototype approval: repeatable visual truth

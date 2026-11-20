@@ -1,12 +1,9 @@
 interface:
-  display_name: Prototype to Production
-  short_description: Redesign faithfully and resume saved progress
-  default_prompt: Use $prototype-to-production. If this project has an unfinished
-    redesign, resume its exact saved phase and task. Otherwise discover the existing
-    app, prototype the requested design, verify coverage and visuals, then wait for
-    my approval.
-  icon_small: assets/icon.svg
-  icon_large: assets/icon.svg
+  display_name: "Prototype to Production"
+  short_description: "Approve precise blueprints and resume faithful implementation"
+  default_prompt: "Use $prototype-to-production to investigate this task, discuss an illustrated blueprint with me, and wait for approval before implementation. Resume existing saved work first."
+  icon_small: "assets/icon.svg"
+  icon_large: "assets/icon.svg"
 policy:
   products:
   - chatgpt

@@ -1,0 +1,23 @@
+{
+  "audit_id": "empty-v1",
+  "scope": "feature",
+  "baseline_kind": "greenfield",
+  "surface": "backend",
+  "inspected_paths": [
+    "."
+  ],
+  "features": [],
+  "unresolved": [],
+  "requirements": [
+    {
+      "requirement_id": "original-feature",
+      "text": "REPLACE actual user intent",
+      "decision_ids": [
+        "answer-one"
+      ]
+    }
+  ],
+  "evidence_paths": [
+    "discovery/evidence/empty-baseline.txt"
+  ]
+}

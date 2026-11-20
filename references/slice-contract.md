@@ -1,5 +1,7 @@
 # Self-contained vertical-slice contracts
 
+For **blueprint** mode, use `blueprint-slice.template.json` and the [blueprint workflow](blueprint-workflow.md). The CLI injects exact feature/state/API/visual contracts, baseline source/requirement anchors, decision records and hashes into each slice; no runnable prototype or UI screenshots are required for backend-only work. The prototype-specific fields below apply only to **prototype** mode.
+
 The coordinator issues one `slices/<id>/contract.json` per end-to-end user flow, not per disconnected CSS task. A worker should be able to complete its slice with only the repository, this contract, the exact approved references, and existing app tests. When a referenced design detail is absent, report BLOCKED and ask the coordinator; never infer it from generic design taste.
 
 In Git projects the handoff lives under ignored `.artifacts/prototype-to-production/<id>/`. If a worker uses a **different** clone, worktree, computer or isolated filesystem, the coordinator must explicitly transfer the complete hashed initiative evidence first; Git alone will not include it. A worker lacking that directory must stop, never recreate the prototype from a prose task packet.

@@ -1,0 +1,39 @@
+{
+  "capture_id": "search-results-member",
+  "feature_id": "record-search",
+  "route": "/replace-with-actual-route",
+  "role": "member",
+  "state": "results",
+  "viewport": {
+    "width": 1440,
+    "height": 900
+  },
+  "ready_selector": "#search-results[data-state=\"results\"]",
+  "setup": [
+    {
+      "action": "fill",
+      "selector": "#search",
+      "value": "example"
+    },
+    {
+      "action": "click",
+      "selector": "#submit-search"
+    },
+    {
+      "action": "wait",
+      "selector": "#search-results[data-state=\"results\"]"
+    }
+  ],
+  "observations": {
+    "role": {
+      "selector": "#session",
+      "attribute": "data-role",
+      "expected": "member"
+    },
+    "state": {
+      "selector": "#search-results",
+      "attribute": "data-state",
+      "expected": "results"
+    }
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "decision_id": "approve-spec-v1",
+  "approved_version": "spec-v1",
+  "scope": "feature",
+  "mode": "blueprint",
+  "approved_by_user": false,
+  "user_approval_note": "REPLACE only after actual explicit approval",
+  "decision_recap_path": "approval-evidence/spec-v1-recap.md",
+  "exceptions": [],
+  "shown_paths": [
+    "blueprints/spec-v1/index.md",
+    "blueprints/spec-v1/feature.md",
+    "blueprint-coverage/spec-v1.json",
+    "approval-evidence/spec-v1-recap.md"
+  ]
+}

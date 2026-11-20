@@ -40,6 +40,8 @@ class ProjectStateTests(unittest.TestCase):
         self.test_env = {**os.environ, "GIT_CEILING_DIRECTORIES": str(self.root.parent)}
 
     def cli(self, command, *extra, success=True):
+        if command == "init":
+            extra = (*extra, "--mode", "prototype")
         result = subprocess.run(
             [sys.executable, str(SCRIPT), command, "--project-root", str(self.root),
              "--initiative-id", "billing-refresh", *map(str, extra)],

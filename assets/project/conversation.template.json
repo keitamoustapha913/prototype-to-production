@@ -1,0 +1,22 @@
+{
+  "exchange_id": "question-one",
+  "phase": "discover",
+  "question": "REPLACE with exact displayed question or proposal",
+  "basis": "REPLACE with the relevant user intent when no source or evidence path applies",
+  "options": [
+    {
+      "label": "REPLACE exact option",
+      "tradeoff": "REPLACE exact tradeoff"
+    }
+  ],
+  "recommendation": "REPLACE actual recommendation",
+  "status": "open",
+  "response": null,
+  "feature_ids": [
+    "example-feature"
+  ],
+  "requirement_ids": [],
+  "source_paths": [],
+  "illustration_paths": [],
+  "evidence_paths": []
+}

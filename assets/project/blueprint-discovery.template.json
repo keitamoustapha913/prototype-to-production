@@ -1,0 +1,65 @@
+{
+  "audit_id": "audit-v1",
+  "scope": "page",
+  "routes": [
+    "/replace-with-actual-route"
+  ],
+  "features": [
+    {
+      "feature_id": "record-search",
+      "route": "/replace-with-actual-route",
+      "behavior": "REPLACE with observed UI behavior including its data effect, validation and navigation.",
+      "roles": [
+        "REPLACE with real authorized roles"
+      ],
+      "states": [
+        "REPLACE with observed states"
+      ],
+      "source_anchors": [
+        {
+          "path": "src/REPLACE_WITH_ACTUAL_SOURCE.tsx",
+          "contains": "REPLACE_WITH_REAL_HANDLER_OR_COMPONENT"
+        }
+      ],
+      "browser_evidence": [
+        "discovery/browser/REPLACE_WITH_PATH_PRINTED_BY_DISCOVERY_CAPTURE.png"
+      ]
+    }
+  ],
+  "unresolved": [
+    "Replace examples with complete investigated A behavior before freezing"
+  ],
+  "sweeps": [
+    {
+      "sweep_id": "source-and-browser",
+      "routes_checked": [
+        "/replace-with-actual-route"
+      ],
+      "source_files_checked": [
+        "src/REPLACE_WITH_ACTUAL_SOURCE.tsx"
+      ],
+      "new_feature_ids": [
+        "record-search"
+      ]
+    },
+    {
+      "sweep_id": "independent-full-sweep",
+      "routes_checked": [
+        "/replace-with-actual-route"
+      ],
+      "source_files_checked": [
+        "src/REPLACE_WITH_ACTUAL_SOURCE.tsx"
+      ],
+      "new_feature_ids": []
+    }
+  ],
+  "baseline_kind": "existing",
+  "surface": "ui",
+  "requirements": [],
+  "behavior_contracts": {
+    "record-search": {
+      "behavior_contract": "REPLACE with exact observed triggers, permissions, state transitions, and side effects."
+    }
+  },
+  "retired_source_paths": []
+}

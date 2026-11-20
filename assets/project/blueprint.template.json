@@ -1,0 +1,68 @@
+{
+  "version": "spec-v1",
+  "baseline_id": "audit-v1",
+  "plan_version": "plan-v1",
+  "surface": "backend",
+  "document_paths": [
+    "blueprints/spec-v1/index.md"
+  ],
+  "decision_ids": [
+    "answer-one"
+  ],
+  "open_decisions": [],
+  "features": [
+    {
+      "feature_id": "example-feature",
+      "purpose": "REPLACE user goal",
+      "baseline_ids": [
+        "original-feature"
+      ],
+      "classification": "KEEP",
+      "decision_ids": [
+        "answer-one"
+      ],
+      "spec_paths": [
+        "blueprints/spec-v1/feature.md"
+      ],
+      "anatomy": "REPLACE actual module relationships",
+      "behavior_contract": "REPLACE trigger, guards, validation, effects and navigation",
+      "states": [
+        "success",
+        "forbidden",
+        "error"
+      ],
+      "dependencies": [],
+      "backend_contract": {
+        "request": "REPLACE method/path/schema",
+        "response": "REPLACE schema/status",
+        "authorization": "REPLACE roles/rules",
+        "side_effects": "REPLACE persistence/transaction effects",
+        "failure": "REPLACE error/retry semantics",
+        "compatibility": "REPLACE versioning/migration rules"
+      },
+      "acceptance_checks": [
+        {
+          "check_id": "example-check",
+          "kind": "backend",
+          "expected": "REPLACE exact observable value",
+          "state_expectations": {
+            "success": "REPLACE observed success result",
+            "forbidden": "REPLACE observed authorization result",
+            "error": "REPLACE observed error result",
+            "backend_failure": "REPLACE failure/retry semantics"
+          },
+          "command": [
+            "python3",
+            "tests/example/verify.py",
+            "example-check"
+          ]
+        }
+      ],
+      "implementation_paths": [
+        "src/example/**",
+        "tests/example/**"
+      ],
+      "prerequisite_feature_ids": []
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "slice_id": "example-slice",
+  "scope": "feature",
+  "owner": "unassigned",
+  "status": "draft",
+  "blueprint_version": "spec-v1",
+  "feature_ids": [
+    "example-feature"
+  ],
+  "allowed_paths": [
+    "src/example/**"
+  ],
+  "dependencies": [],
+  "functional_tests": [
+    "example-check"
+  ],
+  "test_plan": "REPLACE real fixtures and executed checks",
+  "prohibited_deviations": [
+    "REPLACE exact approved constraints"
+  ]
+}

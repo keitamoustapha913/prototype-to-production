@@ -1,0 +1,13 @@
+{
+  "version": "spec-v1",
+  "baseline_id": "audit-v1",
+  "mappings": [
+    {
+      "baseline_id": "original-feature",
+      "feature_id": "example-feature",
+      "acceptance_ids": [
+        "example-check"
+      ]
+    }
+  ]
+}

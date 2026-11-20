@@ -5,8 +5,12 @@
   "summary": "REPLACE with actual progress already made",
   "next_action": "REPLACE with one concrete, safe action to perform next",
   "completed_steps": [],
-  "pending_steps": ["REPLACE with next unfinished, independently checkable step"],
+  "pending_steps": [
+    "REPLACE with next unfinished, independently checkable step"
+  ],
   "blockers": [],
   "code_paths": [],
-  "artifact_paths": []
+  "artifact_paths": [],
+  "pending_question_id": null,
+  "absent_code_paths": []
 }

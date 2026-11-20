@@ -1,5 +1,7 @@
 # Functionality-first A-to-B discovery and parity gate
 
+The runnable A-to-B parity and replay requirements below apply to **prototype** mode. Blueprint mode uses source/browser or backend evidence and A-to-spec coverage, with a verified empty baseline for greenfield; read [blueprint-workflow.md](blueprint-workflow.md).
+
 This procedure is **mandatory for every new prototype approval**, whether the request covers one control, one page or an entire app. The user gives the design direction, not a list of existing features. Codex must discover application A's behaviors from real code and browser operation before designing B. A prototype is **not approval-ready** until `discovery-record` and `prototype-coverage` both succeed for the exact version to be shown.
 
 ## Source-led inventory of application A

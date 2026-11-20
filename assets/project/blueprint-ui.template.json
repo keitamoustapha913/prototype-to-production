@@ -1,0 +1,90 @@
+{
+  "version": "spec-v1",
+  "baseline_id": "audit-v1",
+  "plan_version": "plan-v1",
+  "surface": "ui",
+  "document_paths": [
+    "blueprints/spec-v1/index.md"
+  ],
+  "decision_ids": [
+    "answer-one"
+  ],
+  "open_decisions": [],
+  "features": [
+    {
+      "feature_id": "example-feature",
+      "purpose": "REPLACE user goal",
+      "baseline_ids": [
+        "original-feature"
+      ],
+      "classification": "KEEP",
+      "decision_ids": [
+        "answer-one"
+      ],
+      "spec_paths": [
+        "blueprints/spec-v1/feature.md"
+      ],
+      "anatomy": "REPLACE actual module relationships",
+      "behavior_contract": "REPLACE trigger, guards, validation, effects and navigation",
+      "states": [
+        "success"
+      ],
+      "dependencies": [],
+      "acceptance_checks": [
+        {
+          "check_id": "example-visual",
+          "kind": "visual",
+          "expected": "REPLACE exact style measurement",
+          "command": [
+            "python3",
+            "tests/example/verify.py",
+            "example-visual"
+          ],
+          "measurement": {
+            "selector": "#example-list",
+            "property": "gap"
+          }
+        },
+        {
+          "check_id": "example-action",
+          "kind": "behavior",
+          "expected": "REPLACE exact interaction result",
+          "command": [
+            "python3",
+            "tests/example/verify.py",
+            "example-action"
+          ]
+        }
+      ],
+      "visual_contract": {
+        "tokens": {
+          "gap": "REPLACE approved value"
+        },
+        "responsive": "REPLACE exact breakpoint behavior",
+        "accessibility": "REPLACE focus/keyboard/announcement rules",
+        "render_cases": [
+          {
+            "case_id": "default-desktop",
+            "route": "/example",
+            "state": "success",
+            "viewport": {
+              "width": 1440,
+              "height": 900
+            },
+            "command": [
+              "python3",
+              "tests/example/render.py",
+              "default-desktop"
+            ],
+            "ready_selector": "#example-list[data-state=\"success\"]"
+          }
+        ]
+      },
+      "implementation_paths": [
+        "src/example/**",
+        "tests/example/**"
+      ],
+      "prerequisite_feature_ids": []
+    }
+  ]
+}

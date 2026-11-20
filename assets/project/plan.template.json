@@ -1,0 +1,18 @@
+{
+  "version": "plan-v1",
+  "baseline_id": "audit-v1",
+  "scope": "feature",
+  "objective": "REPLACE actual goal",
+  "workstreams": [
+    "REPLACE actual workstream"
+  ],
+  "dependencies": [],
+  "risks": [],
+  "decision_ids": [
+    "answer-one"
+  ],
+  "document_paths": [
+    "plans/plan-v1/roadmap.md"
+  ],
+  "blueprint_index_path": "plans/plan-v1/blueprints/index.md"
+}

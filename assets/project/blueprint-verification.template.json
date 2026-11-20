@@ -1,0 +1,24 @@
+{
+  "slice_id": "example-slice",
+  "reviewer": "REPLACE independent reviewer",
+  "notes": "REPLACE actual observed comparison",
+  "checks": [
+    {
+      "check_id": "example-check",
+      "result": "BLOCKED",
+      "expected": "REPLACE exact approved value",
+      "observed": null,
+      "command": [
+        "python3",
+        "tests/example/verify.py",
+        "example-check"
+      ],
+      "output_file": "slices/example-slice/evidence/check.json"
+    }
+  ],
+  "rendered_cases": [],
+  "specification_limits": "REPLACE limits; no B pixel reference exists in blueprint mode",
+  "test_source_paths": [
+    "tests/REPLACE_actual_test_source.py"
+  ]
+}
