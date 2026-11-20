@@ -1,6 +1,7 @@
 """Black-box blueprint contracts; fixtures are evidence, never real user approvals."""
 import base64
 import copy
+import hashlib
 from functools import partial
 from http.server import ThreadingHTTPServer
 import importlib.util
@@ -17,6 +18,7 @@ from unittest.mock import patch
 
 from fixtures.blueprint_browser_probe import ItemsHandler
 from test_project_state import png
+from scripts import slice_evidence as SLICE_EVIDENCE_MODULE
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'scripts/project_state.py'
 FIXTURE_VIEWPORT = {'width': 160, 'height': 160}
@@ -25,6 +27,10 @@ BACKEND_OUTCOMES = {'success': '200 JSON array', 'forbidden': '403 forbidden',
 CLI_SPEC = importlib.util.spec_from_file_location('blueprint_fixture_cli', SCRIPT)
 FIXTURE_CLI = importlib.util.module_from_spec(CLI_SPEC)
 CLI_SPEC.loader.exec_module(FIXTURE_CLI)
+SLICE_REVIEW_SPEC = importlib.util.spec_from_file_location(
+    'blueprint_fixture_slice_review', SCRIPT.with_name('slice_review.py'))
+SLICE_REVIEW_MODULE = importlib.util.module_from_spec(SLICE_REVIEW_SPEC)
+SLICE_REVIEW_SPEC.loader.exec_module(SLICE_REVIEW_MODULE)
 
 
 class BlueprintTests(unittest.TestCase):
@@ -35,6 +41,61 @@ class BlueprintTests(unittest.TestCase):
         self.directory = self.root / 'design/redesigns/sample-work'
         self.env = {**os.environ, 'GIT_CEILING_DIRECTORIES': str(self.root.parent)}
         self.env.pop('P2P_APP_URL', None)
+
+    def test_shared_identity_sweep_catches_same_api_route_and_scopes_tokens_to_route(self):
+        packets = {
+            'provider': {'feature_contracts': [{'feature_id': 'a',
+                'backend_contract': {'request': 'GET /items; no body', 'response': '200 JSON array'},
+                'visual_contract': {'tokens': {'gap': '16px'}, 'render_cases': [{'route': '/items', 'ready_selector': '#items'}]}}]},
+            'consumer': {'feature_contracts': [{'feature_id': 'b',
+                'backend_contract': {'request': 'GET /items; no body', 'response': '200 object'},
+                'visual_contract': {'tokens': {'gap': '24px'}, 'render_cases': [{'route': '/items', 'ready_selector': '#items'}]}}]},
+            'other-screen': {'feature_contracts': [{'feature_id': 'c',
+                'visual_contract': {'tokens': {'gap': '8px'}, 'render_cases': [{'route': '/settings', 'ready_selector': '#settings'}]}}]},
+        }
+        conflicts = SLICE_REVIEW_MODULE.SliceReview.shared_identity_conflicts(None, packets)
+        self.assertIn('GET /items has divergent responses', conflicts)
+        self.assertIn('/items component #items token gap has divergent values', conflicts)
+        self.assertFalse(any('/settings token gap' in conflict for conflict in conflicts))
+
+    def test_v3_dependency_requires_typed_declaration_and_rejects_implicit_provider_path(self):
+        feature = self.reviewed_blueprint(multiple=True)
+        provider = self.guide_candidate(feature)
+        consumer = self.guide_candidate(feature, 'adapter-slice', path='src/adapter.py', deps=('items-slice',))
+        del consumer['dependency_contracts']
+        missing = self.review_cli('slice-plan', {'slices': [provider, consumer]}, ok=False)
+        self.assertIn('declare how every dependency is consumed', missing.stderr)
+
+    def test_v3_dependency_rejects_provider_path_referenced_without_shared_declaration(self):
+        feature = self.reviewed_blueprint(multiple=True)
+        provider = self.guide_candidate(feature)
+        consumer = self.guide_candidate(feature, 'adapter-slice', path='src/adapter.py', deps=())
+        guide_path = self.directory / consumer['guide_path']
+        guide_path.write_text(guide_path.read_text().replace(
+            'The request handler checks the caller before invoking item storage.',
+            'The request handler uses `src/service.py` from the provider.'), encoding='utf-8')
+        self.review_cli('slice-plan', {'slices': [provider, consumer]})
+        self.review_cli('slice-review-record', self.review_input())
+        self.review_cli('slice-review-record', self.review_input('adapter-slice'))
+        blocked = self.review_cli('slice-collection-validate', self.collection_input(), ok=False)
+        checks = json.loads(blocked.stdout)['checks']
+        self.assertIn('provider-owned paths referenced without a declared dependency',
+                      checks['dependencies']['explanation'])
+
+    def test_ordering_only_dependency_cannot_hide_a_referenced_provider_file(self):
+        feature = self.reviewed_blueprint(multiple=True)
+        provider = self.guide_candidate(feature)
+        consumer = self.guide_candidate(feature, 'adapter-slice', path='src/adapter.py', deps=('items-slice',))
+        guide_path = self.directory / consumer['guide_path']
+        guide_path.write_text(guide_path.read_text().replace(
+            'Read accepted prerequisites: items-slice',
+            'Read accepted prerequisites: items-slice; use `src/service.py`.'), encoding='utf-8')
+        self.review_cli('slice-plan', {'slices': [provider, consumer]})
+        self.review_cli('slice-review-record', self.review_input())
+        self.review_cli('slice-review-record', self.review_input('adapter-slice'))
+        blocked = self.review_cli('slice-collection-validate', self.collection_input(), ok=False)
+        checks = json.loads(blocked.stdout)['checks']
+        self.assertIn('need an interface dependency declaration', checks['dependencies']['explanation'])
 
     def cli(self, command, *args, ok=True):
         result = subprocess.run([sys.executable, str(SCRIPT), command,
@@ -430,8 +491,15 @@ document.getElementById('observation').textContent = JSON.stringify({
         self.cli('init', '--scope', 'feature')
         self.assertNotIn('initiative_mode', self.manifest())
 
-    def start(self):
+    def start(self, *, review=False):
         self.cli('init', '--scope', 'feature')
+        if not review:
+            # Reproduce a blueprint manifest written before conversational review existed.
+            manifest = self.manifest()
+            manifest.pop('slice_review_required', None)
+            manifest['schema_version'] = 4
+            (self.directory / 'manifest.json').write_text(json.dumps(manifest))
+
 
     def exchange(self, exchange_id='choose-layout', status='decided', **changes):
         value = {'exchange_id': exchange_id, 'phase': 'discover',
@@ -831,6 +899,69 @@ document.getElementById('observation').textContent = JSON.stringify({
     def test_command(self, *args):
         return [sys.executable, 'tests/test_items.py', *args]
 
+    def fixture_annexes(self, feature):
+        return {
+            'backend': {
+                'Inputs and outputs': 'GET /items; no body. 200 JSON array.',
+                'Authorization and validation': 'member only. Deny outsiders before querying.',
+                'Persistence and transactions': 'Read the current store without a transaction spanning requests.',
+                'Concurrency and retries': '403 forbidden; 500 retryable.',
+                'Side effects and observability': 'none beyond existing logs.',
+                'Compatibility and rollback': 'Retain response schema; no migration.',
+                'Verification': 'Run the approved member and outsider fixtures.',
+            },
+            'ui': {
+                'Route and entry': 'Open /items as a signed-in member.',
+                'Viewports and breakpoints': 'Show a single column under 768px.',
+                'Layout and tokens': 'gap = 16px between item rows.',
+                'Copy and assets': 'Retain the existing Items label.',
+                'States and roles': 'Show success, loading and forbidden as approved.',
+                'Keyboard and assistive technology': 'Focusable list with announced loading.',
+                'Events and dependencies': 'Opening /items calls the approved service.',
+                'Render evidence': 'Capture the gap for ' + ', '.join(
+                    f"{case['case_id']} at {case['route']} {case['ready_selector']} {case['viewport']}"
+                    for case in feature.get('visual_contract', {}).get('render_cases', [])),
+            },
+            'api': {
+                'Method and route': 'GET /items serves member items.',
+                'Request and response schemas': '`{"request":{"type":"object"},"response":{"type":"array"}}`',
+                'Statuses and error schemas': '`{"errors":{"403":{"type":"object"}}}`',
+                'Authentication and scope': 'Member session is required.',
+                'Validation and query options': 'No request body or pagination parameters.',
+                'Concurrency and timeouts': 'Retain the service timeout behavior.',
+                'Side effects and compatibility': 'Read only and preserve existing response.',
+                'Verification': 'Run API fixtures for success and forbidden.',
+            },
+            'mcp': {
+                'Server and transport': 'Expose the read tool on the fixture MCP transport.',
+                'Registration and capabilities': 'Register list_items with an item-list description.',
+                'Input and output schemas': '`{"input":{"type":"object"},"output":{"type":"array"}}`',
+                'Permissions and consent': 'Only the current member may call it.',
+                'Protocol and tool errors': 'Map forbidden as a tool error.',
+                'Cancellation and timeouts': 'Propagate cancellation to the service.',
+                'Streaming and data exposure': 'Return bounded items for the member only.',
+                'Client invocation and verification': 'Invoke tools/call list_items from the fixture client.',
+            },
+            'script': {
+                'Entry point and runtime': 'Run the Python item fixture entry point.',
+                'Flags and configuration': 'Accept the explicit member fixture flag.',
+                'Environment and working directory': 'Run from the application root.',
+                'Inputs and outputs': 'Read a member fixture and print the JSON result.',
+                'File mutations': 'Read the fixture without changing files.',
+                'Exit codes and streams': 'Exit 0 on success and 1 on service failure.',
+                'Recovery and concurrency': 'Retry after recovering the service.',
+                'Verification': 'Check stdout and exit status for each case.',
+            },
+        }
+
+    def approved_fixture_annexes(self, feature, surfaces):
+        annexes = self.fixture_annexes(feature)
+        return {
+            surface: {field: json.loads(value.strip('`')) if value.startswith('`{') else value
+                      for field, value in annexes[surface].items()}
+            for surface in surfaces
+        }
+
     def blueprint(self, version='spec-v1', surface='backend'):
         feature = {'feature_id':'items-feature','purpose':'Member can list items',
             'baseline_ids':['list-items'],'classification':'KEEP','decision_ids':['choose-layout'],
@@ -863,16 +994,27 @@ document.getElementById('observation').textContent = JSON.stringify({
                                            'measurement':{'selector':'#items','property':'gap'}},
                 {'check_id':'items-behavior','kind':'behavior','expected':'Member can load items; outsider denied',
                  'command':self.test_command('visual','items-behavior')}]
-        return {'version':version,'baseline_id':'audit-v1','plan_version':'plan-v1',
-            'surface':surface,'document_paths':[f'blueprints/{version}/index.md'],
-            'decision_ids':['choose-layout'],'features':[feature],'open_decisions':[]}
+        value = {'version':version,'baseline_id':'audit-v1','plan_version':'plan-v1',
+                 'surface':surface,'document_paths':[f'blueprints/{version}/index.md'],
+                 'decision_ids':['choose-layout'],'features':[feature],'open_decisions':[]}
+        if FIXTURE_CLI.requires_slice_review(manifest):
+            value['surface_contract_version'] = 2
+            primary_surfaces = ('ui', 'backend') if surface == 'fullstack' else (surface,)
+            feature['surface_contracts'] = self.approved_fixture_annexes(feature, primary_surfaces)
+            source = 'loading' if 'loading' in feature['states'] else 'error'
+            feature['state_transitions'] = [
+                {'from': source, 'to': state, 'trigger': 'Read the next item request',
+                 'guard': f'The approved result is {state}', 'effect': f'Return the approved {state} outcome'}
+                for state in feature['states'] if state != source
+            ]
+        return value
 
     def coverage(self, version='spec-v1', surface='backend'):
         return {'version':version,'baseline_id':'audit-v1','mappings':[{'baseline_id':'list-items',
             'feature_id':'items-feature','acceptance_ids':['items-access','items-behavior'] if surface=='ui' else ['items-access']}]}
 
-    def prepared(self, surface='backend'):
-        self.start()
+    def prepared(self, surface='backend', *, review=False):
+        self.start(review=review)
         self.exchange()
         self.record_baseline(self.baseline(surface))
         plan = self.plan()
@@ -893,6 +1035,1211 @@ document.getElementById('observation').textContent = JSON.stringify({
                 'shown_paths':[f'blueprints/{version}/index.md',f'blueprints/{version}/items.md',
                                f'blueprint-coverage/{version}.json', recap],
                 'decision_recap_path': recap, 'exceptions': []}
+
+    def test_negative_slice_decision_cannot_approve(self):
+        feature = self.reviewed_blueprint()
+        self.review_cli('slice-plan', {'slices': [self.guide_candidate(feature)]})
+        value = self.review_input() | {'user_response': 'No. I reject items-slice revision 1.'}
+        result = self.with_slice_consent('slice-review-record', value, ok=False)
+        self.assertIn('separate explicit user instruction', result.stderr)
+        self.review_cli('slice-review-record', value, ok=False)
+        self.assertEqual(self.manifest()['slice_review']['reviews'], {})
+
+    def test_negative_start_decision_cannot_release(self):
+        feature = self.reviewed_blueprint()
+        self.review_cli('slice-plan', {'slices': [self.guide_candidate(feature)]})
+        self.review_cli('slice-review-record', self.review_input())
+        package = self.lock_reviewed_package()
+        value = package | {'instruction': 'start implementation', 'authorized_by_user': True,
+                           'user_response': 'Do not start implementation of package-v1.'}
+        result = self.with_slice_consent('implementation-authorize', value, ok=False)
+        self.assertIn('separate explicit user instruction', result.stderr)
+        self.review_cli('implementation-authorize', value, ok=False)
+        self.review_cli('slice-release', package | {'slice_id': 'items-slice'}, ok=False)
+        self.assertEqual(self.manifest()['slices'], {})
+
+    def test_question_is_atomic_and_blocking_other_slice_preserves_cursor(self):
+        feature = self.reviewed_blueprint(multiple=True)
+        self.review_cli('slice-plan', {'slices': [self.guide_candidate(feature),
+            self.guide_candidate(feature, 'other-slice', path='src/adapter.py')]})
+        self.exchange('guard-question', status='open', phase='slice_review', feature_ids=['items-feature'])
+        before = self.manifest()['slice_review']
+        self.assertEqual(before['pending_question_id'], 'guard-question')
+        self.review_cli('slice-review-record', {'action': 'block', 'slice_id': 'other-slice', 'proposal_revision': 1,
+            'reason': 'Missing adapter recovery details',
+            'evidence_paths': [self.artifact('inputs/adapter-block.md', 'The design omits recovery details.')]})
+        resumed = json.loads(self.cli('resume', '--format', 'json', ok=False).stdout)
+        self.assertEqual(resumed['slice_review']['current_slice_id'], 'items-slice')
+        self.assertEqual(resumed['slice_review']['pending_question_id'], 'guard-question')
+
+    def test_slice_exchange_cannot_bind_unknown_requirement(self):
+        feature = self.reviewed_blueprint()
+        self.review_cli('slice-plan', {'slices': [self.guide_candidate(feature)]})
+        result = self.cli('conversation-record', '--exchange-file', self.payload('unknown-scope', {
+            'exchange_id': 'scope-question', 'phase': 'slice_review', 'question': 'Which roles can read?',
+            'status': 'open', 'basis': 'Review approved guards', 'feature_ids': ['items-feature'],
+            'requirement_ids': ['unrelated-requirement'],
+        }), ok=False)
+        self.assertIn('requirement', result.stderr)
+
+    def test_review_action_type_returns_actionable_blocker(self):
+        feature = self.reviewed_blueprint()
+        self.review_cli('slice-plan', {'slices': [self.guide_candidate(feature)]})
+        result = self.review_cli('slice-review-record', {'action': [], 'slice_id': 'items-slice',
+                                                        'proposal_revision': 1}, ok=False)
+        self.assertIn('action', result.stderr)
+
+    def test_slice_review_blocks_unresolvable_walkthrough_symbol(self):
+        feature = self.reviewed_blueprint()
+        self.review_cli('slice-plan', {'slices': [self.guide_candidate(feature)]})
+        value = self.review_input()
+        handoff = value['handoff_review']
+        handoff['read_only_scenarios'][0]['references'][0]['symbol'] = 'Missing reviewed guide heading'
+        attachment = self.directory / handoff['walkthrough']['evidence_path']
+        record = json.loads(attachment.read_text())
+        record['cases'][0]['references'][0]['symbol'] = 'Missing reviewed guide heading'
+        attachment.write_text(json.dumps(record))
+        value = self.with_slice_consent('slice-review-record', value)
+        result = self.review_cli('slice-review-record', value, ok=False)
+        self.assertIn('Cannot resolve walkthrough symbol', result.stderr)
+        self.assertEqual(self.manifest()['slice_review']['reviews'], {})
+
+    def test_interrupted_incomplete_inventory_returns_blocked_result(self):
+        self.reviewed_blueprint()
+        request = self.payload('incomplete-inventory', {'slices': []})
+        recover = FIXTURE_CLI.recover_workflow_transition
+
+        def interrupt(directory, value, *, replay=True):
+            if not replay and (directory / '.workflow-transition.json').exists():
+                raise OSError('interrupted inventory write')
+            return recover(directory, value, replay=replay)
+
+        with patch.object(FIXTURE_CLI, 'recover_workflow_transition', side_effect=interrupt):
+            with self.assertRaisesRegex(OSError, 'interrupted inventory write'):
+                FIXTURE_CLI.run_slice_review(self.directory, 'slice-plan', str(request))
+        recovered = self.cli('slice-plan', '--input-file', request, ok=False)
+        journal = (self.directory / 'decisions.jsonl').read_bytes()
+        retried = self.cli('slice-plan', '--input-file', request, ok=False)
+        self.assertEqual(recovered.returncode, 2)
+        self.assertEqual(recovered.stdout, retried.stdout)
+        self.assertEqual(recovered.stderr, retried.stderr)
+        self.assertEqual((self.directory / 'decisions.jsonl').read_bytes(), journal)
+
+    def test_delegating_another_slice_preserves_answered_question_cursor(self):
+        feature = self.reviewed_blueprint(multiple=True)
+        first = self.guide_candidate(feature) | {'dependency_contracts': []}
+        second = self.guide_candidate(feature, 'adapter-slice', path='src/adapter.py') | {
+            'dependency_contracts': []}
+        self.review_cli('slice-plan', {'slices': [first, second]})
+        question = 'Does the membership guard still run before reading storage?'
+        self.exchange('guard-question', phase='slice_review', status='open', question=question)
+        self.exchange('guard-answer', phase='slice_review', question=question, responds_to='guard-question',
+                      response='Keep the guard before storage.', record_type='slice_detail',
+                      slice_id='items-slice', proposal_revision=1, clarifies_decision_ids=['choose-layout'])
+        result = self.review_cli('slice-review-record', self.review_input('adapter-slice', action='delegate'))
+        self.assertEqual(result['reviews']['adapter-slice']['result'], 'delegated_validated')
+        self.assertEqual(result['pending_question_id'], 'guard-question')
+        self.assertEqual(result['current_slice_id'], 'items-slice')
+        resumed = json.loads(self.cli('resume', '--format', 'json').stdout)
+        self.assertEqual(resumed['active_question_answer']['exchange_id'], 'guard-answer')
+
+    def test_register_keeps_verbatim_question_with_a_custom_next_action(self):
+        feature = self.reviewed_blueprint()
+        candidate = self.guide_candidate(feature) | {'dependency_contracts': []}
+        self.review_cli('slice-plan', {'slices': [candidate]})
+        question = 'Does the membership guard still run before reading storage?'
+        self.exchange('guard-question', phase='slice_review', status='open', question=question)
+        self.review_cli('slice-review-record', {'slice_id': 'items-slice', 'proposal_revision': 1,
+            'action': 'question', 'pending_question_id': 'guard-question', 'next_action': 'Wait for confirmation'})
+        register = self.review_cli('slice-register')
+        self.assertEqual(register['pending_question']['question'], question)
+        markdown = (self.directory / register['register_path']).read_text()
+        self.assertIn(question, markdown)
+        self.assertIn('Wait for confirmation', markdown)
+
+    def test_committed_collection_retry_reuses_report(self):
+        feature = self.reviewed_blueprint()
+        self.review_cli('slice-plan', {'slices': [self.guide_candidate(feature)]})
+        self.review_cli('slice-review-record', self.review_input())
+        data = self.collection_input()
+        self.assertEqual(self.review_cli('slice-collection-validate', data),
+                         self.review_cli('slice-collection-validate', data))
+
+    def test_collection_requires_case_grounded_journey_evidence_before_lock(self):
+        feature = self.reviewed_blueprint()
+        self.review_cli('slice-plan', {'slices': [self.guide_candidate(feature)]})
+        self.review_cli('slice-review-record', self.review_input())
+        data = self.collection_input()
+        data['semantic_checks']['end_to_end_journeys']['case_conclusions'] = []
+        response = self.review_cli('slice-collection-validate', data, ok=False)
+        check = json.loads(response.stdout)['checks']['end_to_end_journeys']
+        self.assertEqual(check['result'], 'BLOCKED')
+        self.assertIn('exact feature/check', check['explanation'])
+        self.review_cli('slice-package-preview', ok=False)
+
+    def test_missing_coverage_and_rejected_alternatives_appear_in_register(self):
+        feature = self.reviewed_blueprint()
+        response = self.review_cli('slice-plan', {'slices': []}, ok=False)
+        self.assertIn('items-access', response.stderr)
+        register = self.review_cli('slice-register')
+        self.assertEqual(register['planning_gaps']['feature_checks'], [['items-feature', 'items-access']])
+        self.review_cli('slice-plan', {'slices': [self.guide_candidate(feature)]})
+        self.exchange('guard-option', phase='slice_review', status='open', feature_ids=['items-feature'])
+        question = 'Keep the existing authorization and response shape?'
+        self.exchange('guard-rejection', phase='slice_review', status='rejected', question=question,
+                      responds_to='guard-option', response='Reject the alternative that changes the guard.',
+                      feature_ids=['items-feature'])
+        register = self.review_cli('slice-register')
+        self.assertEqual(register['rejected_alternatives']['guard-rejection']['slice_id'], 'items-slice')
+        self.assertIn('guard-rejection', (self.directory / register['register_path']).read_text())
+
+    def test_clarification_correction_preserves_history_and_freezes_effective_decision(self):
+        feature = self.reviewed_blueprint()
+        self.review_cli('slice-plan', {'slices': [self.guide_candidate(feature)]})
+        q = 'Does the member guard run before storage?'
+        self.exchange('guard-question', phase='slice_review', status='open', question=q, feature_ids=['items-feature'])
+        binding = {'phase': 'slice_review', 'question': q, 'responds_to': 'guard-question',
+                   'feature_ids': ['items-feature'], 'record_type': 'slice_detail', 'slice_id': 'items-slice',
+                   'proposal_revision': 1, 'clarifies_decision_ids': ['choose-layout']}
+        self.exchange('guard-answer', response='Yes, check it before querying.', **binding)
+        self.exchange('guard-correction', response='Check the member role before all storage reads.',
+                      supersedes='guard-answer', **binding)
+        candidate = self.guide_candidate(feature, revision=2, detail='guard-correction')
+        summary = self.review_cli('slice-draft', candidate)
+        contract = json.loads((self.directory / summary['slices']['items-slice']['contract_path']).read_text())
+        self.assertIn('guard-correction', contract['decision_ids'])
+        self.assertNotIn('guard-answer', contract['decision_ids'])
+        self.assertTrue((self.directory / 'conversation/guard-answer.json').is_file())
+        self.review_cli('slice-review-record', self.review_input(exchanges=('guard-question', 'guard-correction')))
+
+    def test_reviewed_blueprint_rejects_application_absolute_runner(self):
+        self.test_command = lambda *args: [sys.executable, str(self.root / 'tests/test_items.py'), *args]
+        self.prepared(review=True)
+        result = self.cli('approve', '--approval-file', self.payload('approval', self.approval()), ok=False)
+        self.assertIn('workspace-specific path', result.stderr)
+
+    def test_missing_lifecycle_journal_events_block_release(self):
+        feature = self.reviewed_blueprint()
+        self.review_cli('slice-plan', {'slices': [self.guide_candidate(feature)]})
+        self.review_cli('slice-review-record', self.review_input())
+        package = self.lock_reviewed_package()
+        self.authorize_fixture(package)
+        journal = self.directory / 'decisions.jsonl'
+        journal.write_text(''.join(line + '\n' for line in journal.read_text().splitlines()
+            if json.loads(line).get('type') not in {'slice_spec_reviewed', 'slice_package_locked',
+                                                  'slice_implementation_authorized'}))
+        response = self.review_cli('slice-release', package | {'slice_id': 'items-slice'}, ok=False)
+        self.assertIn('lifecycle history', response.stderr)
+        self.assertEqual(self.manifest()['slices'], {})
+
+    def test_suspension_preserves_authorized_work_and_detects_later_writes(self):
+        feature = self.reviewed_blueprint()
+        self.review_cli('slice-plan', {'slices': [self.guide_candidate(feature)]})
+        self.review_cli('slice-review-record', self.review_input())
+        package = self.lock_reviewed_package()
+        self.authorize_fixture(package)
+        self.review_cli('slice-release', package | {'slice_id': 'items-slice'})
+        source = self.root / 'src/service.py'
+        source.write_text(source.read_text() + '\n# Work written while this slice was released.\n')
+        paused_source = source.read_bytes()
+        self.review_cli('slice-review-record', {'action': 'reopen', 'slice_id': 'items-slice',
+                                                'proposal_revision': 1, 'user_response': 'Reopen this slice.'})
+        self.cli('validate')
+        source.write_text(source.read_text() + '\n# Work written after the pause.\n')
+        result = self.cli('validate', ok=False)
+        self.assertIn('Suspended source changed after pause', result.stderr)
+        self.assertIn('src/service.py', result.stderr)
+        source.write_bytes(paused_source)
+        self.review_cli('slice-review-record', self.review_input())
+        replacement = self.lock_reviewed_package(version=2)
+        self.authorize_fixture(replacement)
+        before_release = source.read_bytes()
+        source.write_bytes(before_release + b'\n# Work before the separate release.\n')
+        result = self.review_cli('slice-release', replacement | {'slice_id': 'items-slice'}, ok=False)
+        self.assertIn('Suspended source changed after pause', result.stderr)
+        source.write_bytes(before_release)
+        self.review_cli('slice-release', replacement | {'slice_id': 'items-slice'})
+
+    def test_committed_migration_retry_preserves_one_receipt(self):
+        self.prepared()
+        self.cli('approve', '--approval-file', self.payload('approval', self.approval()))
+        value = {'approved_by_user': True, 'user_response': 'Migrate the saved initiative.'}
+        self.assertEqual(self.review_cli('slice-review-migrate', value),
+                         self.review_cli('slice-review-migrate', value))
+        events = (self.directory / 'decisions.jsonl').read_text()
+        self.assertEqual(events.count('"type": "slice_review_migrated"'), 1)
+
+    def test_observed_guide_requires_journaled_command_execution(self):
+        feature = self.reviewed_blueprint()
+        candidate = self.guide_candidate(feature)
+        path = self.directory / candidate['guide_path']
+        runner = self.root / 'tests/test_items.py'
+        manifest = self.manifest()
+        approved = manifest['approvals'][manifest['active_approval_id']]['workspace_snapshot']
+        check = feature['acceptance_checks'][0]
+        receipt = {'check_id': check['check_id'], 'argv': check['command'], 'expected': check['expected'],
+                   'actual': check['expected'], 'result': 'PASS', 'exit_code': 0,
+                   'executed_at': '2026-11-20T00:00:00Z',
+                   'source_hashes': {str(runner.relative_to(self.root)): approved['tests/test_items.py']}}
+        relative = path.parent.relative_to(self.directory) / 'examples/self-attested.json'
+        candidate['asset_paths'].append(self.artifact(str(relative), json.dumps(receipt)))
+        path.write_text(path.read_text().replace('| planned |', '| observed |')
+                        .replace('| Not run |', '| examples/self-attested.json |'))
+        result = self.review_cli('slice-plan', {'slices': [candidate]}, ok=False)
+        self.assertIn('journaled verification', result.stderr)
+
+    def test_observed_guide_can_reuse_matching_coordinator_verification(self):
+        feature = self.reviewed_blueprint(multiple=True)
+        self.review_cli('slice-plan', {'slices': [self.guide_candidate(feature)]})
+        self.review_cli('slice-review-record', self.review_input())
+        package = self.lock_reviewed_package()
+        self.authorize_fixture(package)
+        self.review_cli('slice-release', package | {'slice_id': 'items-slice'})
+        self.accept_first_released_slice()
+        candidate = self.guide_candidate(feature, 'adapter-slice', path='src/adapter.py', deps=('items-slice',))
+        path = self.directory / candidate['guide_path']
+        source = self.directory / 'slices/items-slice/verification.json'
+        relative = path.parent.relative_to(self.directory) / 'examples/verification.json'
+        candidate['asset_paths'].append(self.artifact(str(relative), source.read_bytes()))
+        path.write_text(path.read_text().replace('| planned |', '| observed |')
+                        .replace('| Not run |', '| examples/verification.json |'))
+        self.review_cli('slice-plan', {'slices': [{'slice_id': 'items-slice', 'retain': True}, candidate],
+                                       'amendment': 'Add a verified adapter handoff.'})
+        self.review_cli('slice-guide-validate', {'slice_id': 'adapter-slice'})
+
+    def test_sr001_blueprint_approval_cannot_create_an_executable_slice(self):
+        self.prepared(review=True)
+        self.cli('approve', '--approval-file', self.payload('approval', self.approval()))
+        result = self.cli('slice-create', '--contract-file', self.payload('slice', self.slice()), ok=False)
+        self.assertIn('slice-release', result.stderr)
+        self.assertEqual(self.manifest()['slices'], {})
+        self.assertFalse((self.directory / 'slices/items-slice').exists())
+
+    def test_sr003_guide_reports_missing_section(self):
+        self.prepared(review=True)
+        self.cli('approve', '--approval-file', self.payload('approval', self.approval()))
+        candidate = self.slice() | {
+            'title': 'Member item list', 'proposal_revision': 1, 'surfaces': ['backend'],
+            'guide_path': self.artifact('inputs/items-guide.md', '## Identity and status\nMember item list'),
+            'traceability': [], 'asset_paths': [], 'shared_contracts': {}, 'dependency_contracts': [],
+        }
+        result = self.cli('slice-plan', '--input-file', self.payload('inventory', {'slices': [candidate]}), ok=False)
+        self.assertIn('Traceability matrix', result.stderr)
+
+    def reviewed_blueprint(self, *, surface='backend', multiple=False, extra_surfaces=False):
+        self.start(review=True)
+        self.exchange()
+        self.record_baseline(self.baseline(surface))
+        self.cli('plan-record', '--plan-file', self.payload('plan', self.plan()))
+        blueprint = self.blueprint(surface=surface)
+        if multiple:
+            blueprint['features'][0]['implementation_paths'] += ['src/adapter.py', 'src/view.py']
+        if extra_surfaces:
+            feature = blueprint['features'][0]
+            feature['slice_surfaces'] = ['api', 'mcp', 'script']
+            feature['surface_contracts'].update(self.approved_fixture_annexes(feature, feature['slice_surfaces']))
+        self.cli('blueprint-record', '--blueprint-file', self.payload('blueprint', blueprint))
+        self.cli('blueprint-coverage', '--coverage-file', self.payload('coverage', self.coverage(surface=surface)))
+        self.cli('approve', '--approval-file', self.payload('approval', self.approval()))
+        return blueprint['features'][0]
+
+    def with_slice_consent(self, command, value, *, response=None, ok=True):
+        if command == 'slice-review-record':
+            action = value['action']
+            target = {'slices': [{field: value[field] for field in
+                                  ('slice_id', 'proposal_revision', 'guide_sha256', 'contract_sha256')}]}
+            if action == 'delegate':
+                target['constraints'] = value['constraints']
+                value = value | {'user_response': f'Delegate review of {value["slice_id"]} revision {value["proposal_revision"]}'}
+        elif command == 'slice-package-lock':
+            from hashlib import sha256
+            action = 'lock'
+            target = {field: value[field] for field in ('package_id', 'collection_path', 'collection_sha256')}
+            target['recap_sha256'] = sha256((self.directory / value['recap_path']).read_bytes()).hexdigest()
+        else:
+            action = 'start'
+            target = {field: value[field] for field in ('package_id', 'package_hash')}
+        quote = response if response is not None else value['user_response']
+        consent_id = f"slice-consent-{len(self.manifest().get('conversation', {})) + 1}"
+        exchange = {'exchange_id': consent_id, 'phase': 'slice_review', 'record_type': 'slice_consent',
+                    'status': 'decided', 'question': f'Confirm {action} for {json.dumps(target)}',
+                    'response': quote, 'consent_action': action, 'target': target}
+        result = self.cli('conversation-record', '--exchange-file', self.payload(consent_id, exchange), ok=ok)
+        return value | {'consent_id': consent_id} if ok else result
+
+    def review_cli(self, command, value=None, *, ok=True):
+        if ok and value and 'consent_id' not in value and (command in {'slice-package-lock', 'implementation-authorize'}
+                or command == 'slice-review-record' and value.get('action') in ('approve', 'delegate')):
+            value = self.with_slice_consent(command, value)
+        args = [] if value is None else ['--input-file', self.payload(command, value)]
+        output = self.cli(command, *args, ok=ok)
+        return json.loads(output.stdout) if ok else output
+
+    def guide_candidate(self, feature, slice_id='items-slice', *, revision=1, path='src/service.py',
+                        deps=(), surfaces=('backend',), missing_trace=None, shared=None, detail=None):
+        from hashlib import sha256
+        manifest = self.manifest()
+        approval_id = manifest['active_approval_id']
+        approval = manifest['approvals'][approval_id]
+        version = approval['approved_version']
+        spec = json.loads((self.directory / manifest['blueprints'][version]['path']).read_text())
+        snapshot_hash = sha256(json.dumps(approval['workspace_snapshot'], ensure_ascii=False, sort_keys=True,
+                                          separators=(',', ':')).encode()).hexdigest()
+        key = feature['feature_id']
+        title = f'Member items ({slice_id})'
+        spec_links = '\n'.join(f'- [Approved feature]({ "../../../../" + path })' for path in feature['spec_paths'])
+        decision_links, history_hashes = [], {}
+        for spec_path in feature['spec_paths']:
+            history_hashes[spec_path] = sha256((self.directory / spec_path).read_bytes()).hexdigest()
+        for decision_id in sorted(set(spec['decision_ids'] + feature['decision_ids'] + ([detail] if detail else []))):
+            entry = manifest['conversation'][decision_id]
+            decision_links.append(f'- [{decision_id}](../../../../{entry["path"]})')
+            history_hashes.update({entry['path']: entry['sha256'], **entry.get('evidence_hashes', {})})
+        invalidated = ('none; this is the initial revision.' if revision == 1 else f'revision {revision - 1}.')
+        history = '\n'.join([
+            f'Revision {revision} prepared for exact review.',
+            'Outcome: pending review.',
+            'Exceptions: none.',
+            f'Invalidated revisions: {invalidated}',
+            *decision_links,
+            *(f'- `{path}` SHA-256 `{digest}`' for path, digest in sorted(history_hashes.items())),
+        ])
+        headings = {
+            'Identity and status': '\n'.join(f'- {field}: `{value}`' for field, value in {
+                'slice_id': slice_id, 'title': title, 'proposal_revision': revision, 'blueprint_version': version,
+                'blueprint_approval_id': approval_id, 'plan_version': spec['plan_version'],
+                'source_snapshot_sha256': snapshot_hash, 'owner': 'builder', 'scope': 'feature',
+            }.items()) + '\n- review_status: Pending review; not approved.\n'
+                           '- package: Not assigned at guide freeze.\n' + spec_links,
+            'In plain language': 'A signed-in member opens the items list, and the application shows their items.',
+            'Why this slice exists': f'`{key}` preserves `list-items` and the user decision `choose-layout`.',
+            'What exists now': '`src/service.py` contains `def list_items`. Membership is checked before reads.',
+            'Finished experience or service contract': ('| Feature | Check ID | Expected outcome |\n'
+                '| --- | --- | --- |\n' + '\n'.join(
+                    f'| {key} | {check["check_id"]} | {check["expected"]} |'
+                    for check in feature['acceptance_checks'])),
+            'Architecture and anatomy': f'`{key}` uses `{path}`. '
+                                        'The request handler checks the caller before invoking item storage.',
+            'Detailed functional requirements': '\n'.join(
+                f'{index}. `{key}` binds `{check["check_id"]}` to the membership guard and '
+                f'its expected outcome, {check["expected"]}.'
+                for index, check in enumerate(feature['acceptance_checks'], 1)),
+            'Visual specification': ('Render the items list at /items with a 16px gap and a single column under 768px.'
+                                     if 'ui' in surfaces else 'Not applicable — This delivery exposes a service only.'),
+            'Interface specification': ('Serve GET /items and require member authorization, preserving the array response.'
+                                        if 'backend' in surfaces else 'Not applicable — This slice tests the existing UI.'),
+            'State and scenario matrix': '\n'.join(f'- `{state}` yields {BACKEND_OUTCOMES.get(state, "an announced loading state")}.'
+                                                  for state in feature['states']),
+            'Data and security rules': 'Keep membership checks on the service, and retain the current storage read.',
+            'Exact implementation footprint': '',
+            'Step-by-step implementation recipe': (
+                f'1. `check-items` Run approved fixtures for '
+                f'{", ".join(check["check_id"] for check in feature["acceptance_checks"])} '
+                f'in `{path}`. Expected result: ' + '; '.join(
+                    check['expected'] for check in feature['acceptance_checks'])),
+            'Dependencies and integration': 'Read accepted prerequisites: ' + (', '.join(deps) or 'none for this slice'),
+            'Safety, rollback and prohibited deviations': f'Do not change membership or JSON schema. '
+                                                         f'Rollback steps: Restore `{path}` to the pre-slice contents.',
+            'Definition of done': 'The member list and outsider refusal pass the approved test cases, with saved evidence.',
+            'Fresh-session handoff': ('- First files to read: Read src/service.py and the approved feature contract before editing.\n'
+                                      '- Environment: Set P2P_SKILL_ROOT to the installed skill directory and use the app repository root.\n'
+                                      '- Resume command: `python3 "$P2P_SKILL_ROOT/scripts/project_state.py" resume --project-root . --initiative-id sample-work --format json`\n'
+                                      '- Validation command: `python3 "$P2P_SKILL_ROOT/scripts/project_state.py" validate --project-root . --initiative-id sample-work`\n'
+                                      '- Current blockers: No blockers are recorded for this slice.\n'
+                                      '- Next action: Inspect src/service.py and implement the approved membership behavior.\n'
+                                      '- How to report findings: Record each result with its check ID and evidence path.'),
+            'Change and approval history': history,
+        }
+        fixture_folder = f'inputs/{slice_id}-r{revision}'
+        transitions = feature.get('state_transitions', [])
+        if transitions:
+            diagram = 'stateDiagram-v2\n' + ''.join(
+                f'  {edge["from"]} --> {edge["to"]}: {edge["trigger"]} / {edge["guard"]} / {edge["effect"]}\n'
+                for edge in transitions)
+        else:
+            diagram = ('stateDiagram-v2\n  [*] --> Request\n' +
+                       ''.join(f'  Request --> {state}\n' for state in feature['states']))
+        self.artifact(f'{fixture_folder}/diagrams/items.mmd', diagram)
+        headings['Worked examples and diagrams'] = (
+            'A member opens the list. The route returns its JSON result. [Diagram source](diagrams/items.mmd)\n\n'
+            '```mermaid\n' + diagram + '```')
+        checks = feature['acceptance_checks']
+        state_rows = ['| Feature | Check ID | State | Expected outcome |', '| --- | --- | --- | --- |']
+        for check in checks:
+            state_rows.extend(f"| {key} | {check['check_id']} | {state} | {outcome} |"
+                              for state, outcome in sorted(check.get('state_expectations', {}).items()))
+        for case in feature.get('visual_contract', {}).get('render_cases', []):
+            viewport = case['viewport']
+            outcome = f'renders {case["route"]} at {viewport.get("width", "?")}x{viewport.get("height", "?")} with {case["ready_selector"]}'
+            state_rows.append(f"| {key} | {case['case_id']} | {case['state']} | {outcome} |")
+        headings['State and scenario matrix'] = '\n'.join(state_rows)
+        headings['Exact implementation footprint'] = ('| Path | Operation | Feature |\n| --- | --- | --- |\n'
+                                                        f'| {path} | MODIFY | {key} |')
+        fixtures = FIXTURE_CLI.blueprint_state(self.directory, manifest).test_sources(feature)
+        headings['Tests and acceptance evidence'] = (
+            f'Fixture sources: {", ".join(sorted(fixtures))}.\n\n'
+            '| Check ID | Status | Expected outcome | Command | Evidence |\n'
+            '| --- | --- | --- | --- | --- |\n' + '\n'.join(
+                f"| {c['check_id']} | planned | {c['expected']} | `{json.dumps(c['command'])}` | Not run |"
+                for c in checks))
+        trace = []
+        for kind, values, section in (
+            ('feature', [key], 'Why this slice exists'),
+            ('baseline', ['list-items'], 'Why this slice exists'),
+            ('decision', ['choose-layout'], 'Why this slice exists'),
+            ('state', feature['states'], 'State and scenario matrix'),
+            ('check', [c['check_id'] for c in checks], 'Tests and acceptance evidence'),
+        ):
+            trace += [dict(feature_id=key, kind=kind, id=value, section=section, step='check-items')
+                      for value in values if value != missing_trace]
+        if detail:
+            headings['Why this slice exists'] += f' The user clarified this in `{detail}`.'
+            trace.append(dict(feature_id=key, kind='decision', id=detail,
+                              section='Why this slice exists', step='check-items'))
+        headings['Traceability matrix'] = ('| Feature | Kind | ID | Section | Step |\n| --- | --- | --- | --- | --- |\n' +
+            '\n'.join('| ' + ' | '.join(row.values()) + ' |' for row in trace))
+        annexes = self.fixture_annexes(feature)
+        guide = f'# {title}\n\n' + '\n\n'.join(
+            f'## {heading}\n\n{body}' for heading, body in headings.items()) + '\n\n'
+        guide += '\n\n'.join(f'### {surface.upper()} annex — {key}\n\n' +
+                             '\n'.join(f'- {field}: {body}' for field, body in annexes[surface].items())
+                             for surface in surfaces)
+        dependency_contracts = []
+        for dependency_id in deps:
+            consumed = sorted(name for name, contract in (shared or {}).items()
+                              if contract['role'] == 'consumes')
+            if consumed:
+                dependency_contracts.append({'dependency_id': dependency_id, 'kind': 'interface',
+                                             'contract_ids': consumed, 'paths': []})
+            else:
+                dependency_contracts.append({'dependency_id': dependency_id, 'kind': 'ordering_only',
+                                             'reason': 'The prerequisite supplies a required foundation before this slice.',
+                                             'evidence_paths': list(feature['spec_paths'])})
+        return self.slice() | {
+            'slice_id': slice_id, 'allowed_paths': [path], 'dependencies': list(deps),
+            'blueprint_version': version, 'functional_tests': [c['check_id'] for c in checks], 'title': title,
+            'proposal_revision': revision, 'surfaces': list(surfaces),
+            'guide_path': self.artifact(f'{fixture_folder}/implementation-guide.md', guide + '\n'),
+            'traceability': trace, 'asset_paths': [f'{fixture_folder}/diagrams/items.mmd'],
+            'artifact_paths': feature['spec_paths'],
+            'shared_contracts': shared or {},
+            'dependency_contracts': dependency_contracts,
+        }
+
+    def review_input(self, slice_id='items-slice', *, action='approve', exchanges=()):
+        item = self.manifest()['slice_review']['selected'][slice_id]
+        contract = json.loads((self.directory / item['contract_path']).read_text())
+        features = contract.get('feature_contracts', [])
+        checks = [check for feature in features for check in feature.get('acceptance_checks', [])]
+        guide_lines = (self.directory / item['guide_path']).read_text().splitlines()
+        section_line = next(index for index, line in enumerate(guide_lines, 1)
+                            if line.strip() == '## State and scenario matrix')
+        finding_sections = ['Finished experience or service contract', 'Detailed functional requirements',
+                            'Step-by-step implementation recipe']
+        normative_findings = []
+        for section in finding_sections:
+            start = guide_lines.index(f'## {section}') + 1
+            line = next(index + 1 for index in range(start, len(guide_lines)) if guide_lines[index].strip())
+            normative_findings.append({'section': section, 'citation': f'line {line}', 'result': 'PASS',
+                                       'finding': 'Traced member and outsider behavior to the approved guard.',
+                                       'resolution': 'The section preserves the approved list and refusal outcomes.'})
+        scenario_rows = []
+
+        def scenario(feature_id, suffix, expected, case_ids, symbol):
+            return {'scenario': f'{feature_id}:{suffix}', 'expected': expected, 'observed': expected,
+                    'read_only': True, 'observation_basis': f'Traced the approved entries in {symbol}.',
+                    'references': [{'feature_id': feature_id, 'check_id': case_id,
+                                    'source_path': item['guide_path'], 'symbol': symbol} for case_id in case_ids]}
+
+        for feature in features:
+            feature_id = feature['feature_id']
+            expected, references = {}, {}
+            for check in feature.get('acceptance_checks', []):
+                expected.update(check.get('state_expectations', {}))
+                for state in check.get('state_expectations', {}):
+                    references.setdefault(state, []).append(check['check_id'])
+                scenario_rows.append(scenario(feature_id, f'check:{check["check_id"]}', check['expected'],
+                                              [check['check_id']], 'Tests and acceptance evidence'))
+            scenario_rows.extend(scenario(feature_id, state, outcome, references[state], 'State and scenario matrix')
+                for state, outcome in expected.items() if state in feature.get('states', []))
+            for case in feature.get('visual_contract', {}).get('render_cases', []):
+                viewport = case['viewport']
+                outcome = f'renders {case["route"]} at {viewport["width"]}x{viewport["height"]} with {case["ready_selector"]}'
+                scenario_rows.append(scenario(feature_id, f'render:{case["case_id"]}', outcome,
+                                              [case['case_id']], 'State and scenario matrix'))
+        cases = [{field: row[field] for field in ('scenario', 'expected', 'observed', 'observation_basis', 'references')}
+                 | {field: reference[field] for field in ('feature_id', 'check_id')}
+                 for row in scenario_rows for reference in row['references']]
+        handoff_path = self.artifact(f'inputs/{slice_id}-r{item["revision"]}-handoff.json', json.dumps({
+            'record_type': 'independent_no_code_walkthrough', 'reviewer': 'fresh-reader',
+            'context': 'fresh_session', 'test_execution': False, 'source_paths': [item['guide_path']],
+            'cases': cases,
+        }))
+        value = {'action': action, 'slice_id': slice_id, 'proposal_revision': item['revision'],
+                 'user_response': f'{action} {slice_id} revision {item["revision"]}',
+                 'guide_sha256': item['guide_sha256'], 'contract_sha256': item['contract_sha256'],
+                 'conversation_exchange_ids': list(exchanges),
+                 'handoff_review': {'slice_id': slice_id, 'proposal_revision': item['revision'],
+                     'guide_sha256': item['guide_sha256'], 'contract_sha256': item['contract_sha256'],
+                     'reviewer': 'fresh-reader', 'result': 'PASS',
+                     'walkthrough': {'mode': 'no_code', 'context': 'fresh_session', 'independent': True,
+                         'performed': True, 'test_execution': False, 'evidence_path': handoff_path,
+                         'attestation': 'Read the frozen guide and traced existing service paths without implementing or running tests.'},
+                     'findings': [{'section': 'State and scenario matrix', 'citation': f'line {section_line + 1}',
+                         'finding': 'The guarded member and outsider outcomes are explicit.',
+                         'resolution': 'Confirmed the stated outcomes against the approved contract.'},
+                         *normative_findings],
+                     'source_paths': [item['guide_path']],
+                     'read_only_scenarios': scenario_rows,
+                     'acceptance_checks': [{'check_id': check['check_id'], 'expected': check['expected'],
+                         'observed': check['expected'], 'result': 'PASS'} for check in checks],
+                     'evidence_paths': [handoff_path]} }
+        if action == 'delegate':
+            value.update(delegated_slice_ids=[slice_id], constraints='Validate only already approved behavior')
+        return value
+
+    def collection_input(self):
+        path = self.artifact('inputs/collection-review.md', 'Reviewed existing member and outsider journeys and fixture coverage.')
+        selected = self.manifest()['slice_review']['selected']
+        bindings = {key: {'proposal_revision': entry['revision'], 'guide_sha256': entry['guide_sha256'],
+                          'contract_sha256': entry['contract_sha256']} for key, entry in selected.items()}
+        sources = [entry['guide_path'] for entry in selected.values()]
+        packets = {key: json.loads((self.directory / entry['contract_path']).read_text())
+                   for key, entry in selected.items()}
+        features = {feature['feature_id']: feature for packet in packets.values()
+                    for feature in packet['feature_contracts']}
+        case_conclusions = [{'feature_id': feature_id, 'check_id': check['check_id'], 'result': 'PASS',
+                             'expected': check['expected'], 'source_path': sources[0],
+                             'citation': f'check:{check["check_id"]}',
+                             'conclusion': f'Traced the approved expected outcome and verification source for {check["check_id"]}.'}
+                            for feature_id, feature in sorted(features.items()) for check in feature['acceptance_checks']]
+        for feature_id, feature in sorted(features.items()):
+            for case in feature.get('visual_contract', {}).get('render_cases', []):
+                viewport = case['viewport']
+                case_id = case['case_id']
+                case_conclusions.append({
+                    'feature_id': feature_id, 'check_id': case_id, 'result': 'PASS', 'source_path': sources[0],
+                    'expected': f'renders {case["route"]} at {viewport["width"]}x{viewport["height"]} with {case["ready_selector"]}',
+                    'citation': f'check:{case_id}',
+                    'conclusion': f'Traced the route, viewport and ready selector for {case_id}.',
+                })
+        interfaces = {}
+        for slice_id, packet in packets.items():
+            for name, contract in packet['shared_contracts'].items():
+                contract_path = selected[slice_id]['contract_path']
+                lines = (self.directory / contract_path).read_text().splitlines()
+                citation_line = next(index for index, line in enumerate(lines, 1) if f'"{name}": {{' in line)
+                record = interfaces.setdefault(name, {'interface_id': name, 'provider_slice_id': None,
+                    'consumer_slice_ids': [], 'result': 'PASS',
+                    'source_path': contract_path, 'citation': f'line {citation_line}',
+                    'conclusion': f'Compared provider and consumer contracts for {name}.'})
+                if contract['role'] == 'provides':
+                    record['provider_slice_id'] = slice_id
+                else:
+                    record['consumer_slice_ids'].append(slice_id)
+        boundary_conclusions = []
+        for left_id, right_id in sorted(SLICE_EVIDENCE_MODULE._shared_boundary_pairs(packets)):
+            source_path = selected[left_id]['guide_path']
+            boundary_conclusions.append({'slice_ids': [left_id, right_id], 'result': 'PASS',
+                'conclusion': f'Compared approved shared boundaries for {left_id} and {right_id}.',
+                'source_path': source_path, 'citation': 'line 1'})
+        return {'semantic_checks': {key: {'result': 'PASS', 'explanation': 'Compared affected sections and fixture outcomes.',
+                                         'schema_version': 2,
+                                         'reviewer': {'name': 'collection-reader', 'context': 'fresh_session',
+                                                      'independent_of_authoring': True},
+                                         'case_conclusions': case_conclusions,
+                                         'interface_conclusions': list(interfaces.values()) if key == 'shared_contract_review' else [],
+                                         'boundary_conclusions': boundary_conclusions if key == 'shared_contract_review' else [],
+                                         'revision_bindings': bindings,
+                                         'covered_feature_ids': sorted(features),
+                                         'source_paths': sources,
+                                         'evidence_paths': [path]}
+                  for key in ('decision_fidelity', 'shared_contract_review', 'end_to_end_journeys', 'verification_coverage')}}
+
+    def lock_reviewed_package(self, version=1):
+        package_id = f'package-v{version}'
+        report = self.review_cli('slice-collection-validate', self.collection_input())
+        self.assertEqual(report['result'], 'PASS')
+        manifest = self.manifest()['slice_review']
+        preview = self.review_cli('slice-package-preview')
+        self.assertEqual(preview['package_id'], package_id)
+        self.assertEqual(preview['collection_path'], report['path'])
+        recap = preview['recap']
+        summary = self.review_cli('slice-package-lock', {
+            'package_id': package_id, 'collection_path': report['path'],
+            'collection_sha256': manifest['artifact_hashes'][report['path']],
+            'recap_path': self.artifact('inputs/recap.md', recap),
+            'approved_by_user': True, 'user_response': f'Approve locking {package_id}.',
+        })
+        self.assertEqual(summary['active_package'], package_id)
+        return {'package_id': package_id, 'package_hash': summary['packages'][package_id]['package_hash']}
+
+    def authorize_fixture(self, package):
+        return self.review_cli('implementation-authorize', package | {
+            'instruction': 'start implementation', 'authorized_by_user': True,
+            'user_response': f'Start implementation of {package["package_id"]}.',
+        })
+
+    def test_sr002_004_005_007_complete_inventory_sequential_reviews_and_scoped_revision(self):
+        feature = self.reviewed_blueprint(multiple=True)
+        first = self.guide_candidate(feature)
+        second = self.guide_candidate(feature, 'adapter-slice', path='src/adapter.py', deps=('items-slice',))
+        third = self.guide_candidate(feature, 'view-slice', path='src/view.py')
+        summary = self.review_cli('slice-plan', {'slices': [first, second, third]})
+        self.assertEqual(summary['current_slice_id'], 'items-slice')
+        for entry in summary['slices'].values():
+            self.assertTrue((self.directory / entry['guide_path']).is_file())
+        summary = self.review_cli('slice-review-record', self.review_input())
+        self.assertEqual(summary['current_slice_id'], 'adapter-slice')
+        self.assertEqual(self.manifest()['slices'], {})
+        summary = self.review_cli('slice-review-record', self.review_input('view-slice', action='delegate'))
+        self.assertEqual(summary['reviews']['view-slice']['result'], 'delegated_validated')
+        self.assertNotIn('adapter-slice', summary['reviews'])
+        self.review_cli('slice-review-record', self.review_input('adapter-slice'))
+        summary = self.review_cli('slice-draft', self.guide_candidate(feature, revision=2))
+        self.assertEqual(summary['changed_dependents'], ['adapter-slice'])
+        self.assertEqual(set(summary['reviews']), {'view-slice'})
+        self.assertTrue((self.directory / 'slice-proposals/items-slice/revisions/1/contract.json').exists())
+
+    def test_sr003_reports_exact_missing_check_and_state(self):
+        feature = self.reviewed_blueprint()
+        for missing in ('items-access', 'forbidden'):
+            with self.subTest(missing=missing):
+                candidate = self.guide_candidate(feature, missing_trace=missing)
+                result = self.review_cli('slice-plan', {'slices': [candidate]}, ok=False)
+                self.assertIn('Traceability matrix', result.stderr)
+                self.assertIn(missing, result.stderr)
+
+    def test_sr006_012_delegation_stops_for_exact_resumable_question(self):
+        feature = self.reviewed_blueprint()
+        self.review_cli('slice-plan', {'slices': [self.guide_candidate(feature)]})
+        question = 'Where should a member retry when the service times out?'
+        self.exchange('retry-question', status='open', phase='slice_review', question=question,
+                      feature_ids=['items-feature'])
+        self.review_cli('slice-review-record', {'action': 'question', 'slice_id': 'items-slice',
+                                               'proposal_revision': 1, 'pending_question_id': 'retry-question'})
+        result = self.review_cli('slice-review-record', self.review_input(action='delegate'), ok=False)
+        self.assertIn('Unanswered consequential question', result.stderr)
+        resumed = json.loads(self.cli('resume', '--format', 'json', ok=False).stdout)
+        self.assertEqual(resumed['slice_review']['current_revision'], 1)
+        self.assertEqual(resumed['slice_review']['pending_question_id'], 'retry-question')
+        self.assertEqual(resumed['pending_questions'][0]['question'], question)
+        self.assertEqual(resumed['next_action'], question)
+        self.assertEqual(resumed['slice_review']['reviews'], {})
+
+    def test_resolved_slice_clarification_is_frozen_without_blueprint_reapproval(self):
+        feature = self.reviewed_blueprint()
+        self.review_cli('slice-plan', {'slices': [self.guide_candidate(feature)]})
+        question = 'Does the existing membership guard run before reading storage?'
+        self.exchange('guard-question', status='open', phase='slice_review', question=question,
+                      feature_ids=['items-feature'])
+        self.review_cli('slice-review-record', {'action': 'question', 'slice_id': 'items-slice',
+                                               'proposal_revision': 1, 'pending_question_id': 'guard-question'})
+        self.exchange('guard-answer', phase='slice_review', question=question, responds_to='guard-question',
+                      response='Yes, keep the guard before the storage call.', feature_ids=['items-feature'],
+                      record_type='slice_detail', slice_id='items-slice', proposal_revision=1,
+                      clarifies_decision_ids=['choose-layout'])
+        resumed = json.loads(self.cli('resume', '--format', 'json').stdout)
+        self.assertEqual(resumed['active_work']['slice_review']['pending_question_id'], 'guard-question')
+        self.assertEqual(resumed['active_question_answer']['response'], 'Yes, keep the guard before the storage call.')
+        self.review_cli('slice-draft', self.guide_candidate(feature, revision=2, detail='guard-answer'))
+        result = self.review_cli('slice-review-record', self.review_input(exchanges=('guard-question', 'guard-answer')))
+        self.assertEqual(result['reviews']['items-slice']['proposal_revision'], 2)
+        self.assertEqual(self.manifest()['approved_version'], 'spec-v1')
+
+    def test_reopening_sibling_after_answer_clears_stale_waiting_cursor(self):
+        feature = self.reviewed_blueprint(multiple=True)
+        first = self.guide_candidate(feature) | {'dependency_contracts': []}
+        second = self.guide_candidate(feature, 'adapter-slice', path='src/adapter.py') | {
+            'dependency_contracts': []}
+        self.review_cli('slice-plan', {'slices': [first, second]})
+        question = 'Does the existing membership guard run before reading storage?'
+        self.exchange('cursor-question', status='open', phase='slice_review', question=question,
+                      feature_ids=['items-feature'])
+        self.review_cli('slice-review-record', {'action': 'question', 'slice_id': 'items-slice',
+            'proposal_revision': 1, 'pending_question_id': 'cursor-question'})
+        self.exchange('cursor-answer', phase='slice_review', question=question,
+                      responds_to='cursor-question', response='Yes, preserve the existing guard.',
+                      feature_ids=['items-feature'], record_type='slice_detail', slice_id='items-slice',
+                      proposal_revision=1, clarifies_decision_ids=['choose-layout'])
+
+        summary = self.review_cli('slice-review-record', {'action': 'reopen', 'slice_id': 'adapter-slice',
+            'proposal_revision': 1, 'user_response': 'Reopen the adapter slice.'})
+        resumed = json.loads(self.cli('resume', '--format', 'json').stdout)
+
+        self.assertEqual(summary['current_slice_id'], 'adapter-slice')
+        self.assertIsNone(summary['pending_question_id'])
+        self.assertEqual(resumed['active_work']['status'], 'in_progress')
+        self.assertIsNone(resumed['active_work'].get('pending_question_id'))
+        self.assertEqual(resumed['next_action'], 'Review adapter-slice revision 1')
+
+    def test_superseded_blueprint_decision_deactivates_slice_clarification(self):
+        feature = self.reviewed_blueprint()
+        candidate = self.guide_candidate(feature) | {'dependency_contracts': []}
+        self.review_cli('slice-plan', {'slices': [candidate]})
+        question = 'Does the existing membership guard run before reading storage?'
+        self.exchange('scope-question', status='open', phase='slice_review', question=question,
+                      feature_ids=['items-feature'])
+        self.exchange('scope-answer', phase='slice_review', question=question,
+                      responds_to='scope-question', response='Yes, preserve the existing guard.',
+                      feature_ids=['items-feature'], record_type='slice_detail', slice_id='items-slice',
+                      proposal_revision=1, clarifies_decision_ids=['choose-layout'])
+        revised = self.guide_candidate(feature, revision=2, detail='scope-answer') | {'dependency_contracts': []}
+        self.review_cli('slice-draft', revised)
+        self.exchange('replacement-layout', phase='slice_review', feature_ids=['list-items'],
+                      slice_id='items-slice', supersedes='choose-layout',
+                      response='Use the newly approved guard sequence.')
+
+        state = FIXTURE_CLI.slice_review_state(self.directory, self.manifest())
+
+        self.assertEqual(state.active_slice_details('items-slice'), [])
+
+    def test_locked_package_guard_rejects_frozen_clarifications_that_are_no_longer_active(self):
+        feature = self.reviewed_blueprint()
+        candidate = self.guide_candidate(feature) | {'dependency_contracts': []}
+        self.review_cli('slice-plan', {'slices': [candidate]})
+        question = 'Does the existing membership guard run before reading storage?'
+        self.exchange('locked-scope-question', status='open', phase='slice_review', question=question,
+                      feature_ids=['items-feature'])
+        self.exchange('locked-scope-answer', phase='slice_review', question=question,
+                      responds_to='locked-scope-question', response='Yes, preserve the existing guard.',
+                      feature_ids=['items-feature'], record_type='slice_detail', slice_id='items-slice',
+                      proposal_revision=1, clarifies_decision_ids=['choose-layout'])
+        revised = self.guide_candidate(feature, revision=2, detail='locked-scope-answer') | {'dependency_contracts': []}
+        self.review_cli('slice-draft', revised)
+        self.review_cli('slice-review-record', self.review_input(exchanges=('locked-scope-question',
+                                                                            'locked-scope-answer')))
+        self.lock_reviewed_package()
+        package = json.loads((self.directory / 'slice-review/packages/package-v1/package-manifest.json').read_text())
+        packet = json.loads((self.directory / package['slices']['items-slice']['contract_path']).read_text())
+        self.assertIn('locked-scope-answer', packet['decision_ids'])
+        state = FIXTURE_CLI.slice_review_state(self.directory, self.manifest())
+
+        with patch.object(state, 'active_slice_details', return_value=[]):
+            with self.assertRaisesRegex(FIXTURE_CLI.StateError,
+                                        'locked package contains a clarification tied to a superseded'):
+                state.validate_package_active_decisions(package)
+
+    def test_replacement_slice_records_its_cancelled_predecessor(self):
+        feature = self.reviewed_blueprint(multiple=True)
+        initial = self.guide_candidate(feature) | {'dependency_contracts': []}
+        self.review_cli('slice-plan', {'slices': [initial]})
+        self.review_cli('slice-review-record', self.review_input())
+        package = self.lock_reviewed_package()
+        self.authorize_fixture(package)
+        self.review_cli('slice-release', package | {'slice_id': 'items-slice'})
+        self.cli('slice-cancel', '--slice-id', 'items-slice', '--reason', 'Replace the contract after review.')
+
+        replacement = self.guide_candidate(feature, 'items-slice-v2', path='src/adapter.py') | {
+            'dependency_contracts': [], 'replaces_slice_ids': ['items-slice']}
+        amendment = {'amendment': 'Replace the cancelled reviewed assignment.',
+            'user_response': 'Replace items-slice with items-slice-v2.'}
+        missing_lineage = replacement.copy()
+        missing_lineage.pop('replaces_slice_ids')
+        blocked = self.review_cli('slice-plan', amendment | {'slices': [missing_lineage]}, ok=False)
+        self.assertIn('declare the predecessor in replaces_slice_ids', blocked.stderr)
+        summary = self.review_cli('slice-plan', amendment | {'slices': [replacement]})
+
+        self.assertEqual(summary['slices']['items-slice-v2']['replaces_slice_ids'], ['items-slice'])
+
+    def test_proposal_cannot_add_a_surface_absent_from_blueprint(self):
+        feature = self.reviewed_blueprint()
+        candidate = self.guide_candidate(feature, surfaces=('backend', 'mcp'))
+        result = self.review_cli('slice-plan', {'slices': [candidate]}, ok=False)
+        self.assertIn("unapproved surfaces ['mcp']", result.stderr)
+
+    def test_sr008_collection_detects_conflicting_contracts_and_ownership(self):
+        feature = self.reviewed_blueprint()
+        provider = self.guide_candidate(feature, shared={'items-schema': {'role': 'provides', 'definition': {'type': 'array'}}})
+        consumer = self.guide_candidate(feature, 'consumer-slice', deps=('items-slice',),
+                                        shared={'items-schema': {'role': 'consumes', 'definition': {'type': 'object'}}})
+        self.review_cli('slice-plan', {'slices': [provider, consumer]})
+        for key in ('items-slice', 'consumer-slice'):
+            self.review_cli('slice-review-record', self.review_input(key))
+        response = self.review_cli('slice-collection-validate', self.collection_input(), ok=False)
+        checks = json.loads(response.stdout)['checks']
+        self.assertIn('items-schema', checks['contract_consistency']['explanation'])
+        self.assertIn('consumer-slice', checks['source_ownership']['explanation'])
+
+    def test_sr009_010_separate_authorization_releases_exact_package_and_paths(self):
+        feature = self.reviewed_blueprint(multiple=True)
+        self.review_cli('slice-plan', {'slices': [self.guide_candidate(feature),
+            self.guide_candidate(feature, 'adapter-slice', path='src/adapter.py', deps=('items-slice',))]})
+        for key in ('items-slice', 'adapter-slice'):
+            self.review_cli('slice-review-record', self.review_input(key))
+        package = self.lock_reviewed_package()
+        release = package | {'slice_id': 'items-slice'}
+        result = self.review_cli('slice-release', release, ok=False)
+        self.assertIn('separate explicit start authorization', result.stderr)
+        self.assertEqual(self.manifest()['slices'], {})
+        self.assertIn('exact locked', self.review_cli(
+            'implementation-authorize', package | {'package_hash': 'other'}, ok=False).stderr)
+        old_approval = self.manifest()['slice_review']['reviews']['items-slice']['user_response']
+        invalid_authorization = package | {'instruction': 'start implementation', 'authorized_by_user': True,
+                                           'user_response': old_approval}
+        self.assertIn('separate explicit user instruction', self.review_cli(
+            'implementation-authorize', invalid_authorization, ok=False).stderr)
+        self.authorize_fixture(package)
+        self.assertIn('dependencies first', self.review_cli(
+            'slice-release', package | {'slice_id': 'adapter-slice'}, ok=False).stderr)
+        self.review_cli('slice-release', release)
+        self.review_cli('slice-release', release)
+        self.cli('validate')
+        state = self.manifest()
+        self.assertEqual(set(state['slices']), {'items-slice'})
+        self.assertEqual(state['slices']['items-slice']['allowed_paths'], ['src/service.py'])
+        contract = json.loads((self.directory / 'slices/items-slice/contract.json').read_text())
+        self.assertEqual(contract['package_hash'], package['package_hash'])
+        source_guide = (self.directory / contract['locked_guide_path']).read_bytes()
+        delivered_guide_path = self.directory / contract['delivery_guide_path']
+        delivered_guide = delivered_guide_path.read_text()
+        self.assertNotEqual(delivered_guide.encode(), source_guide)
+        self.assertIn('Package: `package-v1`', delivered_guide)
+        self.assertNotIn(package['package_hash'], delivered_guide)
+        self.assertIn('Review outcome: `approved`', delivered_guide)
+        self.assertIn('Review mode: manual.', delivered_guide)
+        self.assertIn('[Original authored guide](implementation-guide.md)', delivered_guide)
+        self.assertIn('[Review receipt](', delivered_guide)
+        self.assertIn('reviewer', delivered_guide.lower())
+        self.assertNotIn('Outcome: pending review.', delivered_guide)
+        receipt_path = self.manifest()['slice_review']['reviews']['items-slice']['path']
+        receipt_line = next(line for line in delivered_guide.splitlines() if '[Review receipt](' in line)
+        receipt_link = delivered_guide_path.parent / receipt_line.split('[Review receipt](', 1)[1].rstrip(')')
+        self.assertTrue(receipt_link.resolve().is_file())
+        self.assertEqual(receipt_link.resolve(), (self.directory / receipt_path).resolve())
+        package_manifest = json.loads((self.directory / 'slice-review/packages/package-v1/package-manifest.json').read_text())
+        self.assertEqual(package_manifest['slices']['items-slice']['delivery_guide_path'],
+                         contract['delivery_guide_path'])
+        self.assertEqual(package_manifest['artifact_hashes'][contract['delivery_guide_path']],
+                         hashlib.sha256(delivered_guide_path.read_bytes()).hexdigest())
+        self.assertIn(contract['delivery_guide_path'], self.manifest()['slice_review']['artifact_hashes'])
+        handoff = json.loads(self.cli('resume', '--slice-id', 'items-slice', '--format', 'json').stdout)
+        self.assertEqual(handoff['delivery_handoff']['package_id'], 'package-v1')
+        self.assertEqual(handoff['delivery_handoff']['package_hash'], package['package_hash'])
+        self.assertEqual(handoff['delivery_handoff']['guide_path'], contract['delivery_guide_path'])
+        self.assertEqual(handoff['delivery_handoff']['contract_guide_path'], contract['delivery_guide_path'])
+        original_delivery = delivered_guide_path.read_bytes()
+        try:
+            for damaged in (original_delivery + b'\nTampered.\n', None):
+                if damaged is None:
+                    delivered_guide_path.unlink()
+                else:
+                    delivered_guide_path.write_bytes(damaged)
+                blocked = self.cli('validate', ok=False)
+                self.assertIn(contract['delivery_guide_path'], blocked.stderr)
+        finally:
+            delivered_guide_path.write_bytes(original_delivery)
+        self.cli('validate')
+
+    def test_legacy_locked_guide_fields_remain_readable_for_re_release(self):
+        authored_path = 'slice-proposals/items-slice/revisions/1/implementation-guide.md'
+        authored_hash = 'a' * 64
+        legacy_slice = {'guide_path': authored_path, 'guide_sha256': authored_hash}
+        self.assertEqual(SLICE_REVIEW_MODULE.package_guide(legacy_slice), (authored_path, authored_hash))
+        self.assertEqual(SLICE_REVIEW_MODULE.released_guide({}, legacy_slice), (authored_path, authored_hash))
+        self.assertEqual(SLICE_REVIEW_MODULE.released_guide(
+            {'guide_path': authored_path, 'guide_sha256': authored_hash}, legacy_slice),
+            (authored_path, authored_hash))
+
+    def accept_first_released_slice(self):
+        report = {'owner': 'builder', 'slice_id': 'items-slice', 'summary': 'Verified guarded list behavior',
+                  'status': 'submitted', 'implementation_paths': ['src/service.py'],
+                  'functional_evidence': ['Member and outsider checks'], 'visual_evidence': [], 'blockers': [],
+                  'next_action': 'Verify independent observations'}
+        self.cli('slice-report', '--slice-id', 'items-slice', '--owner', 'builder',
+                 '--report-file', self.payload('worker', report))
+        self.cli('reconcile', '--slice-id', 'items-slice', '--action', 'report')
+        self.cli('reconcile', '--slice-id', 'items-slice', '--action', 'verify',
+                 '--review-file', self.payload('delivery-review', self.review()))
+        self.cli('reconcile', '--slice-id', 'items-slice', '--action', 'accept')
+
+    def test_integration_waits_for_unreleased_package_slices_and_freezes_dependent_contract(self):
+        feature = self.reviewed_blueprint(multiple=True)
+        self.review_cli('slice-plan', {'slices': [self.guide_candidate(feature),
+            self.guide_candidate(feature, 'adapter-slice', path='src/adapter.py', deps=('items-slice',))]})
+        for key in ('items-slice', 'adapter-slice'):
+            self.review_cli('slice-review-record', self.review_input(key))
+        package = self.lock_reviewed_package()
+        self.authorize_fixture(package)
+        self.review_cli('slice-release', package | {'slice_id': 'items-slice'})
+        self.accept_first_released_slice()
+        self.assertEqual(self.manifest()['stage'], 'implement')
+        dependency_source = self.root / 'src/service.py'
+        original_source = dependency_source.read_bytes()
+        dependency_source.write_bytes(original_source + b'\n# Changed after verification\n')
+        blocked = self.review_cli('slice-release', package | {'slice_id': 'adapter-slice'}, ok=False)
+        self.assertIn('accepted dependency items-slice is stale', blocked.stderr)
+        dependency_source.write_bytes(original_source)
+        self.review_cli('slice-release', package | {'slice_id': 'adapter-slice'})
+        dependent_contract = self.directory / 'slices/adapter-slice/contract.json'
+        original_contract = dependent_contract.read_bytes()
+        self.cli('reconcile', '--slice-id', 'items-slice', '--action', 'block', '--review-file',
+                 self.payload('blocker', {'slice_id': 'items-slice', 'reason': 'Investigate reported list inconsistency',
+                    'next_action': 'Check the member fixtures',
+                    'evidence_files': [self.artifact('slices/items-slice/evidence/incident.txt', 'Observed inconsistency')]}))
+        self.assertEqual(self.manifest()['slices']['adapter-slice']['status'], 'blocked')
+        self.assertEqual(dependent_contract.read_bytes(), original_contract)
+        self.cli('validate')
+
+    def test_unaffected_ready_assignment_continues_during_and_after_package_amendment(self):
+        feature = self.reviewed_blueprint(multiple=True)
+        self.review_cli('slice-plan', {'slices': [self.guide_candidate(feature),
+            self.guide_candidate(feature, 'adapter-slice', path='src/adapter.py')]})
+        for key in ('items-slice', 'adapter-slice'):
+            self.review_cli('slice-review-record', self.review_input(key))
+        first = self.lock_reviewed_package()
+        self.authorize_fixture(first)
+        self.review_cli('slice-release', first | {'slice_id': 'items-slice'})
+        delivery = self.directory / 'slices/items-slice/contract.json'
+        original = delivery.read_bytes()
+        self.review_cli('slice-review-record', {'slice_id': 'adapter-slice', 'proposal_revision': 1,
+            'action': 'reopen', 'user_response': 'Reopen the adapter slice.'})
+        resumed = json.loads(self.cli('resume', '--format', 'json').stdout)
+        self.assertEqual(resumed['slices']['items-slice'], 'ready')
+        self.assertEqual(resumed['dispatchable_slices'], ['items-slice'])
+        self.assertEqual(resumed['slice_review']['continuing_releases'], {'items-slice': 'package-v1'})
+        question = 'Should the adapter preserve the existing response shape?'
+        self.exchange('adapter-question', phase='slice_review', status='open', question=question)
+        scoped_resume = json.loads(self.cli(
+            'resume', '--slice-id', 'items-slice', '--format', 'json').stdout)
+        self.assertTrue(scoped_resume['safe_to_continue'])
+        self.assertEqual(scoped_resume['slice_review']['pending_question_id'], 'adapter-question')
+        self.cli('validate', '--slice-id', 'items-slice')
+        self.cli('validate', '--slice-id', 'adapter-slice', ok=False)
+        source = self.root / 'src/service.py'
+        source.write_text(source.read_text() + '\n# Work continued under the unchanged contract.\n')
+        report = {'owner': 'builder', 'slice_id': 'items-slice', 'summary': 'Preserved verified service behavior',
+                  'status': 'submitted', 'implementation_paths': ['src/service.py']}
+        self.cli('slice-report', '--slice-id', 'items-slice', '--owner', 'builder',
+                 '--report-file', self.payload('unchanged-worker', report))
+        self.cli('reconcile', '--slice-id', 'items-slice', '--action', 'report')
+        self.assertEqual(self.manifest()['stage'], 'slice_review')
+        self.exchange('adapter-answer', phase='slice_review', status='rejected', question=question,
+                      responds_to='adapter-question', response='Reject the proposed response change.')
+        self.review_cli('slice-review-record', self.review_input(
+            'adapter-slice', exchanges=('adapter-question', 'adapter-answer')))
+        second = self.lock_reviewed_package(version=2)
+        self.assertIn('separate explicit start', self.review_cli(
+            'slice-release', second | {'slice_id': 'adapter-slice'}, ok=False).stderr)
+        self.authorize_fixture(second)
+        self.review_cli('slice-release', second | {'slice_id': 'items-slice'})
+        self.assertEqual(self.manifest()['slices']['items-slice']['status'], 'reported')
+        self.assertEqual(delivery.read_bytes(), original)
+        current_handoff = json.loads(self.cli(
+            'resume', '--slice-id', 'items-slice', '--format', 'json').stdout)['delivery_handoff']
+        contract = json.loads(delivery.read_text())
+        self.assertEqual(current_handoff['package_id'], 'package-v2')
+        self.assertEqual(current_handoff['guide_path'],
+                         'slice-proposals/items-slice/revisions/1/implementation-guide-package-v2.md')
+        self.assertEqual(current_handoff['contract_guide_path'], contract['delivery_guide_path'])
+        current_manifest = json.loads((self.directory / 'slice-review/packages/package-v2/package-manifest.json').read_text())
+        self.assertEqual(current_manifest['slices']['items-slice']['delivery_guide_path'],
+                         current_handoff['guide_path'])
+        source_path = current_manifest['slices']['items-slice']['guide_path']
+        source_hash = current_manifest['slices']['items-slice']['guide_sha256']
+        self.assertEqual(contract['locked_guide_path'], source_path)
+        self.assertEqual(current_manifest['artifact_hashes'][source_path], source_hash)
+        self.assertEqual(hashlib.sha256((self.directory / source_path).read_bytes()).hexdigest(), source_hash)
+        self.cli('validate')
+
+    def test_interrupted_release_rechecks_source_before_recovery(self):
+        feature = self.reviewed_blueprint()
+        self.review_cli('slice-plan', {'slices': [self.guide_candidate(feature)]})
+        self.review_cli('slice-review-record', self.review_input())
+        package = self.lock_reviewed_package()
+        self.authorize_fixture(package)
+        release = self.payload('release', package | {'slice_id': 'items-slice'})
+        module = FIXTURE_CLI
+        recover = module.recover_workflow_transition
+
+        def interrupt(directory, request, *, replay=True):
+            if not replay and (directory / '.workflow-transition.json').exists():
+                raise OSError('simulated interruption')
+            return recover(directory, request, replay=replay)
+
+        with patch.object(module, 'recover_workflow_transition', side_effect=interrupt):
+            with self.assertRaisesRegex(OSError, 'simulated interruption'):
+                module.run_slice_review(self.directory, 'slice-release', str(release))
+        drift = self.root / 'outside.py'
+        drift.write_text('print("outside authorized paths")\n')
+        self.assertIn('outside.py', self.cli('slice-release', '--input-file', release, ok=False).stderr)
+        self.assertFalse((self.directory / 'slices/items-slice').exists())
+        drift.unlink()
+        self.cli('slice-release', '--input-file', release)
+        self.cli('validate')
+
+    def test_revising_locked_package_preserves_old_lock_and_requires_new_start(self):
+        feature = self.reviewed_blueprint()
+        self.review_cli('slice-plan', {'slices': [self.guide_candidate(feature)]})
+        self.review_cli('slice-review-record', self.review_input())
+        first = self.lock_reviewed_package()
+        self.authorize_fixture(first)
+        original_lock = self.directory / 'slice-review/packages/package-v1/lock-receipt.json'
+        before = original_lock.read_bytes()
+        self.review_cli('slice-draft', self.guide_candidate(feature, revision=2))
+        self.review_cli('slice-review-record', self.review_input())
+        second = self.lock_reviewed_package(version=2)
+        self.assertNotEqual(first['package_hash'], second['package_hash'])
+        self.assertEqual(original_lock.read_bytes(), before)
+        self.assertIn('separate explicit start', self.review_cli(
+            'slice-release', second | {'slice_id': 'items-slice'}, ok=False).stderr)
+        self.assertIn('exact locked', self.review_cli(
+            'slice-release', first | {'slice_id': 'items-slice'}, ok=False).stderr)
+        self.assertIn('separate explicit user instruction', self.review_cli('implementation-authorize', second | {
+            'instruction': 'start implementation', 'authorized_by_user': True,
+            'user_response': 'Start implementation of package-v1.'}, ok=False).stderr)
+        self.authorize_fixture(second)
+        self.review_cli('slice-release', second | {'slice_id': 'items-slice'})
+
+    def test_sr011_013_changed_or_missing_frozen_handoff_blocks_release(self):
+        feature = self.reviewed_blueprint()
+        self.review_cli('slice-plan', {'slices': [self.guide_candidate(feature)]})
+        self.review_cli('slice-review-record', self.review_input())
+        package = self.lock_reviewed_package()
+        self.authorize_fixture(package)
+        guide = self.directory / self.manifest()['slice_review']['selected']['items-slice']['guide_path']
+        original = guide.read_bytes()
+        guide.write_bytes(original + b'\nDrift')
+        result = self.review_cli('slice-release', package | {'slice_id': 'items-slice'}, ok=False)
+        self.assertIn('Changed protected evidence', result.stderr)
+        guide.unlink()
+        self.assertIn('Missing approved artifact', self.cli('validate', ok=False).stderr)
+
+    def test_sr014_surface_annexes_are_required_and_schema_checked(self):
+        feature = self.reviewed_blueprint(extra_surfaces=True)
+        candidate = self.guide_candidate(feature, surfaces=('backend', 'api', 'mcp', 'script'))
+        path = self.directory / candidate['guide_path']
+        valid = path.read_text()
+        path.write_text(valid.replace('"output":{"type":"array"}', '"bogus":{"type":"array"}'))
+        result = self.review_cli('slice-plan', {'slices': [candidate]}, ok=False)
+        self.assertIn('MCP annex', result.stderr)
+        self.assertIn('output', result.stderr)
+        path.write_text(valid)
+        self.review_cli('slice-plan', {'slices': [candidate]})
+        self.review_cli('slice-guide-validate', {'slice_id': 'items-slice'})
+
+    def test_sr014_ui_annex_checks_the_approved_visual_token(self):
+        feature = self.reviewed_blueprint(surface='ui')
+        candidate = self.guide_candidate(feature, surfaces=('ui',))
+        path = self.directory / candidate['guide_path']
+        valid = path.read_text()
+        path.write_text(valid.replace('gap = 16px', 'gap = 17px'))
+        self.assertIn('Layout and tokens differs from the approved contract', self.review_cli(
+            'slice-plan', {'slices': [candidate]}, ok=False).stderr)
+        path.write_text(valid)
+        self.review_cli('slice-plan', {'slices': [candidate]})
+
+    def test_sr015_report_halts_active_authorized_release_until_reapproval(self):
+        feature = self.reviewed_blueprint()
+        self.review_cli('slice-plan', {'slices': [self.guide_candidate(feature)]})
+        self.review_cli('slice-review-record', self.review_input())
+        package = self.lock_reviewed_package()
+        self.authorize_fixture(package)
+        self.review_cli('slice-release', package | {'slice_id': 'items-slice'})
+        report = {'report_id': 'missing-items', 'suspected_features': ['list-items'],
+                  'summary': 'The forbidden outcome was omitted from an implementation proposal.',
+                  'evidence_paths': [self.artifact('inputs/missing-items.md', 'Observed absent forbidden outcome.')]}
+        self.cli('missing-feature', '--report-file', self.payload('missing-report', report))
+        response = self.review_cli('slice-release', package | {'slice_id': 'items-slice'}, ok=False)
+        self.assertIn('follow-up sweep', response.stderr.lower())
+        audit = self.baseline(audit_id='audit-v2')
+        audit['sweeps'] = [audit['sweeps'][-1]]
+        self.record_baseline(audit)
+        self.cli('plan-record', '--plan-file', self.payload('followup-plan', self.plan('plan-v2', 'audit-v2')))
+        second_spec = self.blueprint('spec-v2') | {'baseline_id': 'audit-v2', 'plan_version': 'plan-v2'}
+        self.cli('blueprint-record', '--blueprint-file', self.payload('followup-spec', second_spec))
+        self.cli('blueprint-coverage', '--coverage-file', self.payload(
+            'followup-coverage', self.coverage('spec-v2') | {'baseline_id': 'audit-v2'}))
+        self.cli('approve', '--approval-file', self.payload('followup-approval', self.approval('spec-v2')))
+        replacement = self.guide_candidate(second_spec['features'][0], 'replacement-slice') | {
+            'replaces_slice_ids': ['items-slice']}
+        plan = self.review_cli('slice-plan', {'slices': [replacement]})
+        self.assertEqual(plan['slices']['replacement-slice']['replaces_slice_ids'], ['items-slice'])
+        self.review_cli('slice-review-record', self.review_input('replacement-slice'))
+        new_package = self.lock_reviewed_package(version=2)
+        package_manifest = json.loads((self.directory / 'slice-review/packages/package-v2/package-manifest.json').read_text())
+        self.assertEqual(package_manifest['slices']['replacement-slice']['replaces_slice_ids'], ['items-slice'])
+        self.assertIn('separate explicit start', self.review_cli(
+            'slice-release', new_package | {'slice_id': 'replacement-slice'}, ok=False).stderr)
+        self.authorize_fixture(new_package)
+        self.review_cli('slice-release', new_package | {'slice_id': 'replacement-slice'})
+        self.assertEqual(self.manifest()['slices']['items-slice']['superseded_by'], 'approve-spec-v2')
+        self.cli('validate')
+
+    def test_sr017_interrupted_start_recovers_once(self):
+        feature = self.reviewed_blueprint()
+        self.review_cli('slice-plan', {'slices': [self.guide_candidate(feature)]})
+        self.review_cli('slice-review-record', self.review_input())
+        package = self.lock_reviewed_package()
+        file = self.payload('auth', self.with_slice_consent('implementation-authorize', package | {
+            'instruction': 'start implementation', 'authorized_by_user': True,
+            'user_response': 'Start implementation of package-v1.'}))
+        module = FIXTURE_CLI
+        recover = module.recover_workflow_transition
+
+        def interrupt(directory, request, *, replay=True):
+            if not replay and (directory / '.workflow-transition.json').exists():
+                raise OSError('simulated interruption before artifacts are written')
+            return recover(directory, request, replay=replay)
+
+        with patch.object(module, 'recover_workflow_transition', side_effect=interrupt):
+            with self.assertRaisesRegex(OSError, 'simulated interruption'):
+                module.run_slice_review(self.directory, 'implementation-authorize', str(file))
+        self.assertIn('Interrupted implementation-authorize', self.cli('validate', ok=False).stderr)
+        self.cli('implementation-authorize', '--input-file', file)
+        self.cli('implementation-authorize', '--input-file', file)
+        log = [json.loads(line) for line in (self.directory / 'decisions.jsonl').read_text().splitlines()]
+        self.assertEqual(sum(event['type'] == 'slice_implementation_authorized' for event in log), 1)
+        self.cli('validate')
+
+    def test_reconcile_cannot_advance_a_released_slice_after_review_reopens(self):
+        feature = self.reviewed_blueprint()
+        self.review_cli('slice-plan', {'slices': [self.guide_candidate(feature)]})
+        self.review_cli('slice-review-record', self.review_input())
+        package = self.lock_reviewed_package()
+        self.authorize_fixture(package)
+        self.review_cli('slice-release', package | {'slice_id': 'items-slice'})
+        report = {'owner': 'builder', 'slice_id': 'items-slice', 'summary': 'Observed fixture behavior',
+                  'status': 'submitted', 'implementation_paths': ['src/service.py']}
+        self.cli('slice-report', '--slice-id', 'items-slice', '--owner', 'builder',
+                 '--report-file', self.payload('worker', report))
+        self.review_cli('slice-review-record', {'action': 'reopen', 'slice_id': 'items-slice',
+                                                'proposal_revision': 1, 'user_response': 'Reopen this slice.'})
+        result = self.cli('reconcile', '--slice-id', 'items-slice', '--action', 'report', ok=False)
+        self.assertIn('Lock the reviewed collection', result.stderr)
+        resumed = json.loads(self.cli('resume', '--format', 'json').stdout)
+        self.assertEqual(resumed['slices']['items-slice'], 'paused')
+        self.assertEqual(resumed['dispatchable_slices'], [])
+
+    def test_migration_preserves_in_progress_delivery_and_requires_current_blueprint(self):
+        self.assigned()
+        original = self.manifest()
+        self.review_cli('slice-review-migrate', {'approved_by_user': True,
+                                                'user_response': 'Migrate this initiative to review gates.'})
+        current = self.manifest()
+        self.assertEqual(current['slices'], original['slices'])
+        self.assertEqual(current['approvals'], original['approvals'])
+        result = self.review_cli('slice-plan', {'slices': []}, ok=False)
+        self.assertIn('new blueprint approval', result.stderr)
+
+    def test_review_blocker_is_durable_and_prevents_lock(self):
+        feature = self.reviewed_blueprint()
+        self.review_cli('slice-plan', {'slices': [self.guide_candidate(feature)]})
+        self.review_cli('slice-review-record', {'action': 'block', 'slice_id': 'items-slice',
+            'proposal_revision': 1, 'reason': 'The no-code handoff found an ambiguous role.',
+            'evidence_paths': [self.artifact('inputs/open-role.md', 'The reviewer found an unspecified role.')]})
+        resumed = self.review_cli('slice-register')
+        self.assertIn('ambiguous role', resumed['review_blockers']['items-slice']['reason'])
+        result = self.review_cli('slice-collection-validate', self.collection_input(), ok=False)
+        self.assertIn('Open review blockers', json.loads(result.stdout)['checks']['review_validity']['explanation'])
+
+    def test_sr018_unrelated_workspace_change_blocks_review_gate(self):
+        feature = self.reviewed_blueprint()
+        self.review_cli('slice-plan', {'slices': [self.guide_candidate(feature)]})
+        (self.root / 'unrelated.py').write_text('print("unrelated change")\n')
+        result = self.review_cli('slice-review-record', self.review_input(), ok=False)
+        self.assertIn('unrelated.py', result.stderr)
+        self.assertIn('unrelated.py', self.cli('validate', ok=False).stderr)
 
     def test_approval_requires_coverage_recap_and_explicit_exceptions(self):
         self.prepared()

@@ -8,6 +8,7 @@ import importlib.util
 from types import SimpleNamespace
 from collections import deque
 from contextlib import contextmanager
+from functools import lru_cache
 from datetime import datetime, timezone
 import fcntl
 import hashlib
@@ -24,7 +25,7 @@ import zlib
 
 
 VALID_SCOPES = frozenset({"feature", "page", "app"})
-VALID_STAGES = frozenset({"discover", "plan", "blueprint", "prototype", "approved", "sliced", "implement", "verify", "integrate"})
+VALID_STAGES = frozenset({"discover", "plan", "blueprint", "prototype", "approved", "slice_review", "sliced", "implement", "verify", "integrate"})
 VALID_WORK_STATUSES = frozenset({"in_progress", "blocked", "waiting_user", "done"})
 INITIATIVE_ID = re.compile(r"^[a-z][a-z0-9-]{2,60}$")
 VERSION_ID = re.compile(r"^[a-z][a-z0-9-]{1,60}$")
@@ -44,17 +45,86 @@ def initiative_mode(manifest: dict) -> str:
     return mode
 
 
-def blueprint_state(directory: Path, manifest: dict):
-    # Load beside the CLI even when imported by path from an unrelated working directory.
-    spec = importlib.util.spec_from_file_location("p2p_blueprint", SKILL_ROOT / "scripts/blueprint_state.py")
+@lru_cache(maxsize=None)
+def sibling_module(name: str):
+    spec = importlib.util.spec_from_file_location(f"p2p_{name}", SKILL_ROOT / "scripts" / f"{name}.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.BlueprintState(SimpleNamespace(**globals()), directory, manifest)
+    return module
+
+
+def blueprint_state(directory: Path, manifest: dict):
+    # Load beside the CLI even when imported by path from an unrelated working directory.
+    return sibling_module("blueprint_state").BlueprintState(SimpleNamespace(**globals()), directory, manifest)
+
+
+REVIEW_COMMANDS = (
+    "slice-plan", "slice-draft", "slice-guide-validate", "slice-review-record",
+    "slice-register", "slice-collection-validate", "slice-package-lock",
+    "implementation-authorize", "slice-release", "slice-review-migrate", "slice-package-preview",
+)
+REVIEW_READ_ONLY = {"slice-guide-validate", "slice-register", "slice-package-preview"}
+
+
+def slice_review_state(directory: Path, manifest: dict):
+    return sibling_module("slice_review").SliceReview(blueprint_state(directory, manifest))
+
+
+def requires_slice_review(manifest: dict) -> bool:
+    return initiative_mode(manifest) == "blueprint" and (
+        manifest.get("schema_version", 1) >= 5 or manifest.get("slice_review_required") is True)
+
+
+def active_review_release(manifest: dict) -> dict:
+    if not requires_slice_review(manifest) or manifest.get("coverage_pending"):
+        return {}
+    review = manifest.get("slice_review", {})
+    active_approval = manifest.get("active_approval_id")
+    if not active_approval or review.get("approval_id") != active_approval:
+        return {}
+    packages = review.get("packages", {})
+    released = {}
+    for slice_id, origin in review.get("continuing_releases", {}).items():
+        package = packages.get(origin, {})
+        if package.get("authorization_path") and slice_id in package.get("released", {}):
+            released[slice_id] = package["released"][slice_id]
+    package = packages.get(review.get("active_package"), {})
+    if package.get("authorization_path"):
+        released.update(package.get("released", {}))
+    return released
+
+
+def run_slice_review(directory: Path, command: str, input_file: str | None) -> None:
+    value = read_json(Path(input_file)) if input_file else {}
+    request = {"command": command, "input": value}
+    with coordinator_lock(directory):
+        if command not in REVIEW_READ_ONLY and recover_workflow_transition(directory, request, replay=False):
+            state = slice_review_state(directory, manifest_at(directory))
+            result = state.summary()
+            if command == "slice-collection-validate":
+                result = read_json(artifact_file(directory, result["collection_report"]["path"]))
+            elif command == "slice-plan" and result["planning_gaps"]:
+                result = state.planning_blocker()
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+            if result.get("result") == "BLOCKED":
+                raise StateError(result.get("explanation", "Resolve the blockers in the validation report"))
+            return
+        manifest = manifest_at(directory)
+        if initiative_mode(manifest) != "blueprint":
+            raise StateError("Slice review requires blueprint mode")
+        state = slice_review_state(directory, manifest)
+        result = state.run(request)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        if isinstance(result, dict) and result.get("result") == "BLOCKED":
+            raise StateError(result.get("explanation", "Resolve the blockers in the validation report"))
 
 
 def record_blueprint_command(directory: Path, command: str, input_file: str, project_root: Path) -> None:
     value = read_json(Path(input_file))
+    request = {"command": command, "input": value}
     with coordinator_lock(directory):
+        if command == "conversation-record" and recover_workflow_transition(directory, request):
+            return
         manifest = manifest_at(directory)
         if initiative_mode(manifest) != "blueprint":
             raise StateError("Blueprint commands require an explicitly initialized blueprint initiative")
@@ -69,6 +139,9 @@ def record_blueprint_command(directory: Path, command: str, input_file: str, pro
             raise StateError("Reconcile protected record history first: " + "; ".join(integrity_errors))
         if command == "discovery-record":
             state.record_discovery(project_root, value)
+        elif command == "conversation-record" and requires_slice_review(manifest) and value.get("phase") == "slice_review":
+            review = slice_review_state(directory, manifest)
+            review.record_exchange(request, value)
         else:
             getattr(state, command.replace("-", "_"))(value)
     print(f"Recorded {command}")
@@ -136,8 +209,8 @@ def location(project_root: str, initiative_id: str) -> Path:
     return hidden if git_workspace_root(root) else legacy
 
 
-def ensure_local_git_ignore(project_root: Path, directory: Path) -> None:
-    """Keep new and resumed Git-backed artifacts ignored without changing the index."""
+def ensure_local_git_ignore(project_root: Path, directory: Path, *, configure: bool) -> None:
+    """Check privacy of initiative artifacts and optionally configure Git's local exclude."""
     root = git_workspace_root(project_root)
     if root is None:
         return
@@ -170,6 +243,8 @@ def ensure_local_git_ignore(project_root: Path, directory: Path) -> None:
 
     if is_ignored():
         return
+    if not configure:
+        raise StateError("Run artifact-setup for this initiative to configure its local Git exclude, then retry")
     git_path = subprocess.run(
         ["git", "-C", str(root), "rev-parse", "--git-path", "info/exclude"],
         capture_output=True, text=True,
@@ -264,7 +339,7 @@ def manifest_at(directory: Path) -> dict:
         raise StateError(f"Initiative not initialized: {directory}. Run init first.")
     manifest = read_json(directory / "manifest.json")
     version = manifest.get("schema_version", 1)
-    if type(version) is not int or version not in {1, 2, 3, 4}:
+    if type(version) is not int or version not in {1, 2, 3, 4, 5}:
         raise StateError(f"Unsupported manifest schema version: {version!r}")
     return manifest
 
@@ -941,9 +1016,9 @@ def validate_approval_record(directory: Path, value: dict, existing: dict) -> tu
     return frozen, errors
 
 
-def check_approval(directory: Path, manifest: dict) -> list[str]:
+def check_approval(directory: Path, manifest: dict, *, allow_questions: bool = False) -> list[str]:
     if initiative_mode(manifest) == "blueprint":
-        return blueprint_state(directory, manifest).check_approval()
+        return blueprint_state(directory, manifest).check_approval(allow_questions=allow_questions)
     approval_id = manifest.get("active_approval_id")
     if not approval_id:
         return ["No active approved prototype"] if manifest.get("stage") not in {"discover", "plan", "blueprint", "prototype"} else []
@@ -995,6 +1070,8 @@ def recover_workflow_transition(directory: Path, request: dict, *, replay: bool 
     pending = read_json(marker)
     if pending["request"] != request:
         raise StateError(f"Interrupted {pending['request']['command']}; retry it with the exact original input")
+    if pending.get("review_source_guard"):
+        slice_review_state(directory, pending["manifest"]).check_recovery(pending["review_source_guard"])
     writes = pending["artifacts"] | {"manifest.json": pending["manifest"]}
     journal_path = directory / "decisions.jsonl"
     before = pending["before"]
@@ -1006,15 +1083,22 @@ def recover_workflow_transition(directory: Path, request: dict, *, replay: bool 
         append = False
     else:
         raise StateError("Journal changed during interrupted workflow transition")
+    def encoded(relative, value):
+        if relative in pending.get("binary_artifacts", {}):
+            return bytes.fromhex(pending["binary_artifacts"][relative])
+        return json_content(value).encode("utf-8")
+
+    writes.update(dict.fromkeys(pending.get("binary_artifacts", {})))
     for relative, value in writes.items():
         path = directory / relative
         if path.resolve() != directory.resolve() / relative:
             raise StateError(f"Invalid write path in interrupted transition: {relative}")
         old = digest_of(path) if path.exists() else None
-        if old not in {before[relative], hashlib.sha256(json_content(value).encode()).hexdigest()}:
+        if old not in {before[relative], hashlib.sha256(encoded(relative, value)).hexdigest()}:
             raise StateError(f"File changed during interrupted workflow transition: {relative}")
-    for relative, value in pending["artifacts"].items():
-        atomic_json(directory / relative, value)
+    for relative, value in writes.items():
+        if relative != "manifest.json":
+            atomic_bytes(directory / relative, encoded(relative, value))
     if append:
         atomic_bytes(journal_path, journal_bytes + suffix)
     atomic_json(directory / "manifest.json", pending["manifest"])
@@ -1027,7 +1111,9 @@ def recover_workflow_transition(directory: Path, request: dict, *, replay: bool 
 
 
 def save_workflow_state(directory: Path, manifest: dict, *, slice_retry_cursor: dict | None = None,
-                        transition: tuple[dict, list[dict], dict] | None = None) -> None:
+                        transition: tuple[dict, list[dict], dict] | None = None,
+                        binary_artifacts: dict[str, bytes] | None = None,
+                        review_source_guard: dict | None = None) -> None:
     """Persist blueprint phase changes together with the active task position."""
     if initiative_mode(manifest) == "blueprint":
         task_id = manifest.get("active_work_id")
@@ -1054,11 +1140,14 @@ def save_workflow_state(directory: Path, manifest: dict, *, slice_retry_cursor: 
                 manifest["work_items"][task_id] = updated
     if transition is not None:
         request, events, artifacts = transition
-        paths = ["manifest.json", "decisions.jsonl", *artifacts]
+        binary_artifacts = binary_artifacts or {}
+        paths = ["manifest.json", "decisions.jsonl", *artifacts, *binary_artifacts]
         before = {relative: digest_of(directory / relative) if (directory / relative).exists() else None
                   for relative in paths}
         atomic_json(directory / ".workflow-transition.json", {
             "request": request, "manifest": manifest, "artifacts": artifacts, "before": before,
+            "binary_artifacts": {path: data.hex() for path, data in binary_artifacts.items()},
+            "review_source_guard": review_source_guard,
             "lines": [journal_line({**event, "at": utc_now()}) for event in events],
         })
         recover_workflow_transition(directory, request, replay=False)
@@ -1106,8 +1195,12 @@ def render_checkpoint(manifest: dict, *, resume_action: str | None = None) -> st
         if item.get("status") == "blocked" and not item.get("superseded_by"):
             lines.extend(f"- {slice_id}: {reason}" for reason in item.get("blockers", []))
     lines += ["", "## Slices", ""]
+    released = active_review_release(manifest)
     for slice_id, item in sorted(manifest.get("slices", {}).items()):
         status = item.get("status", "unknown")
+        if (requires_slice_review(manifest) and slice_id not in released
+                and not item.get("superseded_by") and status not in {"accepted", "cancelled"}):
+            status = f"paused (last delivery status {status})"
         if item.get("superseded_by"):
             status += f", superseded by {item['superseded_by']}"
         lines.append(f"- {slice_id}: {status} ({item.get('owner', 'unassigned')})")
@@ -1169,6 +1262,8 @@ def initialize(directory: Path, scope: str, next_action: str | None, mode: str |
             "stage": "discover",
             "next_action": next_action or template["next_action"],
         })
+        if template["initiative_mode"] == "blueprint":
+            template.update(schema_version=5, slice_review_required=True)
         template["provenance"]["created_at"] = utc_now()
         folders = ("plans", "blueprints", "conversation", "slices") if template["initiative_mode"] == "blueprint" else ("prototype/versions", "references", "fixtures", "slices")
         for subdirectory in folders:
@@ -1274,7 +1369,7 @@ def work_update(directory: Path, project_root: Path, work_file: str) -> None:
     with coordinator_lock(directory):
         manifest = manifest_at(directory)
         blueprint = initiative_mode(manifest) == "blueprint"
-        if value["phase"] in {"plan", "blueprint"} and not blueprint:
+        if value["phase"] in {"plan", "blueprint", "slice_review"} and not blueprint:
             raise StateError("Plan/blueprint phases require blueprint mode")
         if blueprint and value["phase"] != manifest["stage"]:
             raise StateError(f"Set the work phase to the recorded blueprint stage {manifest['stage']}")
@@ -1329,7 +1424,8 @@ def work_update(directory: Path, project_root: Path, work_file: str) -> None:
         }
         artifact_hashes = {path: digest_of(artifact_file(directory, path)) for path in artifact_paths}
         repository_head, worktree_status = git_info(project_root)
-        recorded = {**value, "code_paths": code_paths, "artifact_paths": artifact_paths,
+        review_cursor = {"slice_review": existing["slice_review"]} if existing and "slice_review" in existing else {}
+        recorded = {**value, **review_cursor, "code_paths": code_paths, "artifact_paths": artifact_paths,
                     "code_hashes": code_hashes, "artifact_hashes": artifact_hashes,
                     "repository_head": repository_head, "worktree_status": worktree_status,
                     "created_at": existing["created_at"] if existing else utc_now(),
@@ -1391,7 +1487,8 @@ def approve(directory: Path, approval_file: str) -> None:
                          and item.endswith("; implementation is paused"))
             ],
             "coverage_pending": False,
-            "next_action": "Create complete slice contracts grounded in the locked blueprint" if initiative_mode(manifest) == "blueprint" else "Create complete slice contracts grounded in the locked prototype",
+            "next_action": ("Plan the complete slice inventory and implementation guides" if requires_slice_review(manifest)
+                            else f"Create complete slice contracts grounded in the locked {mode}"),
         })
         note_progress(manifest, f"Approved {mode} {approval['approved_version']}, decision {approval['decision_id']}",
                       completed=f"Frozen {mode} {approval['approved_version']}")
@@ -1460,6 +1557,8 @@ def create_slice(directory: Path, contract_file: str) -> None:
             raise StateError("Cannot create a slice without active approval")
         approval = manifest["approvals"][active_id]
         if initiative_mode(manifest) == "blueprint":
+            if requires_slice_review(manifest):
+                raise StateError("Reviewed blueprint assignments require slice-release from an authorized package")
             blueprint_state(directory, manifest).create_slice(candidate)
             return
         errors = validate_slice_contract(candidate)
@@ -1546,22 +1645,46 @@ def create_slice(directory: Path, contract_file: str) -> None:
 def cancel_slice(directory: Path, slice_id: str, reason: str) -> None:
     if not reason.strip():
         raise StateError("Cancelling a slice requires a written reason")
+    request = {"command": "slice-cancel", "input": {"slice_id": slice_id, "reason": reason}}
     with coordinator_lock(directory):
+        if recover_workflow_transition(directory, request, replay=False):
+            print(f"Cancelled {slice_id}; old contract and evidence retained")
+            return
         manifest = manifest_at(directory)
         assignment = manifest.get("slices", {}).get(slice_id)
         if not assignment or assignment.get("status") == "cancelled" or assignment.get("superseded_by"):
             raise StateError(f"Slice is unknown or already cancelled: {slice_id}")
         prior = assignment["status"]
-        journal(directory, {"type": "slice_cancelled", "slice_id": slice_id, "prior_status": prior, "reason": reason})
+        checkpoint = None
+        package_id = assignment.get("review_package_id")
+        package = manifest.get("slice_review", {}).get("packages", {}).get(package_id, {})
+        if package.get("authorization_path"):
+            state = slice_review_state(directory, manifest)
+            approval = manifest.get("approvals", {}).get(manifest.get("active_approval_id"), {})
+            snapshot = state.blueprint.workspace_snapshot()
+            state.source(approval, state.authorized_paths(), snapshot=snapshot)
+            allowed_paths = assignment.get("allowed_paths", [])
+            scoped = {path: value for path, value in snapshot.items()
+                      if any(ownership_contains(owner, path) for owner in allowed_paths)}
+            checkpoint = {"approval_id": manifest.get("active_approval_id"), "package_id": package_id,
+                          "allowed_paths": allowed_paths, "snapshot": scoped}
+            assignment["cancelled_source_checkpoint"] = checkpoint
+        event = {"type": "slice_cancelled", "slice_id": slice_id, "prior_status": prior,
+                 "reason": reason, **({"source_checkpoint": checkpoint} if checkpoint else {})}
         assignment["status"] = "cancelled"
         assignment["blockers"] = [f"Cancelled: {reason}; existing code remains untouched"]
         manifest["next_action"] = "Review cancelled slice impact, reassign its paths if needed, and preserve old evidence"
         note_progress(manifest, f"Cancelled slice {slice_id} (was {prior}): {reason}")
-        save_workflow_state(directory, manifest)
+        save_workflow_state(directory, manifest, transition=(request, [event], {}))
     print(f"Cancelled {slice_id}; old contract and evidence retained")
 
 
 def worker_report(directory: Path, slice_id: str, owner: str, report_file: str) -> None:
+    with coordinator_lock(directory):
+        record_worker_report(directory, slice_id, owner, report_file)
+
+
+def record_worker_report(directory: Path, slice_id: str, owner: str, report_file: str) -> None:
     manifest = manifest_at(directory)
     assigned = manifest.get("slices", {}).get(slice_id)
     if not assigned:
@@ -1584,10 +1707,13 @@ def worker_report(directory: Path, slice_id: str, owner: str, report_file: str) 
     if manifest.get("coverage_pending") and report.get("status") != "blocked":
         raise StateError("New application-A functionality is pending investigation; implementation reports cannot claim completion")
     blueprint = initiative_mode(manifest) == "blueprint"
+    if blueprint and requires_slice_review(manifest) and report["status"] == "submitted":
+        slice_review_state(directory, manifest).require_execution(slice_id)
     if blueprint and report["status"] == "submitted":
         if assigned.get("blueprint_version") != manifest.get("approved_version"):
             raise StateError("Slice must target the active blueprint approval")
-        errors = check_approval(directory, manifest)
+        errors = check_approval(directory, manifest, allow_questions=(
+            requires_slice_review(manifest) and slice_review_state(directory, manifest).unrelated_review_questions(slice_id)))
         if errors:
             raise StateError("Cannot submit blueprint slice: " + "; ".join(errors))
     if not isinstance(report.get("implementation_paths"), list) or not all(
@@ -2246,13 +2372,14 @@ def check_work_state(directory: Path, manifest: dict) -> list[str]:
     return errors
 
 
-def check_initiative(directory: Path, manifest: dict) -> list[str]:
-    errors = check_approval(directory, manifest)
+def check_initiative(directory: Path, manifest: dict, *, allow_questions: bool = False) -> list[str]:
+    errors = check_approval(directory, manifest, allow_questions=allow_questions)
     errors.extend(check_coverage_records(directory, manifest))
     errors.extend(check_work_state(directory, manifest))
     if initiative_mode(manifest) == "blueprint":
         state = blueprint_state(directory, manifest)
         errors.extend(state.check_records())
+        errors.extend(slice_review_state(directory, manifest).check())
         try:
             state.check_baseline_before_delivery()
         except (StateError, KeyError, OSError) as error:
@@ -2295,7 +2422,8 @@ def block_dependents(directory: Path, manifest: dict, prerequisite_id: str,
                      *, staged: tuple[list[dict], dict] | None = None) -> None:
     """A newly blocked prerequisite cannot leave dependent tasks falsely ready or accepted."""
     for dependent_id, dependent in manifest["slices"].items():
-        if prerequisite_id not in dependent.get("dependencies", []) or dependent["status"] == "cancelled":
+        if (prerequisite_id not in dependent.get("dependencies", []) or dependent["status"] == "cancelled"
+                or dependent.get("superseded_by")):
             continue
         reason = f"Waiting for accepted dependency: {prerequisite_id}"
         if reason in dependent.get("blockers", []):
@@ -2303,7 +2431,7 @@ def block_dependents(directory: Path, manifest: dict, prerequisite_id: str,
         previous = dependent["status"]
         dependent["status"] = "blocked"
         dependent["blockers"] = list(dependent.get("blockers", [])) + [reason]
-        if previous == "ready":
+        if previous == "ready" and not dependent.get("review_package_id"):
             packet_path = artifact_file(directory, dependent["contract_file"])
             packet = read_json(packet_path)
             packet["status"], packet["blockers"] = "blocked", dependent["blockers"]
@@ -2324,21 +2452,23 @@ def block_dependents(directory: Path, manifest: dict, prerequisite_id: str,
 def unblock_dependents(directory: Path, manifest: dict) -> None:
     """Release implementation dependencies, not final acceptance, after reviewed warnings."""
     for dependent_id, dependent in manifest["slices"].items():
-        if dependent["status"] != "blocked" or not dependent["dependencies"]:
+        if dependent["status"] != "blocked" or not dependent["dependencies"] or dependent.get("superseded_by"):
             continue
-        if any(manifest["slices"][dep]["status"] not in {"accepted", "provisional"}
-               for dep in dependent["dependencies"]):
+        reviewed = bool(dependent.get("review_package_id"))
+        allowed = {"accepted"} if reviewed else {"accepted", "provisional"}
+        if any(manifest["slices"][dep]["status"] not in allowed for dep in dependent["dependencies"]):
             continue
         if any(not str(blocker).startswith("Waiting for accepted dependency:") for blocker in dependent["blockers"]):
             continue
-        packet_path = artifact_file(directory, dependent["contract_file"])
-        packet = read_json(packet_path)
-        packet["status"], packet["blockers"] = "ready", []
-        atomic_json(packet_path, packet)
+        if not reviewed:
+            packet_path = artifact_file(directory, dependent["contract_file"])
+            packet = read_json(packet_path)
+            packet["status"], packet["blockers"] = "ready", []
+            atomic_json(packet_path, packet)
+            dependent["contract_sha256"] = digest_of(packet_path)
         dependent["status"], dependent["blockers"] = "ready", []
-        dependent["contract_sha256"] = digest_of(packet_path)
-        journal(directory, {"type": "slice_unblocked", "slice_id": dependent_id,
-                            "reason": "Dependencies accepted or provisionally verified with capture warnings"})
+        reason = "Dependencies accepted" if reviewed else "Dependencies accepted or provisionally verified with capture warnings"
+        journal(directory, {"type": "slice_unblocked", "slice_id": dependent_id, "reason": reason})
 
 
 def reconcile_slice(directory: Path, slice_id: str, action: str, review_file: str | None = None) -> None:
@@ -2351,16 +2481,28 @@ def reconcile_slice(directory: Path, slice_id: str, action: str, review_file: st
                 return
             transition = (request, [], {})
         manifest = manifest_at(directory)
-        if initiative_mode(manifest) == "blueprint" and action in {"report", "verify", "accept", "accept-warning"}:
+        review_state = slice_review_state(directory, manifest) if requires_slice_review(manifest) else None
+        independent_question = review_state is not None and review_state.unrelated_review_questions(slice_id)
+        work = manifest.get("work_items", {}).get(manifest.get("active_work_id"), {})
+        other_slice_waiting = independent_question and work.get("status") == "waiting_user" and (
+            work.get("pending_question_id") == review_state.registry.get("pending_question_id"))
+        if (initiative_mode(manifest) == "blueprint" and not other_slice_waiting
+                and action in {"report", "verify", "accept", "accept-warning"}):
             blueprint_state(directory, manifest).require_ready()
         assignment = manifest.get("slices", {}).get(slice_id)
         if not assignment:
             raise StateError(f"Unknown slice: {slice_id}")
-        errors = check_initiative(directory, manifest)
+        if review_state and action in {"unblock", "report", "verify", "accept", "accept-warning"}:
+            review_state.require_execution(slice_id)
+        errors = check_initiative(directory, manifest, allow_questions=independent_question)
         if assignment.get("blueprint_version", assignment.get("prototype_version")) != manifest.get("approved_version"):
             errors.append(f"Slice references superseded {initiative_mode(manifest)}; reapproval and reslicing required")
         if errors:
             raise StateError("Cannot reconcile: " + "; ".join(errors))
+        review_cursor = {}
+        if manifest["stage"] == "slice_review" and review_state and (
+                slice_id in review_state.registry.get("continuing_releases", {})):
+            review_cursor = {field: manifest[field] for field in ("stage", "next_action")}
         if action == "block":
             if assignment["status"] == "cancelled" or not review_file:
                 raise StateError("Blocking an active slice requires --review-file with the defect and next action")
@@ -2422,7 +2564,6 @@ def reconcile_slice(directory: Path, slice_id: str, action: str, review_file: st
                                        else "Verify reported slice against approved visual cases and affected behavior")
         elif action == "verify":
             if initiative_mode(manifest) == "blueprint":
-                blueprint_state(directory, manifest).require_ready()
                 if assignment["status"] != "reported" or assignment.get("blockers") or any(
                     manifest["slices"][dep]["status"] != "accepted" for dep in assignment.get("dependencies", [])
                 ):
@@ -2441,6 +2582,7 @@ def reconcile_slice(directory: Path, slice_id: str, action: str, review_file: st
                 manifest["stage"] = "verify"
                 manifest["next_action"] = "Fix verification blockers, rerun visual/functional checks and submit review"
                 journal(directory, {"type": "verification_blocked", "slice_id": slice_id, "errors": failures, "review": review})
+                manifest.update(review_cursor)
                 save_workflow_state(directory, manifest)
                 raise StateError("Verification BLOCKED: " + "; ".join(failures))
             if verified["status"] == "WARNING":
@@ -2515,6 +2657,7 @@ def reconcile_slice(directory: Path, slice_id: str, action: str, review_file: st
             raise StateError(f"Unknown reconciliation action: {action}")
         note_progress(manifest, f"Slice {slice_id}: {assignment['status']} ({action})",
                       completed=f"Accepted {slice_id}" if action in {"accept", "accept-warning"} else None)
+        manifest.update(review_cursor)
         save_workflow_state(directory, manifest, transition=transition)
     print(f"Reconciled slice {slice_id}: {assignment['status']} ({action})")
 
@@ -2571,9 +2714,16 @@ def recent_journal_events(directory: Path, limit: int = 30) -> list[dict]:
         raise StateError(f"Cannot reconstruct recent decision history from {path}: {error}") from error
 
 
-def build_resume_packet(directory: Path, project_root: Path) -> dict:
+def build_resume_packet(directory: Path, project_root: Path, *, delivery_slice: str | None = None) -> dict:
     """Create a read-only, machine-usable continuation plan from durable files."""
     manifest = manifest_at(directory)
+    independent_review_wait = False
+    if delivery_slice is not None:
+        if not requires_slice_review(manifest):
+            raise StateError("Slice-scoped validation requires a reviewed blueprint assignment")
+        scoped_execution = slice_review_state(directory, manifest)
+        scoped_execution.require_execution(delivery_slice)
+        independent_review_wait = scoped_execution.unrelated_review_questions(delivery_slice)
     active = manifest.get("approvals", {}).get(manifest.get("active_approval_id"))
     work = manifest.get("work_items", {}).get(manifest.get("active_work_id"))
     actual_head, actual_status = git_info(project_root)
@@ -2600,7 +2750,7 @@ def build_resume_packet(directory: Path, project_root: Path) -> dict:
                     reconciliation.append(f"Task evidence changed since the saved step: {path}")
             except (StateError, OSError) as error:
                 reconciliation.append(f"Saved task evidence is unavailable: {path} ({error})")
-    errors = check_initiative(directory, manifest)
+    errors = check_initiative(directory, manifest, allow_questions=independent_review_wait)
     blockers = list(manifest.get("blockers", []))
     if work:
         for item in work.get("blockers", []):
@@ -2615,10 +2765,11 @@ def build_resume_packet(directory: Path, project_root: Path) -> dict:
         try:
             conversation = state.conversations()
             pending_questions = state.pending()
-            question_source_errors = state.check_question_sources(project_root, pending_questions)
+            if not independent_review_wait:
+                question_source_errors = state.check_question_sources(project_root, pending_questions)
             if work and work.get("pending_question_id"):
                 active_question_answer, question_context = state.question_context(work["pending_question_id"], conversation)
-                if active_question_answer:
+                if active_question_answer and not independent_review_wait:
                     question_source_errors.extend(state.check_question_sources(project_root, [question_context]))
         except (StateError, OSError, ValueError, KeyError, TypeError) as error:
             errors.append(f"Conversation recovery is blocked: {error}")
@@ -2627,11 +2778,60 @@ def build_resume_packet(directory: Path, project_root: Path) -> dict:
         except (StateError, OSError, ValueError, KeyError, TypeError) as error:
             errors.append(f"Traceability recovery is blocked: {error}")
     errors.extend(question_source_errors)
+    review = slice_review_state(directory, manifest).summary() if initiative_mode(manifest) == "blueprint" else None
+    if review and review.get("pending_question_id") and not any(
+            question["exchange_id"] == review["pending_question_id"] for question in pending_questions):
+        review["pending_question_answer"] = next(
+            (answer for answer in reversed(conversation)
+             if answer.get("responds_to") == review["pending_question_id"]), None)
     next_action = work.get("next_action") if work else manifest.get("next_action")
     if question_source_errors:
         next_action = "Reconcile the changed question source before continuing."
     elif active_question_answer:
         next_action = "Use the recorded answer and update the saved work cursor."
+    delivery = {key: item.get("status") for key, item in manifest.get("slices", {}).items()
+                if not item.get("superseded_by")}
+    delivery_handoff = None
+    if delivery_slice is not None and review and review.get("active_package"):
+        package_id = review["active_package"]
+        package_entry = review["packages"].get(package_id, {})
+        released = package_entry.get("released", {}).get(delivery_slice)
+        if released:
+            assignment = manifest.get("slices", {}).get(delivery_slice, {})
+            current_guide = released.get("guide_path") or assignment.get("guide_path")
+            source_guide = (released.get("contract_guide_path") or assignment.get("locked_guide_path")
+                            or current_guide)
+            delivery_handoff = {
+                "package_id": package_id,
+                "package_hash": package_entry.get("package_hash"),
+                "guide_path": current_guide,
+                "contract_path": released.get("contract_path"),
+                "contract_guide_path": source_guide,
+            }
+    dispatchable = []
+    if requires_slice_review(manifest):
+        released = active_review_release(manifest)
+        review_state = slice_review_state(directory, manifest)
+        for key, status in delivery.items():
+            if key not in released and status not in {"accepted", "cancelled"}:
+                delivery[key] = "paused"
+            elif key in released and status == "ready":
+                independent_question = review_state.unrelated_review_questions(key)
+                slice_errors = [error for error in errors if not independent_question
+                                or error != "Unanswered consequential question blocks implementation"]
+                ready_work = (not work or work["status"] == "in_progress" or
+                              (independent_question and work.get("status") == "waiting_user"
+                               and work.get("pending_question_id") == review["pending_question_id"]))
+                if slice_errors or reconciliation or blockers or not ready_work or (
+                        pending_questions and not independent_question):
+                    continue
+                assignment = manifest["slices"][key]
+                if all(manifest["slices"].get(dep, {}).get("status") == "accepted"
+                       for dep in assignment["dependencies"]):
+                    dispatchable.append(key)
+    work_ready_for_delivery = (not work or work.get("status") == "in_progress" or
+                               (independent_review_wait and work.get("status") == "waiting_user"
+                                and work.get("pending_question_id") == review["pending_question_id"]))
     return {
         "initiative_id": manifest["initiative_id"], "initiative_directory": str(directory),
         "scope": manifest["scope"], "phase": manifest["stage"],
@@ -2650,13 +2850,16 @@ def build_resume_packet(directory: Path, project_root: Path) -> dict:
         "active_work": work,
         "conversation": conversation,
         "pending_questions": pending_questions,
+        "slice_review": review,
         "active_question_answer": active_question_answer,
         "conversation_usage": conversation_usage,
         "coverage_with_slices": coverage_with_slices,
         "finished_tasks": sorted(task_id for task_id, item in manifest.get("work_items", {}).items()
                                  if item.get("status") == "done"),
-        "slices": {key: item.get("status") for key, item in manifest.get("slices", {}).items()
-                   if not item.get("superseded_by")},
+        "slices": delivery,
+        "dispatchable_slices": sorted(dispatchable),
+        "delivery_slice": delivery_slice,
+        "delivery_handoff": delivery_handoff,
         "superseded_slices": {key: {"last_status": item.get("status"), "superseded_by": item["superseded_by"]}
                               for key, item in manifest.get("slices", {}).items() if item.get("superseded_by")},
         "warnings": {key: item.get("status") for key, item in manifest.get("warnings", {}).items()},
@@ -2664,14 +2867,14 @@ def build_resume_packet(directory: Path, project_root: Path) -> dict:
         "blockers": blockers, "validation_errors": errors,
         "reconciliation_required": reconciliation,
         "git_head": actual_head, "git_worktree_status": actual_status,
-        "safe_to_continue": not errors and not reconciliation and not blockers
-        and (not work or work.get("status") == "in_progress")
-        and not pending_questions,
+        "safe_to_continue": not errors and not reconciliation and not blockers and work_ready_for_delivery
+        and (not pending_questions or independent_review_wait)
+        and (delivery_slice is None or delivery.get(delivery_slice) not in {"paused", "blocked", "cancelled"}),
     }
 
 
-def print_resume(directory: Path, project_root: Path) -> list[str]:
-    packet = build_resume_packet(directory, project_root)
+def print_resume(directory: Path, project_root: Path, *, delivery_slice: str | None = None) -> list[str]:
+    packet = build_resume_packet(directory, project_root, delivery_slice=delivery_slice)
     manifest = manifest_at(directory)
     answer = packet["active_question_answer"]
     print(render_checkpoint(manifest, resume_action=packet["next_action"] if answer else None))
@@ -2688,6 +2891,16 @@ def print_resume(directory: Path, project_root: Path) -> list[str]:
         print("Approved prototype source files:")
         for path in active.get("source_paths", []):
             print(f"- {path}")
+    review = packet["slice_review"]
+    if review and review["required"]:
+        print("Dispatchable reviewed slices: " + (", ".join(packet["dispatchable_slices"]) or "none"))
+        if review["register_path"]:
+            print(f"Slice review register: {review['register_path']}")
+        if review["current_slice_id"]:
+            print(f"Open slice: {review['current_slice_id']} revision {review['current_revision']}")
+        if review["active_package"]:
+            package = review["packages"][review["active_package"]]
+            print(f"Package index: {package['index_path']} (hash {package['package_hash']})")
     print(f"Current Git HEAD: {packet['git_head'] or 'unavailable (inspect code manually)'}")
     print(f"Current Git status: {packet['git_worktree_status'] or ('clean' if packet['git_worktree_status'] is not None else 'unavailable')}")
     if packet["active_work"]:
@@ -2709,7 +2922,18 @@ def print_resume(directory: Path, project_root: Path) -> list[str]:
         print(f"RECONCILE: {issue}")
     for error in packet["validation_errors"]:
         print(f"BLOCKED: {error}")
-    if packet["active_work"] and packet["active_work"]["status"] == "waiting_user" and not answer:
+    if delivery_slice:
+        print(f"Delivery scope: {delivery_slice}")
+        if packet["delivery_handoff"]:
+            handoff = packet["delivery_handoff"]
+            print(f"Authorized package: {handoff['package_id']} ({handoff['package_hash']})")
+            print(f"Implementation guide: {handoff['guide_path']}")
+            if handoff["contract_guide_path"] != handoff["guide_path"]:
+                print(f"Original assignment guide: {handoff['contract_guide_path']}")
+        if not packet["safe_to_continue"] and not packet["validation_errors"]:
+            print(f"BLOCKED: {delivery_slice} has unresolved delivery work or workspace reconciliation")
+            return ["Unresolved delivery work or workspace reconciliation"]
+    if packet["active_work"] and packet["active_work"]["status"] == "waiting_user" and not answer and not delivery_slice:
         print("WAITING FOR USER: do not infer or invent the pending approval or decision")
     return packet["validation_errors"]
 
@@ -2718,12 +2942,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     for name in (
-        "init", "event", "checkpoint", "conversation-record", "plan-record", "blueprint-record", "blueprint-coverage", "blueprint-index-rebuild", "work-update", "discovery-record", "discovery-capture", "browser-build-fingerprint", "missing-feature", "prototype-coverage", "approve", "revoke-approval", "slice-create", "slice-cancel",
-        "slice-report", "reconcile", "warning-record", "warning-decide", "resume", "validate",
+        "init", "artifact-setup", "event", "checkpoint", "conversation-record", "plan-record", "blueprint-record", "blueprint-coverage", "blueprint-index-rebuild", "work-update", "discovery-record", "discovery-capture", "browser-build-fingerprint", "missing-feature", "prototype-coverage", "approve", "revoke-approval", "slice-create", "slice-cancel",
+        "slice-report", "reconcile", "warning-record", "warning-decide", "resume", "validate", *REVIEW_COMMANDS,
     ):
         sub = commands.add_parser(name)
         sub.add_argument("--project-root", required=True)
         sub.add_argument("--initiative-id", required=name not in {"resume", "validate"})
+        if name in REVIEW_COMMANDS and name not in {"slice-register", "slice-package-preview"}:
+            sub.add_argument("--input-file", required=name not in {"slice-collection-validate"})
         if name == "browser-build-fingerprint":
             sub.add_argument("--source-path", action="append", default=[])
         if name == "init":
@@ -2774,14 +3000,26 @@ def main(argv: list[str] | None = None) -> int:
             sub.add_argument("--decision-file", required=True)
         if name == "resume":
             sub.add_argument("--format", choices=["text", "json"], default="text")
+        if name in {"resume", "validate"}:
+            sub.add_argument("--slice-id")
     args = parser.parse_args(argv)
     try:
         project_root = Path(args.project_root).resolve(strict=True)
         initiative_id = args.initiative_id or discover_single_initiative(project_root)
         directory = location(str(project_root), initiative_id)
-        ensure_local_git_ignore(project_root, directory)
+        manifest_file = directory / "manifest.json"
+        explicit_setup = args.command in {"init", "artifact-setup"}
+        if args.command != "init" and not manifest_file.is_file():
+            raise StateError(f"Initiative not initialized: {directory}. Run init first.")
+        review_workflow = args.command in REVIEW_COMMANDS or (
+            manifest_file.is_file() and requires_slice_review(read_json(manifest_file)))
+        ensure_local_git_ignore(project_root, directory, configure=explicit_setup or not review_workflow)
         if args.command == "init":
             initialize(directory, args.scope, args.next_action, args.mode)
+        elif args.command == "artifact-setup":
+            print(f"Artifact setup complete for {directory}")
+        elif args.command in REVIEW_COMMANDS:
+            run_slice_review(directory, args.command, getattr(args, "input_file", None))
         elif args.command == "event":
             add_event(directory, args.event_file)
         elif args.command == "checkpoint":
@@ -2837,22 +3075,32 @@ def main(argv: list[str] | None = None) -> int:
             decide_warning(directory, args.warning_id, args.decision_file)
         elif args.command == "resume":
             if args.format == "json":
-                packet = build_resume_packet(directory, project_root)
+                packet = build_resume_packet(directory, project_root, delivery_slice=args.slice_id)
                 print(json.dumps(packet, indent=2, ensure_ascii=False, sort_keys=True))
-                return 2 if packet["validation_errors"] else 0
-            return 2 if print_resume(directory, project_root) else 0
+                return 2 if packet["validation_errors"] or (args.slice_id and not packet["safe_to_continue"]) else 0
+            return 2 if print_resume(directory, project_root, delivery_slice=args.slice_id) else 0
         elif args.command == "validate":
             manifest = manifest_at(directory)
-            if initiative_mode(manifest) == "blueprint":
-                packet = build_resume_packet(directory, project_root)
+            if initiative_mode(manifest) == "blueprint" or args.slice_id:
+                packet = build_resume_packet(directory, project_root, delivery_slice=args.slice_id)
                 errors = packet["validation_errors"] + packet["reconciliation_required"]
+                if not errors and args.slice_id and not packet["safe_to_continue"]:
+                    errors = [f"{args.slice_id} has unresolved delivery work or workspace reconciliation"]
             else:
                 errors = check_initiative(directory, manifest)
             if errors:
                 raise StateError("; ".join(errors))
-            if not manifest.get("active_approval_id"):
+            if args.slice_id:
+                print(f"Exact package authorization and released assignment verified for {args.slice_id}")
+            elif not manifest.get("active_approval_id"):
                 mode = initiative_mode(manifest)
                 print(f"NOT YET APPROVED: initiative state is valid, but no {mode} is approved for implementation")
+            elif requires_slice_review(manifest):
+                review = packet["slice_review"]
+                entry = review["packages"].get(review["active_package"], {})
+                status = ("Exact package authorization recorded" if entry.get("authorization_path")
+                          else "Review state valid. Implementation awaits authorization of the exact locked package")
+                print(status)
             else:
                 print("OK: current approval, slice handoffs, warning galleries, and evidence hashes are consistent")
         return 0

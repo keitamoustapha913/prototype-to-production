@@ -1,0 +1,51 @@
+{
+  "action": "approve",
+  "slice_id": "",
+  "proposal_revision": 1,
+  "guide_sha256": "",
+  "contract_sha256": "",
+  "user_response": "",
+  "conversation_exchange_ids": [],
+  "handoff_review": {
+    "reviewer": "",
+    "result": "BLOCKED",
+    "findings": [
+      {
+        "section": "",
+        "citation": "",
+        "finding": "",
+        "resolution": "",
+        "result": "BLOCKED"
+      }
+    ],
+    "evidence_paths": [],
+    "slice_id": "",
+    "proposal_revision": 1,
+    "guide_sha256": "",
+    "contract_sha256": "",
+    "walkthrough": {
+      "mode": "no_code",
+      "context": "fresh_session",
+      "independent": true,
+      "performed": false,
+      "test_execution": false,
+      "evidence_path": "",
+      "attestation": ""
+    },
+    "source_paths": [],
+    "read_only_scenarios": [
+      {
+        "scenario": "",
+        "expected": "",
+        "observed": "",
+        "read_only": true,
+        "observation_basis": "",
+        "references": [
+          {"feature_id": "", "check_id": "", "source_path": "", "symbol": ""}
+        ]
+      }
+    ],
+    "acceptance_checks": []
+  },
+  "consent_id": ""
+}

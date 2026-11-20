@@ -1,6 +1,6 @@
 # Prototype to Production
 
-A Codex skill for turning substantial frontend, backend, full-stack and greenfield work into an illustrated blueprint, then implementing the approved specification faithfully. The full runnable-prototype route remains available for high-fidelity redesigns.
+A Codex skill for turning substantial frontend, backend, full-stack and greenfield work into an illustrated blueprint, then reviewing and locking the complete slice package before implementation. The full runnable-prototype route remains available for high-fidelity redesigns.
 
 The workflow discovers existing behavior, records exact consequential conversations, locks approved specifications and evidence, and resumes unfinished tasks or unanswered questions across sessions. Existing prototype initiatives retain their original approval and visual verification semantics.
 
@@ -23,6 +23,8 @@ python3 ~/.codex/skills/.system/skill-installer/scripts/install-skill-from-githu
 
 The default installation directory is `~/.codex/skills/prototype-to-production`. The installer refuses to overwrite an existing installation; back up and move the existing directory before reinstalling. The skill is available on your next turn after installation.
 
+Blueprint slice guide validation uses the pinned Mermaid parser. With Node.js 22.12 or later, run `npm ci` from the installed skill directory to install its parser dependencies.
+
 ## Use
 
 Open the app repository in Codex and describe the redesign. You can attach visual references or specify a style in words.
@@ -30,7 +32,7 @@ Open the app repository in Codex and describe the redesign. You can attach visua
 ```text
 Use $prototype-to-production to redesign the billing page using these reference images.
 Investigate the existing behavior, discuss the roadmap and detailed blueprint with me,
-then wait for my approval before implementation.
+then discuss each slice with me and wait for my separate instruction to start.
 ```
 
 For existing work:
@@ -52,8 +54,10 @@ New initiatives default to **blueprint-first**:
 1. Inspect actual source and behavior, or verify an empty baseline for a new project.
 2. Explain findings and discuss one consequential question at a time, using diagrams or tables when useful. Preserve exact questions, options and actual answers.
 3. Draft a concise roadmap, then indexed Markdown/Mermaid feature specifications with behavior, state, UI or API contracts and acceptance checks.
-4. Prove every source feature or user requirement is covered. Show the exact blueprint version and wait for explicit approval before implementation.
-5. Deliver small vertical slices bound to approved specs, decisions, source anchors and exclusive paths. Verify actual behavior, tests and rendered UI where relevant.
+4. Prove every source feature or user requirement is covered and wait for approval of the exact blueprint.
+5. Draft the complete slice inventory and an illustrated implementation guide for each slice. Review the slices one at a time by default.
+6. Revalidate and lock the reviewed package with the user's approval. Ask separately for permission to start the exact package.
+7. Release slices in dependency order. Verify actual behavior, tests and rendered UI where relevant.
 
 A complete runnable clone is optional. Backend-only work needs source/API/test evidence rather than screenshots. UI blueprint verification checks concrete approved criteria and real rendered states; it does not claim pixel equality against a nonexistent prototype.
 
@@ -84,6 +88,8 @@ python3 scripts/project_state.py validate \
 
 Use the initiative directory printed by `init`. In every Git repository, new designs live under ignored `.artifacts/prototype-to-production/<id>/`. This includes design documents, plans, runnable prototype source, preview assets, screenshots, and evidence. Paths in the templates are relative to that initiative directory. Only the approved implementation goes into tracked app code. Every CLI command checks that existing initiative files are untracked and ignored; legacy locations remain supported under the same rule. Store project evidence in the app's initiative directory rather than the installed skill.
 
+When transferring a reviewed blueprint initiative to a Git checkout, configure its local Git exclude with `artifact-setup --project-root /path/to/app --initiative-id billing-redesign` before resuming. If a slice review amendment is in progress, use `resume --slice-id <id>` and `validate --slice-id <id>` to check a continuing assignment.
+
 Blueprint verification executes approved tests from the app root. UI verification uses Node.js 22 or later and Chrome or Chromium to capture the running app at `P2P_APP_URL`. Use an independent reviewer to inspect the assertions and captured results. See the [blueprint verification contract](references/blueprint-workflow.md#approval-implementation-and-verification).
 
 ## Repository guide
@@ -94,6 +100,7 @@ Blueprint verification executes approved tests from the app root. UI verificatio
 | [SKILL.md](SKILL.md) | Agent entry point, stage routing, and quality gates. |
 | [references/workflow.md](references/workflow.md) | Detailed workflow and command reference. |
 | [references/continuity.md](references/continuity.md) | Checkpoints, evidence preservation, and session recovery. |
+| [references/slice-review-workflow.md](references/slice-review-workflow.md) | Proposal, conversation, collection, lock, authorization and migration commands. |
 | [references/slice-contract.md](references/slice-contract.md) | Implementation handoffs and acceptance rules. |
 | [references/visual-qa.md](references/visual-qa.md) | Browser verification, retries, warnings, and evidence requirements. |
 | [assets/project](assets/project) | JSON templates, project instruction snippet, and Playwright scaffold. |
@@ -103,9 +110,10 @@ Blueprint verification executes approved tests from the app root. UI verificatio
 
 ## Development
 
-Run the test suite with Python 3:
+Install the parser dependencies and run the Python suite.
 
 ```bash
+npm ci
 python3 -m unittest discover -s tests
 ```
 

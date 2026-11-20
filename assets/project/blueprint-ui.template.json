@@ -3,6 +3,7 @@
   "baseline_id": "audit-v1",
   "plan_version": "plan-v1",
   "surface": "ui",
+  "surface_contract_version": 2,
   "document_paths": [
     "blueprints/spec-v1/index.md"
   ],
@@ -29,6 +30,7 @@
       "states": [
         "success"
       ],
+      "state_transitions": [],
       "dependencies": [],
       "acceptance_checks": [
         {
@@ -85,7 +87,20 @@
         "src/example/**",
         "tests/example/**"
       ],
-      "prerequisite_feature_ids": []
+      "prerequisite_feature_ids": [],
+      "slice_surfaces": [],
+      "surface_contracts": {
+        "ui": {
+          "Route and entry": "REPLACE exact route and entry action",
+          "Viewports and breakpoints": "REPLACE exact viewport dimensions and breakpoint behavior",
+          "Layout and tokens": "REPLACE exact layout, spacing and visual token values",
+          "Copy and assets": "REPLACE exact labels, messages and asset references",
+          "States and roles": "REPLACE exact visible state and role outcomes",
+          "Keyboard and assistive technology": "REPLACE exact keyboard, focus and announcement behavior",
+          "Events and dependencies": "REPLACE exact user events and service dependencies",
+          "Render evidence": "REPLACE exact render cases, selectors and evidence expectations"
+        }
+      }
     }
   ]
 }

@@ -40,7 +40,7 @@ class ProjectStateTests(unittest.TestCase):
         self.test_env = {**os.environ, "GIT_CEILING_DIRECTORIES": str(self.root.parent)}
 
     def cli(self, command, *extra, success=True):
-        if command == "init":
+        if command == "init" and "--mode" not in extra:
             extra = (*extra, "--mode", "prototype")
         result = subprocess.run(
             [sys.executable, str(SCRIPT), command, "--project-root", str(self.root),
@@ -373,6 +373,22 @@ class ProjectStateTests(unittest.TestCase):
              str(self.initiative / "manifest.json")], capture_output=True,
         )
         self.assertEqual(ignored.returncode, 0)
+
+    def test_review_read_commands_leave_git_exclude_untouched_until_artifact_setup(self):
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        self.cli("init", "--scope", "page", "--mode", "blueprint")
+        exclude = self.root / ".git/info/exclude"
+        original = "# Fresh receiving workspace\n"
+        exclude.write_text(original)
+        for command in ("resume", "validate", "slice-register", "slice-package-preview"):
+            with self.subTest(command=command):
+                failure = self.cli(command, success=False)
+                self.assertIn("artifact-setup", failure.stderr)
+                self.assertEqual(exclude.read_text(), original)
+        self.cli("artifact-setup")
+        self.cli("resume")
+        self.cli("validate")
+        self.cli("slice-register")
 
     def test_event_refuses_tracked_legacy_artifacts_without_modifying_them(self):
         self.init()

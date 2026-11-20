@@ -4,6 +4,7 @@ This module never imports the CLI or changes legacy prototype records.
 """
 from pathlib import Path
 from base64 import b64decode
+from copy import deepcopy
 from hashlib import sha256
 import json
 import os
@@ -158,10 +159,19 @@ class BlueprintState:
         return sources
 
     def check_test_sources(self, feature, allowed_paths):
+        if self.api.requires_slice_review(self.manifest):
+            operations = feature['acceptance_checks'] + feature.get('visual_contract', {}).get('render_cases', [])
+            integrity = self.api.sibling_module('slice_integrity')
+            errors = integrity.validate_transportable_commands(
+                [operation['command'] for operation in operations], self.directory.parents[2])
+            self.require(not errors, '; '.join(errors))
         sources = self.test_sources(feature)
         planned = feature.get('planned_test_paths', [])
         self.require(self.strings(planned, False) and set(planned) <= sources,
                      'Planned test files must be referenced by an approved check or render case')
+        if self.api.requires_slice_review(self.manifest):
+            errors = integrity.validate_runtime_paths(sources - set(planned), self.directory.parents[2])
+            self.require(not errors, '; '.join(errors))
         self.require(all(any(self.api.ownership_contains(allowed, path)
                              for allowed in feature['implementation_paths']) for path in planned),
                      'Planned test files must be within the approved feature implementation paths')
@@ -183,13 +193,22 @@ class BlueprintState:
             self.require(self.api.digest_of(self.api.artifact_file(self.directory, relative)) == expected,
                          f'Changed protected evidence/spec sha256: {relative}')
 
-    def freeze(self, group, key, value, hashes=None, **metadata):
+    def freeze(self, group, key, value, hashes=None, *, transition=None, **metadata):
         self.require(self.identifier(key), f'Invalid record ID/version: {key!r}')
         registry = self.manifest.setdefault(group, {})
         relative = f'{GROUP_PATHS[group]}/{key}.json'
         target = self.directory / relative
         self.require(key not in registry, 'Immutable record already exists; use a new ID/version')
         value = {**value, '_frozen_evidence':hashes or {}}
+        if transition is not None:
+            self.require(not target.exists(), f'Orphaned record {relative}; reconcile original evidence first')
+            entry = {'path': relative, 'sha256': sha256(self.api.json_content(value).encode()).hexdigest(),
+                     'evidence_hashes': hashes or {}, 'sequence': len(registry), **metadata}
+            writes, events = transition
+            writes[relative] = value
+            events.append({'type': 'blueprint_record_frozen', 'group': group, 'record_id': key, 'entry': entry})
+            registry[key] = entry
+            return
         if target.exists():
             saved = self.api.read_json(target)
             # Recovery may reuse only the original content and still-intact evidence.
@@ -230,7 +249,10 @@ class BlueprintState:
                         for field in ('question', 'responds_to', 'report_id'))
                 and all(set(first.get(field, [])) == set(second.get(field, []))
                         for field in ('feature_ids', 'requirement_ids'))
-                and all(record.get('record_type', 'decision') == 'decision' for record in (first, second)))
+                and first.get('record_type', 'decision') == second.get('record_type', 'decision')
+                and first.get('record_type', 'decision') in {'decision', 'slice_detail'}
+                and (first.get('record_type') != 'slice_detail' or
+                     all(first.get(field) == second.get(field) for field in ('slice_id', 'clarifies_decision_ids'))))
 
     def superseded_decisions(self, records):
         by_id = {record['exchange_id']: record for record in records}
@@ -265,7 +287,7 @@ class BlueprintState:
             record = self.load('conversation', key)
             self.require(key not in superseded,
                          f'Decision {key} was superseded; use the recorded amendment')
-            self.require(record.get('record_type') != 'recap', 'Recap confirmations are not design decisions')
+            self.require(record.get('record_type', 'decision') == 'decision', 'Only material decisions can authorize blueprint changes')
             self.require(record['status'] == 'decided' and self.text(record.get('response')),
                          f'Decision {key} has no actual user answer')
             if feature_id:
@@ -275,7 +297,7 @@ class BlueprintState:
             result.update({entry['path']:entry['sha256'], **entry.get('evidence_hashes', {})})
         return result
 
-    def conversation_record(self, value):
+    def conversation_record(self, value, *, transition=None):
         key = value.get('exchange_id')
         self.require(self.identifier(key), 'Stable exchange_id is required')
         self.require(value.get('phase') in self.api.VALID_STAGES, 'Actual conversation phase required')
@@ -297,7 +319,21 @@ class BlueprintState:
             isinstance(x, dict) and self.text(x.get('label')) and self.text(x.get('tradeoff'))
             for x in value.get('options', [])), 'Options need exact labels and tradeoffs')
         record_type = value.get('record_type', 'decision')
-        self.require(record_type in {'decision', 'recap'}, 'Unknown conversation record type')
+        self.require(record_type in {'decision', 'recap', 'slice_detail', 'slice_consent'}, 'Unknown conversation record type')
+        if record_type == 'slice_consent':
+            self.require(transition is not None and value['phase'] == 'slice_review' and value['status'] == 'decided'
+                         and not any(value.get(field) for field in ('responds_to', 'supersedes', 'report_id', 'authorized_changes')),
+                         'Slice consent requires a distinct decided exchange for the exact reviewed scope')
+        if record_type == 'slice_detail':
+            approval = self.manifest.get('approvals', {}).get(self.manifest.get('active_approval_id'), {})
+            slice_item = self.manifest.get('slice_review', {}).get('selected', {}).get(value.get('slice_id'), {})
+            self.require(self.api.requires_slice_review(self.manifest) and value['phase'] == 'slice_review'
+                         and value['status'] == 'decided' and value.get('responds_to')
+                         and slice_item.get('revision') == value.get('proposal_revision')
+                         and self.strings(value.get('clarifies_decision_ids'))
+                         and set(value['clarifies_decision_ids']) <= set(approval.get('blueprint_decision_ids', []))
+                         and not any(value.get(field) for field in ('authorized_changes', 'report_id')),
+                         'Slice detail must answer the exact open slice question and cite unchanged approved decisions')
         if record_type == 'recap':
             self.require(value['status'] == 'decided'
                          and not any(value.get(field) for field in
@@ -312,6 +348,12 @@ class BlueprintState:
                                  'An answer must link an open question and contain the actual response')
                     self.require(value['question'] == earlier['question'],
                                  'An answer must retain the exact linked question or proposal')
+                    if record_type == 'slice_detail':
+                        registry = self.manifest['slice_review']
+                        self.require(earlier.get('slice_id', registry.get('current_slice_id')) == value['slice_id']
+                                     and (registry.get('pending_question_id') == value['responds_to']
+                                          or value.get('supersedes')),
+                                     'Slice detail must answer the question saved for this slice')
                 else:
                     self.require(self.same_decision(earlier, value),
                                  'A correction must retain the exact question, answer link and scope of a prior decision')
@@ -347,8 +389,9 @@ class BlueprintState:
         sources = {p:self.api.digest_of(self.api.project_source_file(self.directory.parents[2], p))
                    for p in value.get('source_paths', [])}
         self.freeze('conversation', key, {**value, 'recorded_at':self.api.utc_now(),
-                    'source_hashes_at_record':sources}, hashes)
-        self.persist()
+                    'source_hashes_at_record':sources}, hashes, transition=transition)
+        if transition is None:
+            self.persist()
 
     def traceability(self):
         usage = {key: {'plan_ids': [], 'blueprint_ids': [], 'slice_ids': []}
@@ -911,6 +954,11 @@ class BlueprintState:
 
     def blueprint_record(self, value):
         self.require_ready()
+        surface_contracts = self.api.sibling_module('surface_contracts')
+        if self.api.requires_slice_review(self.manifest):
+            self.require(value.get('surface_contract_version') == surface_contracts.SURFACE_CONTRACT_VERSION,
+                         f'New reviewed blueprints require surface_contract_version '
+                         f'{surface_contracts.SURFACE_CONTRACT_VERSION}')
         baseline = self.baseline(value.get('baseline_id'))
         plan = self.load('blueprint_plans', value.get('plan_version'))
         self.require(plan['baseline_id'] == value['baseline_id'], 'Plan and blueprint baselines conflict')
@@ -958,10 +1006,33 @@ class BlueprintState:
                 self.api.owned_path(path)
             self.require(self.strings(feature.get('prerequisite_feature_ids', []), False),
                          'Prerequisite feature IDs must be distinct')
+            extras = feature.get('slice_surfaces', [])
+            self.require(self.strings(extras, False) and set(extras) <= {'api', 'mcp', 'script'},
+                         f'{key}: slice_surfaces must name approved API, MCP or script surfaces')
+            extra_contracts = feature.get('surface_contracts', {})
+            self.require(isinstance(extra_contracts, dict) and set(extras) <= set(extra_contracts)
+                         and all(isinstance(contract, dict) and contract for contract in extra_contracts.values()),
+                         f'{key}: each declared surface needs an approved structured contract')
+            if self.api.requires_slice_review(self.manifest):
+                self.api.sibling_module('slice_guide').validate_surface_contracts(feature)
             surface = feature.get('surface', value['surface'])
             self.require(surface in {'ui', 'backend', 'fullstack'}
                          and (value['surface'] == 'fullstack' or surface == value['surface']),
                          'Blueprint feature surface must fit the initiative surface')
+            contract_surfaces = set(extras)
+            if surface == 'fullstack':
+                contract_surfaces.update(('ui', 'backend'))
+            else:
+                contract_surfaces.add(surface)
+            try:
+                surface_contracts.validate_surface_contracts(value.get('surface_contract_version'),
+                                                             sorted(contract_surfaces), extra_contracts)
+                surface_contracts.validate_state_transitions(value.get('surface_contract_version'),
+                                                             feature.get('states'), feature.get('state_transitions'))
+                if value.get('surface_contract_version') and 'sequence_contract' in feature:
+                    surface_contracts.validate_sequence_contract(feature['sequence_contract'])
+            except ValueError as error:
+                raise self.api.StateError(f'{key}: {error}') from error
             if surface in {'ui','fullstack'}:
                 visual = feature.get('visual_contract', {})
                 self.require(isinstance(visual, dict) and isinstance(visual.get('tokens'), dict) and visual['tokens']
@@ -1138,7 +1209,7 @@ class BlueprintState:
         audit = self.manifest.get('discovery_audits', {}).get(audit_id, {})
         return approval['baseline_id'] == audit_id or audit.get('equivalent_approval_id') == approval['decision_id']
 
-    def check_approval(self):
+    def check_approval(self, *, allow_questions=False):
         try:
             key = self.manifest.get('active_approval_id')
             if not key:
@@ -1161,27 +1232,24 @@ class BlueprintState:
                              'Approval presentation hash inventory mismatch')
                 expected.update(presentation_hashes)
             self.require(expected == approval['artifact_hashes'], 'Approved blueprint hash inventory mismatch')
-            self.require(not self.pending(), 'Unanswered consequential question blocks implementation')
             superseded = self.superseded_decisions(self.conversations())
             self.require(not superseded.intersection(approval['blueprint_decision_ids']),
                          'Approved decision was amended; new blueprint approval required')
+            self.require(allow_questions or not self.pending(),
+                         'Unanswered consequential question blocks implementation')
         except (self.api.StateError, KeyError, TypeError, ValueError, OSError) as error:
             return [str(error)]
         return []
 
-    def create_slice(self, candidate):
-        self.require_ready()
+    def slice_packet(self, candidate, dependencies=None, *, allow_partial_checks=False):
+        """Resolve a delivery specification from the approved blueprint."""
         key = candidate.get('slice_id')
-        self.require(self.identifier(key) and key not in self.manifest.get('slices', {}), 'New stable slice ID required')
-        errors = self.api.check_approval(self.directory, self.manifest) + self.api.check_coverage_records(self.directory, self.manifest)
-        errors.extend(self.check_records(recovering=('slices', key)))
-        self.require(not errors, 'Cannot create slice: ' + '; '.join(errors))
+        self.require(self.identifier(key), 'Stable slice ID required')
         approval_id = self.manifest.get('active_approval_id')
         self.require(approval_id is not None, 'Active blueprint approval required')
         approval = self.manifest['approvals'][approval_id]
         self.require(candidate.get('blueprint_version') == approval['approved_version'], 'Slice must target exact approved blueprint')
         self.require('workspace_snapshot' in approval, 'Approve a new blueprint version with a workspace snapshot before delivery')
-        self.check_baseline_before_delivery()
         self.require(self.api.validate_scope(candidate.get('scope')) == [] and
                      candidate['scope'] in {'app':{'app','page','feature'}, 'page':{'page','feature'}, 'feature':{'feature'}}[self.manifest['scope']],
                      'Slice scope cannot exceed approved scope')
@@ -1192,7 +1260,21 @@ class BlueprintState:
         features = {f['feature_id']:f for f in spec['features']}
         ids = candidate.get('feature_ids')
         self.require(self.strings(ids) and set(ids) <= set(features), 'Slice has unknown or missing approved feature IDs')
-        selected = [features[key] for key in ids]
+        selected = [deepcopy(features[key]) for key in ids]
+        checks = {c['check_id'] for f in selected for c in f['acceptance_checks']}
+        if allow_partial_checks:
+            requested = candidate.get('functional_tests')
+            self.require(self.strings(requested) and set(requested) <= checks,
+                         'Genuine test plan must name approved acceptance IDs')
+            for feature in selected:
+                feature['acceptance_checks'] = [check for check in feature['acceptance_checks']
+                                                if check['check_id'] in requested]
+                self.require(bool(feature['acceptance_checks']),
+                             f"Feature {feature['feature_id']} needs at least one assigned acceptance check")
+                selected_sources = self.test_sources(feature)
+                feature['planned_test_paths'] = [path for path in feature.get('planned_test_paths', [])
+                                                 if path in selected_sources]
+            checks = set(requested)
         paths = candidate.get('allowed_paths')
         self.require(self.strings(paths), 'Allowed implementation paths required')
         for index, path in enumerate(paths):
@@ -1201,44 +1283,65 @@ class BlueprintState:
                              for allowed in feature.get('implementation_paths', [])),
                          f'Slice path is outside approved feature paths: {path}')
             self.require(not any(self.api.ownership_overlaps(path, other) for other in paths[:index]), 'Overlapping paths inside slice')
-            for old in self.manifest.get('slices', {}).values():
+            for old in self.manifest.get('slices', {}).values() if dependencies is None else ():
                 self.require(old['status'] == 'cancelled' or old.get('superseded_by')
                              or not any(self.api.ownership_overlaps(path, p) for p in old['allowed_paths']),
                              'Slice ownership overlaps an existing slice')
         deps = candidate.get('dependencies')
-        self.require(self.strings(deps, False) and all(dep != key and dep in self.manifest.get('slices', {}) for dep in deps),
+        assignments = self.manifest.get('slices', {})
+        available = assignments if dependencies is None else dependencies
+        self.require(self.strings(deps, False) and all(dep != key and dep in available for dep in deps),
                      'Unknown/circular slice dependency')
         supplied = set()
         test_ownership = list(paths)
         for dep in deps:
-            assignment = self.manifest['slices'][dep]
-            self.require(assignment.get('blueprint_version') == approval['approved_version']
-                         and assignment['status'] != 'cancelled', 'Prerequisite slice is stale or cancelled')
-            dependency = self.api.artifact_file(self.directory, assignment['contract_file'])
-            self.require(self.api.digest_of(dependency) == assignment['contract_sha256'],
-                         'Prerequisite slice contract has changed')
-            supplied.update(self.api.read_json(dependency)['feature_ids'])
-            test_ownership.extend(assignment['allowed_paths'])
+            if dependencies is None:
+                assignment = assignments[dep]
+                self.require(assignment.get('blueprint_version') == approval['approved_version']
+                             and assignment['status'] != 'cancelled', 'Prerequisite slice is stale or cancelled')
+                dependency = self.api.artifact_file(self.directory, assignment['contract_file'])
+                self.require(self.api.digest_of(dependency) == assignment['contract_sha256'],
+                             'Prerequisite slice contract has changed')
+                prerequisite = self.api.read_json(dependency)
+            else:
+                prerequisite = dependencies[dep]
+            supplied.update(prerequisite['feature_ids'])
+            test_ownership.extend(prerequisite['allowed_paths'])
         for feature in selected:
             self.check_test_sources(feature, test_ownership)
         prerequisites = {required for f in selected for required in f.get('prerequisite_feature_ids', [])}
         self.require(prerequisites <= supplied, 'A slice must depend on slices covering all approved prerequisite features')
-        checks = {c['check_id'] for f in selected for c in f['acceptance_checks']}
-        self.require(self.strings(candidate.get('functional_tests')) and set(candidate['functional_tests']) == checks,
-                     'Genuine test plan must cover every selected acceptance ID')
+        if not allow_partial_checks:
+            self.require(self.strings(candidate.get('functional_tests')) and set(candidate['functional_tests']) == checks,
+                         'Genuine test plan must cover every selected acceptance ID')
         self.require(self.text(candidate.get('test_plan')) and self.strings(candidate.get('prohibited_deviations')),
                      'Slice requires concrete test plan and prohibited deviations')
         self.check_placeholders({field: candidate[field] for field in ('test_plan', 'prohibited_deviations')},
                                 f'slice {key}')
         baseline = self.baseline(approval['baseline_id'], current=False)
-        waiting = [dep for dep in deps if self.manifest['slices'][dep]['status'] != 'accepted']
-        packet = {**candidate, 'approval_id':approval_id, 'approval_mode':'blueprint',
+        return {**candidate, 'approval_id':approval_id, 'approval_mode':'blueprint',
+            'surface_contract_version':spec.get('surface_contract_version'),
             'approved_artifact_hashes':approval['artifact_hashes'], 'feature_contracts':selected,
             'decision_records':[self.load('conversation', d) for d in sorted(set(
                 spec['decision_ids'] + [d for f in selected for d in f['decision_ids']]))],
-            'baseline_contract':baseline, 'acceptance_checks':sorted(checks),
-            'status':'blocked' if waiting else 'ready',
-            'blockers':[f'Waiting for accepted dependency: {dep}' for dep in waiting]}
+            'baseline_contract':baseline, 'acceptance_checks':sorted(checks)}
+
+    def create_slice(self, candidate):
+        self.require(not self.api.requires_slice_review(self.manifest),
+                     'Reviewed blueprint assignments require slice-release')
+        self.require_ready()
+        key = candidate.get('slice_id')
+        self.require(self.identifier(key) and key not in self.manifest.get('slices', {}),
+                     'New stable slice ID required')
+        errors = self.api.check_approval(self.directory, self.manifest) + self.api.check_coverage_records(self.directory, self.manifest)
+        errors.extend(self.check_records(recovering=('slices', key)))
+        self.require(not errors, 'Cannot create slice: ' + '; '.join(errors))
+        self.check_baseline_before_delivery()
+        packet = self.slice_packet(candidate)
+        paths, deps = packet['allowed_paths'], packet['dependencies']
+        waiting = [dep for dep in deps if self.manifest['slices'][dep]['status'] != 'accepted']
+        packet.update(status='blocked' if waiting else 'ready',
+                      blockers=[f'Waiting for accepted dependency: {dep}' for dep in waiting])
         input_hash = sha256(json.dumps(candidate, sort_keys=True).encode('utf-8')).hexdigest()
         relative = f'slices/{key}/contract.json'
         target = self.directory / relative
@@ -1644,7 +1747,7 @@ class BlueprintState:
         authorizations = {}
         for record in records:
             if (record['status'] != 'decided' or record['exchange_id'] in superseded
-                    or record.get('report_id') or record.get('record_type') == 'recap'):
+                    or record.get('report_id') or record.get('record_type') in {'recap', 'slice_detail', 'slice_consent'}):
                 continue
             ids = set(record.get('feature_ids', []) + record.get('requirement_ids', []))
             if not ids or ids & scope:
@@ -1668,6 +1771,14 @@ class BlueprintState:
         if not active:
             return False
         approval = self.manifest['approvals'][active]
+        if self.api.requires_slice_review(self.manifest):
+            review = self.manifest.get('slice_review', {})
+            package = review.get('packages', {}).get(review.get('active_package'), {})
+            if (review.get('approval_id') != active or not package.get('authorization_path')
+                    or set(package['released']) != set(review.get('selected', {}))
+                    or any(self.manifest.get('slices', {}).get(key, {}).get('status') != 'accepted'
+                           for key in package['released'])):
+                return False
         spec = self.load('blueprints',approval['approved_version'])
         expected = {(f['feature_id'],c['check_id']) for f in spec['features'] for c in f['acceptance_checks']}
         covered = set()

@@ -3,6 +3,7 @@
   "baseline_id": "audit-v1",
   "plan_version": "plan-v1",
   "surface": "backend",
+  "surface_contract_version": 2,
   "document_paths": [
     "blueprints/spec-v1/index.md"
   ],
@@ -30,6 +31,22 @@
         "success",
         "forbidden",
         "error"
+      ],
+      "state_transitions": [
+        {
+          "from": "success",
+          "to": "forbidden",
+          "trigger": "A caller without an approved role requests the feature.",
+          "guard": "The caller fails the approved authorization rule.",
+          "effect": "Return the approved denial result without protected side effects."
+        },
+        {
+          "from": "success",
+          "to": "error",
+          "trigger": "The approved operation encounters a service failure.",
+          "guard": "The failure matches the approved error condition.",
+          "effect": "Return the approved failure result and apply its retry rule."
+        }
       ],
       "dependencies": [],
       "backend_contract": {
@@ -62,7 +79,19 @@
         "src/example/**",
         "tests/example/**"
       ],
-      "prerequisite_feature_ids": []
+      "prerequisite_feature_ids": [],
+      "slice_surfaces": [],
+      "surface_contracts": {
+        "backend": {
+          "Inputs and outputs": "REPLACE exact accepted input and output values",
+          "Authorization and validation": "REPLACE exact roles, rules and validation outcomes",
+          "Persistence and transactions": "REPLACE exact persistence and transaction behavior",
+          "Concurrency and retries": "REPLACE exact idempotency, concurrency and retry behavior",
+          "Side effects and observability": "REPLACE exact side effects, logs and metrics",
+          "Compatibility and rollback": "REPLACE exact consumer compatibility and rollback behavior",
+          "Verification": "REPLACE exact observable checks or evidence"
+        }
+      }
     }
   ]
 }

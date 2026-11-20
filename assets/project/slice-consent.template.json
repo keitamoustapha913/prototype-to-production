@@ -1,0 +1,19 @@
+{
+  "exchange_id": "slice-consent-example",
+  "phase": "slice_review",
+  "record_type": "slice_consent",
+  "status": "decided",
+  "consent_action": "approve",
+  "question": "",
+  "response": "",
+  "target": {
+    "slices": [
+      {
+        "slice_id": "",
+        "proposal_revision": 1,
+        "guide_sha256": "",
+        "contract_sha256": ""
+      }
+    ]
+  }
+}

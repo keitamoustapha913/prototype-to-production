@@ -1,0 +1,89 @@
+{
+  "schema_version": 2,
+  "semantic_checks": {
+    "decision_fidelity": {
+      "schema_version": 2,
+      "result": "BLOCKED",
+      "explanation": "",
+      "reviewer": {"name": "", "context": "fresh_session", "independent_of_authoring": true},
+      "evidence_paths": [],
+      "revision_bindings": {},
+      "source_paths": [],
+      "affected_items": [],
+      "covered_feature_ids": [],
+      "case_conclusions": [
+        {"feature_id": "", "check_id": "", "case_kind": "acceptance", "result": "BLOCKED", "expected": "",
+         "conclusion": "", "source_path": "", "citation": ""}
+      ],
+      "interface_conclusions": [
+        {"interface_id": "", "provider_slice_id": "", "consumer_slice_ids": [],
+         "result": "BLOCKED", "conclusion": "", "source_path": "", "citation": ""}
+      ],
+      "applicability": {"scope": [], "reason": "", "evidence_paths": []}
+    },
+    "shared_contract_review": {
+      "schema_version": 2,
+      "result": "BLOCKED",
+      "explanation": "",
+      "reviewer": {"name": "", "context": "fresh_session", "independent_of_authoring": true},
+      "evidence_paths": [],
+      "revision_bindings": {},
+      "source_paths": [],
+      "affected_items": [],
+      "covered_feature_ids": [],
+      "case_conclusions": [
+        {"feature_id": "", "check_id": "", "case_kind": "acceptance", "result": "BLOCKED", "expected": "",
+         "conclusion": "", "source_path": "", "citation": ""}
+      ],
+      "interface_conclusions": [
+        {"interface_id": "", "provider_slice_id": "", "consumer_slice_ids": [],
+         "result": "BLOCKED", "conclusion": "", "source_path": "", "citation": ""}
+      ],
+      "boundary_conclusions": [
+        {"slice_ids": ["slice-a", "slice-b"], "result": "BLOCKED",
+         "conclusion": "", "source_path": "", "citation": ""}
+      ],
+      "applicability": {"scope": [], "reason": "", "evidence_paths": []}
+    },
+    "end_to_end_journeys": {
+      "schema_version": 2,
+      "result": "BLOCKED",
+      "explanation": "",
+      "reviewer": {"name": "", "context": "fresh_session", "independent_of_authoring": true},
+      "evidence_paths": [],
+      "revision_bindings": {},
+      "source_paths": [],
+      "affected_items": [],
+      "covered_feature_ids": [],
+      "case_conclusions": [
+        {"feature_id": "", "check_id": "", "case_kind": "acceptance", "result": "BLOCKED", "expected": "",
+         "conclusion": "", "source_path": "", "citation": ""}
+      ],
+      "interface_conclusions": [
+        {"interface_id": "", "provider_slice_id": "", "consumer_slice_ids": [],
+         "result": "BLOCKED", "conclusion": "", "source_path": "", "citation": ""}
+      ],
+      "applicability": {"scope": [], "reason": "", "evidence_paths": []}
+    },
+    "verification_coverage": {
+      "schema_version": 2,
+      "result": "BLOCKED",
+      "explanation": "",
+      "reviewer": {"name": "", "context": "fresh_session", "independent_of_authoring": true},
+      "evidence_paths": [],
+      "revision_bindings": {},
+      "source_paths": [],
+      "affected_items": [],
+      "covered_feature_ids": [],
+      "case_conclusions": [
+        {"feature_id": "", "check_id": "", "case_kind": "acceptance", "result": "BLOCKED", "expected": "",
+         "conclusion": "", "source_path": "", "citation": ""}
+      ],
+      "interface_conclusions": [
+        {"interface_id": "", "provider_slice_id": "", "consumer_slice_ids": [],
+         "result": "BLOCKED", "conclusion": "", "source_path": "", "citation": ""}
+      ],
+      "applicability": {"scope": [], "reason": "", "evidence_paths": []}
+    }
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "phase": "slice_review",
+  "current_slice_id": null,
+  "current_revision": null,
+  "pending_question_id": null,
+  "pending_question": null,
+  "completed_review_ids": [],
+  "changed_dependents": [],
+  "continuing_releases": {},
+  "next_action": "",
+  "inventory_path": null,
+  "register_path": null,
+  "slices": {},
+  "reviews": {},
+  "planning_gaps": {},
+  "rejected_alternatives": {}
+}
