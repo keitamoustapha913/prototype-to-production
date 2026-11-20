@@ -1,15 +1,8 @@
 """Regression coverage for collection blockers and cancelled assignment history."""
 import json
-import importlib.util
-from pathlib import Path
-import sys
 import unittest
 
-sys.path.insert(0, str(Path(__file__).parent))
-FIXTURE_SPEC = importlib.util.spec_from_file_location(
-    'slice_lifecycle_blueprint_fixtures', Path(__file__).with_name('test_blueprint_state.py'))
-fixtures = importlib.util.module_from_spec(FIXTURE_SPEC)
-FIXTURE_SPEC.loader.exec_module(fixtures)
+import test_blueprint_state as fixtures
 
 
 class SliceLifecycleRemediationTests(unittest.TestCase):

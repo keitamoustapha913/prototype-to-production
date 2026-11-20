@@ -1,8 +1,9 @@
 """Black-box blueprint contracts; fixtures are evidence, never real user approvals."""
+import atexit
 import base64
 import copy
 import hashlib
-from functools import partial
+from functools import cache, partial
 from http.server import ThreadingHTTPServer
 import importlib.util
 import json
@@ -17,6 +18,7 @@ import unittest
 from unittest.mock import patch
 
 from fixtures.blueprint_browser_probe import ItemsHandler
+from fixtures.mermaid_cache import mermaid_cache_environment
 from test_project_state import png
 from scripts import slice_evidence as SLICE_EVIDENCE_MODULE
 
@@ -31,6 +33,15 @@ SLICE_REVIEW_SPEC = importlib.util.spec_from_file_location(
     'blueprint_fixture_slice_review', SCRIPT.with_name('slice_review.py'))
 SLICE_REVIEW_MODULE = importlib.util.module_from_spec(SLICE_REVIEW_SPEC)
 SLICE_REVIEW_SPEC.loader.exec_module(SLICE_REVIEW_MODULE)
+
+
+@cache
+def approved_backend_sample(multiple):
+    sample = BlueprintTests()
+    sample.setUp()
+    atexit.register(sample.doCleanups)
+    feature = sample.build_reviewed_blueprint(multiple=multiple)
+    return sample.root, feature
 
 
 class BlueprintTests(unittest.TestCase):
@@ -100,7 +111,7 @@ class BlueprintTests(unittest.TestCase):
     def cli(self, command, *args, ok=True):
         result = subprocess.run([sys.executable, str(SCRIPT), command,
             '--project-root', str(self.root), '--initiative-id', 'sample-work', *map(str, args)],
-            capture_output=True, text=True, env=self.env)
+            capture_output=True, text=True, env=mermaid_cache_environment(self.env))
         if ok:
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         else:
@@ -1327,6 +1338,13 @@ document.getElementById('observation').textContent = JSON.stringify({
         self.assertIn('Traceability matrix', result.stderr)
 
     def reviewed_blueprint(self, *, surface='backend', multiple=False, extra_surfaces=False):
+        if surface == 'backend' and not extra_surfaces and not any(self.root.iterdir()):
+            sample, feature = approved_backend_sample(multiple)
+            shutil.copytree(sample, self.root, dirs_exist_ok=True)
+            return copy.deepcopy(feature)
+        return self.build_reviewed_blueprint(surface=surface, multiple=multiple, extra_surfaces=extra_surfaces)
+
+    def build_reviewed_blueprint(self, *, surface='backend', multiple=False, extra_surfaces=False):
         self.start(review=True)
         self.exchange()
         self.record_baseline(self.baseline(surface))
