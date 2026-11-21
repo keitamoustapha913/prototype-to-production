@@ -4,6 +4,7 @@
   "scope": "feature",
   "mode": "blueprint",
   "approved_by_user": false,
+  "approval_exchange_id": "blueprint-approval-reply",
   "user_approval_note": "REPLACE only after actual explicit approval",
   "decision_recap_path": "approval-evidence/spec-v1-recap.md",
   "workstream_consistency_path": "approval-evidence/spec-v1-consistency.md",

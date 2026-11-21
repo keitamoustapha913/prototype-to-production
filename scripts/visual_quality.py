@@ -253,6 +253,8 @@ def status(directory, manifest, *, assessment=None):
         except EVIDENCE_ERRORS:
             current = False
     acceptance = read_record(directory, "accept", heads["accept"]) if heads["accept"] else None
+    if acceptance and acceptance.get("presentation_hashes"):
+        state.blueprint_state(directory, manifest).check_hashes(acceptance["presentation_hashes"])
     accepted = bool(current and audit["status"] in COMPLETE and acceptance
                     and acceptance["audit_id"] == audit["audit_id"]
                     and acceptance["audit_sha256"] == records["audit"][audit["audit_id"]])
@@ -430,9 +432,13 @@ def accept(directory, payload):
         manifest = state.manifest_at(directory)
         current = status(directory, manifest)
         audit_record = current["audit"]
+        controller = state.sibling_module("conversation_controller")
+        fields = {"approval_id", "audit_id", "audit_sha256", "approved_by_user", "user_response"}
+        if controller.required(manifest):
+            fields.add("presentation_path")
         if (not audit_record or not current["audit_current"] or audit_record["status"] not in COMPLETE
                 or not isinstance(payload, dict)
-                or set(payload) != {"approval_id", "audit_id", "audit_sha256", "approved_by_user", "user_response"}
+                or set(payload) != fields
                 or payload["approval_id"] != audit_record["approval_id"] or payload["audit_id"] != audit_record["audit_id"]
                 or payload["audit_sha256"] != current["audit_sha256"] or payload["approved_by_user"] is not True
                 or not isinstance(payload["user_response"], str) or not payload["user_response"].strip()):
@@ -445,5 +451,8 @@ def accept(directory, payload):
             raise state.StateError("Resolve outstanding final review feedback or record the user's deferral or withdrawal before accepting")
         key = "accept-" + uuid.uuid4().hex
         record = {**payload, "acceptance_id": key, "accepted_at": state.utc_now()}
+        if controller.required(manifest):
+            record["presentation_hashes"] = controller.final_acceptance_evidence(
+                state.blueprint_state(directory, manifest), payload)
         save(directory, manifest, "accept", key, record, request)
         return record

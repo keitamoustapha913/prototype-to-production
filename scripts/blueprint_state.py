@@ -459,6 +459,8 @@ class BlueprintState:
         self.check_protected_visual_decisions(value)
         paths = value.get('illustration_paths', []) + value.get('evidence_paths', [])
         hashes = self.hashes(paths) if paths else {}
+        if record_type == 'review_checkpoint' and value.get('review_step') == 'blueprint_approval' and value['status'] == 'open':
+            hashes.update(value['approval_basis'])
         sources = {p:self.api.digest_of(self.api.project_source_file(self.directory.parents[2], p))
                    for p in value.get('source_paths', [])}
         if record_type == 'review_checkpoint' and value.get('review_step') == 'initial_alignment' and value['status'] == 'open':
@@ -494,12 +496,17 @@ class BlueprintState:
         self.require((step, value['phase']) in (('initial_alignment', 'discover'),
                                                 ('discovery', 'discover'), ('roadmap', 'plan'),
                                                 ('plan_workstream', 'plan'), ('plan_completion', 'plan'),
-                                                ('workstream', 'blueprint'))
+                                                ('workstream', 'blueprint'),
+                                                ('blueprint_approval', 'blueprint'))
                      and self.text(value.get('review_target')),
                      'Review checkpoint needs the displayed stage and review target')
         self.require(not any(key in value for key in ('authorized_changes', 'protected_visual_decisions',
                                                      'report_id', 'supersedes')),
                      'Review checkpoints record presentation and pacing only; record design decisions separately')
+        controller = self.api.sibling_module('conversation_controller')
+        if step == 'blueprint_approval':
+            controller.check_approval_checkpoint(self, value)
+            return
         if step == 'initial_alignment':
             self.check_initial_alignment(value)
             return
@@ -512,7 +519,11 @@ class BlueprintState:
             self.require(value.get('review_action') != 'skip', 'The plan overview cannot be waived')
             self.require(value['review_version'] not in self.manifest.get('blueprint_plans', {}),
                          'Use a new plan version to revise the roadmap overview')
-        if self.manifest.get('guided_design_review') or (step == 'workstream' and
+        enforced_workstream = step == 'workstream' and controller.required(self.manifest)
+        if enforced_workstream:
+            self.require(value.get('review_action') != 'skip',
+                         'Every blueprint workstream requires a walkthrough and explicit continuation')
+        if enforced_workstream or self.manifest.get('guided_design_review') or (step == 'workstream' and
                                                          self.manifest.get('requirement_traceability_required')):
             version = value.get('review_version')
             self.require(self.identifier(version), 'Review checkpoint needs the exact audit, roadmap or blueprint version')
@@ -521,8 +532,18 @@ class BlueprintState:
                 plan = self.load('blueprint_plans', spec['plan_version'])
                 self.require(value.get('review_workstream') in plan['workstreams'],
                              'Review checkpoint must name an exact roadmap workstream')
+                if enforced_workstream:
+                    latest = max(self.manifest['blueprints'],
+                                 key=lambda key: self.manifest['blueprints'][key]['sequence'])
+                    self.require(self.manifest['stage'] == 'blueprint' and version == latest,
+                                 f'Review the current blueprint version {latest}')
+                    completed, current, revisits = controller.workstream_position(self.conversations(), version, plan)
+                    self.require(value['review_workstream'] == current,
+                                 f'Review the next blueprint workstream: {current or "all walkthroughs complete"}')
+                    if value['status'] == 'decided' and value.get('review_action') == 'revisit':
+                        controller.check_revisit(self, value, completed, revisits)
                 if spec.get('requirement_traceability_version'):
-                    self.check_coverage_workstream(value, spec, plan)
+                    self.check_coverage_workstream(value, spec, plan, check_order=not enforced_workstream)
                 else:
                     feature_ids = {feature['feature_id'] for feature in spec['features']}
                     self.require(value.get('feature_ids') and set(value['feature_ids']) <= feature_ids,
@@ -531,10 +552,15 @@ class BlueprintState:
         if value['status'] == 'open':
             self.require(not action and not value.get('responds_to') and self.strings(value.get('evidence_paths')),
                          'Open review checkpoint needs the actual terminal presentation as evidence')
-            self.markdown(value['evidence_paths'])
+            _, documents = self.markdown(value['evidence_paths'])
             if step == 'workstream':
-                self.require(not any(record.get('review_step') == 'workstream' for record in self.pending()),
-                             'Resolve the current workstream before opening another walkthrough')
+                pending = self.pending()
+                if enforced_workstream:
+                    self.require(not pending, 'Resolve the current review question before opening another walkthrough')
+                    controller.require_presentation(self, documents, value['question'])
+                else:
+                    self.require(not any(record.get('review_step') == 'workstream' for record in pending),
+                                 'Resolve the current workstream before opening another walkthrough')
             return
         actions = ('continue', 'skip', 'revisit', 'revise') if step == 'workstream' else ('confirm', 'skip', 'revise')
         self.require(value['status'] == 'decided' and action in actions,
@@ -546,6 +572,9 @@ class BlueprintState:
             reply = ' '.join(value['response'].casefold().strip().rstrip('.!').split())
             self.require(reply not in {'correct', 'looks good', 'i understand', 'yes', 'ok', 'okay', 'agreed'},
                          'Acknowledgment leaves the workstream open; wait for explicit navigation or correction')
+            if enforced_workstream and action == 'continue':
+                self.require(reply in {'continue', 'next', 'move to the next workstream'},
+                             'Wait for explicit navigation: Continue, Next, or Move to the next workstream')
             if action in {'continue', 'skip'}:
                 self.require(all(record['exchange_id'] == value.get('responds_to') for record in self.pending()),
                              'Resolve outstanding design questions before advancing the workstream review')
@@ -1780,17 +1809,18 @@ class BlueprintState:
                                         'exact blueprint, decision recap and coverage for formal approval')
         self.persist()
 
-    def check_coverage_workstream(self, value, spec, plan):
+    def check_coverage_workstream(self, value, spec, plan, *, check_order):
         self.load('blueprint_coverage', spec['version'])
         coverage = self.manifest['blueprint_coverage'][spec['version']]
         latest = {answer['review_workstream']: answer['review_action'] for answer in self.review_answers('workstream')
                   if answer['review_version'] == spec['version']}
-        completed = {name for name, action in latest.items() if action in {'continue', 'skip'}}
-        current = next((name for name in plan['workstreams'] if name not in completed), None)
         name = value['review_workstream']
         waiver = value.get('review_action') == 'skip'
-        self.require(waiver or name == current or name in completed,
-                     f'Review the next blueprint workstream in plan order: {current}')
+        if check_order:
+            completed = {name for name, action in latest.items() if action in {'continue', 'skip'}}
+            current = next((name for name in plan['workstreams'] if name not in completed), None)
+            self.require(waiver or name == current or name in completed,
+                         f'Review the next blueprint workstream in plan order: {current}')
         feature_ids = {feature['feature_id'] for feature in spec['features'] if name in feature['workstreams']}
         requirement_ids = {key for key, names in plan['requirement_workstreams'].items() if name in names}
         self.require(set(value.get('feature_ids', [])) == feature_ids
@@ -1805,6 +1835,16 @@ class BlueprintState:
         versions = self.manifest['blueprints']
         current_sequence = versions[spec['version']]['sequence']
         features = {feature['feature_id']: feature for feature in spec['features']}
+        controller = self.api.sibling_module('conversation_controller')
+        if controller.required(self.manifest):
+            reviews, current, revisits = controller.workstream_position(self.conversations(), spec['version'], plan)
+            if current:
+                message = (f'Finish the requested revisit of {current}' if revisits else
+                           f'Finish the terminal walkthrough and record explicit Continue for {current}')
+                raise self.api.StateError(message)
+            covered = {feature for answer in reviews.values() for feature in answer['feature_ids']}
+            self.require(covered == features.keys(), 'Workstream reviews must cover every blueprint feature')
+            return [reviews[name] for name in plan['workstreams']]
         latest = {}
         for answer in self.review_answers('workstream'):
             version = answer['review_version']
@@ -1817,10 +1857,9 @@ class BlueprintState:
                 latest[answer['review_workstream']] = (answer, earlier)
         completed, covered = [], set()
         for name in plan['workstreams']:
-            self.require(name in latest, f'Finish the terminal walkthrough or record an explicit skip for {name}')
-            answer, earlier = latest[name]
-            self.require(answer['review_action'] in {'continue', 'skip'},
+            self.require(name in latest and latest[name][0]['review_action'] in {'continue', 'skip'},
                          f'Finish the terminal walkthrough or record an explicit skip for {name}')
+            answer, earlier = latest[name]
             scope = set(answer['feature_ids'])
             # Generated document paths move with the version. The reviewed feature contracts must still match.
             prior = {feature['feature_id']: {k: v for k, v in feature.items() if k != 'spec_paths'}
@@ -1857,19 +1896,30 @@ class BlueprintState:
             hashes.update(self.review_exchange_hashes(answers))
         return hashes
 
-    def validate_approval(self, value):
+    def validate_approval(self, value, *, requesting=False):
         self.require_ready()
+        controller = self.api.sibling_module('conversation_controller')
+        enforced = controller.required(self.manifest)
+        if not enforced:
+            value = {key: item for key, item in value.items() if key != 'approval_exchange_id'}
         self.require(value.get('mode') == 'blueprint', 'Blueprint initiatives require blueprint approval mode')
         self.require(value.get('scope') == self.manifest['scope'], 'Approval scope conflicts')
-        self.require(value.get('approved_by_user') is True and self.text(value.get('user_approval_note')),
+        self.require(requesting or (value.get('approved_by_user') is True and self.text(value.get('user_approval_note'))),
                      'Explicit user approval of exact version required')
         self.require(self.identifier(value.get('decision_id')) and self.identifier(value.get('approved_version')),
                      'Approval decision and version IDs required')
         self.require(value['decision_id'] not in self.manifest.get('approvals', {}) and not any(
             a['approved_version'] == value['approved_version'] for a in self.manifest.get('approvals', {}).values()),
             'Approval/version already used; preserve history')
-        self.require(not self.pending(), 'Unanswered consequential questions block approval')
+        pending = self.pending()
+        self.require(not pending, 'Unanswered consequential questions block approval'
+                     + (f'; next: {pending[0]["question"]}' if pending else ''))
         version = value['approved_version']
+        if enforced:
+            versions = self.manifest.get('blueprints', {})
+            self.require(self.manifest['stage'] == 'blueprint' and versions
+                         and version == max(versions, key=lambda key: versions[key]['sequence']),
+                         'Request approval for the current blueprint version after its plan review')
         spec = self.load('blueprints', version)
         self.check_blueprint_placeholders(spec)
         self.check_backend_acceptance(spec)
@@ -1893,7 +1943,7 @@ class BlueprintState:
             _, issues, _, _ = module.audit(self, spec, baseline, plan, coverage)
             report_path = self.manifest['blueprint_coverage'][version]['report_path']
             self.require(not issues, 'Blueprint coverage is incomplete. ' + module.gap_summary(issues, report_path))
-        if self.manifest.get('guided_design_review') or spec.get('requirement_traceability_version'):
+        if enforced or self.manifest.get('guided_design_review') or spec.get('requirement_traceability_version'):
             answers = self.completed_workstream_reviews(spec, plan)
             value = {**value, 'workstream_review_ids': [answer['exchange_id'] for answer in answers]}
         else:
@@ -1906,6 +1956,10 @@ class BlueprintState:
                        allow_empty=True)
         hashes = self.bound_hashes('blueprint_coverage', version)
         presentation_hashes = self.approval_presentation_hashes(value, spec)
+        if enforced and not requesting:
+            presentation_hashes.update(controller.approval_exchange_hashes(
+                self, {key: item for key, item in value.items() if key != 'workstream_review_ids'},
+                presentation_hashes, current=True))
         self.require(all(hashes[path] == presentation_hashes[path] for path in hashes.keys() & presentation_hashes.keys()),
                      'A displayed file changed after the blueprint or coverage was frozen')
         hashes.update(presentation_hashes)
@@ -1952,6 +2006,10 @@ class BlueprintState:
             expected = self.bound_hashes('blueprint_coverage', approval['approved_version'])
             if 'presentation_evidence_hashes' in approval:
                 presentation_hashes = self.approval_presentation_hashes(approval, spec)
+                if approval.get('approval_exchange_id'):
+                    controller = self.api.sibling_module('conversation_controller')
+                    presentation_hashes.update(controller.approval_exchange_hashes(
+                        self, approval, presentation_hashes, current=False))
                 self.require(presentation_hashes == approval['presentation_evidence_hashes'],
                              'Approval presentation hash inventory mismatch')
                 expected.update(presentation_hashes)

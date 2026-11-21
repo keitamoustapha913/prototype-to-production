@@ -228,6 +228,11 @@ def record_blueprint_command(directory: Path, command: str, input_file: str, pro
         elif command == "conversation-record" and requires_slice_review(manifest) and value.get("phase") == "slice_review":
             review = slice_review_state(directory, manifest)
             review.record_exchange(request, value)
+        elif (command == "conversation-record" and value.get("record_type") == "review_checkpoint"
+              and value.get("review_step") == "blueprint_approval"):
+            writes, events = {}, []
+            state.conversation_record(dict(value), transition=(writes, events))
+            save_workflow_state(directory, manifest, transition=(request, events, writes))
         else:
             getattr(state, command.replace("-", "_"))(value)
     print(f"Recorded {command}")
@@ -1396,6 +1401,7 @@ def initialize(directory: Path, scope: str, next_action: str | None, mode: str |
         if template["initiative_mode"] == "blueprint":
             template.update(schema_version=5, slice_review_required=True, slice_map_required=True,
                             adaptive_handoff_required=True, plan_review_required=True,
+                            conversation_controller_version=1,
                             requirement_traceability_required=True)
         if guided_design_review:
             template["guided_design_review"] = True
@@ -3068,6 +3074,14 @@ def build_resume_packet(directory: Path, project_root: Path, *, delivery_slice: 
             except (StateError, OSError, ValueError, KeyError, TypeError) as error:
                 errors.append(f"Traceability recovery is blocked: {error}")
     errors.extend(question_source_errors)
+    controller = sibling_module("conversation_controller")
+    workflow_progress = None
+    if controller.required(manifest):
+        try:
+            workflow_progress = controller.blueprint_progress(
+                blueprint_state(directory, manifest), conversation, pending_questions)
+        except (StateError, OSError, KeyError, TypeError, ValueError) as error:
+            errors.append(f"Workflow recovery is blocked: {error}")
     review = slice_review_state(directory, manifest).summary() if initiative_mode(manifest) == "blueprint" else None
     if review and review.get("pending_question_id") and not any(
             question["exchange_id"] == review["pending_question_id"] for question in pending_questions):
@@ -3083,6 +3097,8 @@ def build_resume_packet(directory: Path, project_root: Path, *, delivery_slice: 
             review and (walkthrough := review.get('walkthroughs', {}).get(review.get('current_slice_id')))
             and active_question_answer['exchange_id'] in walkthrough['discussion']):
         next_action = "Use the recorded answer and update the saved work cursor."
+    elif workflow_progress and (not work or work.get("status") == "in_progress"):
+        next_action = workflow_progress["next_action"]
     elif pending_guided_review and (not work or work.get("status") == "in_progress"):
         next_action = f"Wait for the user's reply on {pending_guided_review['review_target']}."
     elif (plan_review and manifest["stage"] in {"plan", "blueprint"} and not work
@@ -3192,6 +3208,7 @@ def build_resume_packet(directory: Path, project_root: Path, *, delivery_slice: 
         "conversation": conversation,
         "pending_questions": pending_questions,
         "plan_review": plan_review,
+        "workflow_progress": workflow_progress,
         "slice_review": review,
         "active_question_answer": active_question_answer,
         "conversation_usage": conversation_usage,
@@ -3225,7 +3242,17 @@ def print_resume(directory: Path, project_root: Path, *, delivery_slice: str | N
         print("Application quality: " + quality["status"].replace("_", " "))
         if quality["audit"] and not quality["audit_current"]:
             print("The saved final audit is historical. Reverify affected work and run the final audit.")
-    print(render_checkpoint(manifest, resume_action=packet["next_action"] if answer or quality else None))
+    progress = packet["workflow_progress"]
+    print(render_checkpoint(manifest, resume_action=packet["next_action"] if answer or quality or progress else None))
+    if progress:
+        print(f"Blueprint {progress['version']} | {progress['completed']} of {progress['total']} workstreams reviewed")
+        if progress["current_item"]:
+            print(f"Current workstream | {progress['current_item']}")
+    elif packet["phase"] == "plan" and (plan := packet["plan_review"]):
+        print(f"Plan {plan['plan_version']} | {len(plan['completed_workstreams'])} "
+              f"of {len(plan['workstreams'])} workstreams reviewed")
+        if plan["current_workstream"]:
+            print(f"Current workstream | {plan['current_workstream']}")
     active = manifest.get("approvals", {}).get(manifest.get("active_approval_id"))
     if active and packet["initiative_mode"] == "blueprint":
         print("Approved blueprint specifications:")
@@ -3326,7 +3353,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     for name in (
-        "init", "artifact-setup", "review-viewer", "review-revision", "visual-integrity", "visual-baseline", "cross-screen", "visual-quality", "event", "checkpoint", "conversation-record", "plan-record", "blueprint-record", "blueprint-coverage", "blueprint-index-rebuild", "work-update", "discovery-record", "discovery-capture", "browser-build-fingerprint", "missing-feature", "prototype-coverage", "approve", "revoke-approval", "slice-create", "slice-cancel",
+        "init", "artifact-setup", "review-viewer", "review-revision", "visual-integrity", "visual-baseline", "cross-screen", "visual-quality", "event", "checkpoint", "conversation-record", "plan-record", "blueprint-record", "blueprint-coverage", "blueprint-index-rebuild", "work-update", "discovery-record", "discovery-capture", "browser-build-fingerprint", "missing-feature", "prototype-coverage", "blueprint-approval-preview", "approve", "revoke-approval", "slice-create", "slice-cancel",
         "slice-report", "reconcile", "warning-record", "warning-decide", "resume", "validate", *REVIEW_COMMANDS,
     ):
         sub = commands.add_parser(name)
@@ -3380,7 +3407,7 @@ def main(argv: list[str] | None = None) -> int:
             sub.add_argument("--report-file", required=True)
         if name == "prototype-coverage":
             sub.add_argument("--coverage-file", required=True)
-        if name == "approve":
+        if name in {"blueprint-approval-preview", "approve"}:
             sub.add_argument("--approval-file", required=True)
         if name == "revoke-approval":
             sub.add_argument("--reason", required=True)
@@ -3544,6 +3571,27 @@ def main(argv: list[str] | None = None) -> int:
             report_missing_feature(directory, args.report_file)
         elif args.command == "prototype-coverage":
             record_prototype_coverage(directory, args.coverage_file)
+        elif args.command == "blueprint-approval-preview":
+            with coordinator_lock(directory):
+                manifest = manifest_at(directory)
+                if initiative_mode(manifest) != "blueprint":
+                    raise StateError("Blueprint approval preview requires blueprint mode")
+                controller = sibling_module("conversation_controller")
+                state = blueprint_state(directory, manifest)
+                try:
+                    result = controller.approval_preview(state, read_json(Path(args.approval_file)))
+                    result.pop("presentation_hashes")
+                except (StateError, OSError, ValueError, KeyError, TypeError) as error:
+                    next_action = manifest["next_action"]
+                    try:
+                        if progress := controller.blueprint_progress(state, state.conversations(), state.pending()):
+                            next_action = progress["next_action"]
+                    except (StateError, OSError, ValueError, KeyError, TypeError):
+                        next_action = "Run validate and reconcile the saved workflow evidence."
+                    raise StateError(f"Workflow transition to blueprint approval request\n"
+                                     f"Current stage: {manifest['stage']}\n"
+                                     f"Missing or invalid evidence: {error}\nNext: {next_action}") from error
+            print(json.dumps(result, indent=2, ensure_ascii=False))
         elif args.command == "approve":
             approve(directory, args.approval_file)
         elif args.command == "revoke-approval":

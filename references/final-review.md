@@ -1,6 +1,6 @@
 # Application Completion Review
 
-When the final audit passes, open **Application Completion Review** in the Living Blueprint viewer. The dashboard is available automatically and can be shared with the user as the local viewer URL ending in `/#final-review`. Present the audit ID and SHA-256 with the verified slice count, repairs, warnings and any open review feedback. The user may inspect sections in any order or explicitly accept the current report immediately.
+When the final audit passes, open **Application Completion Review** in the Living Blueprint viewer. The dashboard is available automatically and can be shared with the user as the local viewer URL ending in `/#final-review`. Present the audit ID and SHA-256 with the verified slice count, repairs, warnings and any open review feedback. The user may inspect sections in any order or explicitly accept the current report immediately. For initiatives using the conversation controller, follow the [exact audit acceptance instruction](conversation-controller.md#record-final-acceptance).
 
 The implemented side of each comparison uses captures from the passing slice or cross-screen checks recorded by that report. Older reports without capture IDs use the saved captures for the report's approval and date.
 

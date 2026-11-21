@@ -71,7 +71,7 @@ python3 scripts/project_state.py review-viewer --project-root <app> --initiative
 
 The project status is **In implementation**, **Blocked**, **Technically complete**, **Technically complete — with warnings**, or **Finally accepted**. Technical completion requires all mandatory checks and allows nonblocking warnings. The user can inspect and request corrections with or without accepting the current report.
 
-When the user explicitly accepts the completed application against a specific current report, save `approval_id`, `audit_id`, `audit_sha256` (from `status`), `approved_by_user: true`, and the actual `user_response` in an input file and run:
+When the user explicitly accepts the completed application against a specific current report, follow the [exact audit acceptance instruction](conversation-controller.md#record-final-acceptance) for controller-enabled initiatives. Save `approval_id`, `audit_id`, `audit_sha256` (from `status`), `approved_by_user: true`, and the actual `user_response` in an input file and run:
 
 ```sh
 python3 scripts/project_state.py visual-quality --project-root <app> --initiative-id <id> --action accept --input-file <acceptance.json>

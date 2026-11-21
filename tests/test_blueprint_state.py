@@ -1005,6 +1005,7 @@ document.getElementById('observation').textContent = JSON.stringify({
         self.cli('init', '--scope', 'feature')
         self.assertEqual(self.manifest()['initiative_mode'], 'blueprint')
         self.assertTrue(self.manifest()['slice_map_required'])
+        self.assertEqual(self.manifest()['conversation_controller_version'], 1)
         self.cli('init', '--scope', 'feature', '--mode', 'prototype', ok=False)
         self.assertEqual(self.manifest()['initiative_mode'], 'blueprint')
 
@@ -1024,6 +1025,7 @@ document.getElementById('observation').textContent = JSON.stringify({
         self.cli('init', '--scope', 'feature', *args)
         manifest = self.manifest()
         # Existing workflow fixtures predate the separate intake checkpoint.
+        manifest.pop('conversation_controller_version', None)
         manifest.pop('initial_alignment_required', None)
         manifest.pop('requirement_traceability_required', None)
         manifest['slice_map_required'] = False
@@ -3316,6 +3318,9 @@ print(json.dumps(output))
         self.assertEqual(saved['status'], 'technically_complete')
         self.assertEqual(saved['checks'][0]['observation']['states'], BACKEND_OUTCOMES)
         self.assertEqual(json.loads(self.cli('visual-quality', *args).stdout)['audit_id'], saved['audit_id'])
+        manifest = self.manifest()
+        manifest['conversation_controller_version'] = 1
+        (self.directory / 'manifest.json').write_text(json.dumps(manifest))
         current = status()
         self.assertFalse(current['acceptance_current'])
         decision = {'approval_id': saved['approval_id'], 'audit_id': saved['audit_id'],
@@ -3323,6 +3328,14 @@ print(json.dumps(output))
                     'user_response': 'I accept this completed application.'}
         self.cli('visual-quality', '--action', 'accept',
                  '--input-file', self.payload('wrong-decision', {**decision, 'audit_sha256': '0' * 64}), ok=False)
+        phrase = f"Accept final audit {saved['audit_id']}"
+        presentation = self.artifact('review/final-acceptance.md',
+                                     f"Audit digest {current['audit_sha256']}. Say {phrase}.")
+        decision['presentation_path'] = presentation
+        rejected = self.cli('visual-quality', '--action', 'accept',
+                            '--input-file', self.payload('ambiguous-acceptance', decision), ok=False)
+        self.assertIn(phrase, rejected.stderr)
+        decision['user_response'] = phrase
         decision_file = self.payload('final-decision', decision)
         self.cli('visual-quality', '--action', 'accept', '--input-file', decision_file)
         self.assertEqual(status()['status'], 'finally_accepted')
@@ -4736,6 +4749,110 @@ print(json.dumps(output))
         self.plan_reply(checkpoint, 'revise', 'Refresh the plan from the new audit.')
         self.record_baseline(audit)
         self.record_reviewed_plan(self.plan('plan-v3', 'audit-v2'))
+
+    def test_controller_blocks_blueprint_approval_until_the_exact_request_and_reply(self):
+        self.start()
+        self.exchange()
+        self.record_baseline()
+        plan = self.plan()
+        plan['workstreams'].append('Client compatibility')
+        self.record_reviewed_plan(plan)
+        self.cli('blueprint-record', '--blueprint-file', self.payload('spec', self.blueprint()))
+        self.cli('blueprint-coverage', '--coverage-file', self.payload('coverage', self.coverage()))
+        manifest = self.manifest()
+        manifest['conversation_controller_version'] = 1
+        (self.directory / 'manifest.json').write_text(json.dumps(manifest))
+        approval = self.approval()
+        spec = 'spec-v1'
+        name, next_name = plan['workstreams']
+        consistency = self.artifact('review/consistency.md', 'The API and service use the same membership rules.')
+        approval['workstream_consistency_path'] = consistency
+        approval['shown_paths'].append(consistency)
+        question = 'Approve blueprint spec-v1?'
+        presentation = self.artifact('review/approval-request.md', f'Coverage and consistency for {spec} passed.\n{question}')
+        draft = {key: item for key, item in approval.items()
+                 if key not in {'approved_by_user', 'user_approval_note'}}
+        prompt = {'exchange_id': 'approval-prompt', 'phase': 'blueprint', 'record_type': 'review_checkpoint',
+                  'review_step': 'blueprint_approval', 'review_version': spec, 'review_target': spec,
+                  'status': 'open', 'question': question, 'feature_ids': ['items-feature'],
+                  'approval_presentation': draft, 'evidence_paths': [presentation]}
+
+        def record(value, *, ok=True):
+            return self.cli('conversation-record', '--exchange-file', self.payload('checkpoint', value), ok=ok)
+
+        resume = json.loads(self.cli('resume', '--format', 'json').stdout)
+        self.assertEqual(resume['workflow_progress']['current_item'], name)
+        preview_file = self.payload('approval-draft', draft)
+        blocked = self.cli('blueprint-approval-preview', '--approval-file', preview_file, ok=False)
+        self.assertIn(f'Next: Present blueprint workstream {name}.', blocked.stderr)
+        self.assertIn(name, record(prompt, ok=False).stderr)
+        self.assertIn(name, self.cli('approve', '--approval-file', self.payload('approval', approval), ok=False).stderr)
+        workstream = {'exchange_id': 'workstream-prompt', 'phase': 'blueprint', 'record_type': 'review_checkpoint',
+                      'review_step': 'workstream', 'review_version': spec, 'review_target': name,
+                      'review_workstream': name, 'status': 'open', 'question': 'Continue?',
+                      'feature_ids': ['items-feature'], 'evidence_paths': [
+                          self.artifact('review/workstream.md', 'The endpoint keeps its access check. Continue?')]}
+        bare_prompt = self.artifact('review/prompt-only.md', 'Continue?')
+        self.assertIn('displayed explanation', record(workstream | {'evidence_paths': [bare_prompt]}, ok=False).stderr)
+        record(workstream)
+        advance = {**workstream, 'exchange_id': 'workstream-reply', 'status': 'decided',
+                   'responds_to': 'workstream-prompt', 'review_action': 'continue'}
+        self.assertIn('explicit navigation', record(advance | {'response': 'Okay, sounds good'}, ok=False).stderr)
+        record(advance | {'response': 'Continue'})
+        reopened = workstream | {'exchange_id': 'workstream-revisit-prompt'}
+        record(reopened, ok=False)
+        next_prompt = workstream | {'exchange_id': 'next-workstream', 'review_target': next_name,
+                                    'review_workstream': next_name}
+        record(next_prompt)
+        next_answer = next_prompt | {'exchange_id': 'next-workstream-revisit', 'status': 'decided',
+                                     'responds_to': next_prompt['exchange_id'], 'review_action': 'revisit',
+                                     'revisit_workstream': name, 'response': f'Revisit {name}'}
+        record(next_answer)
+        record(reopened)
+        record(advance | {'exchange_id': 'initial-revisit-reply', 'responds_to': reopened['exchange_id'],
+                          'response': 'Continue'})
+        resume = json.loads(self.cli('resume', '--format', 'json').stdout)
+        self.assertEqual(resume['workflow_progress']['current_item'], next_name)
+        next_prompt = next_prompt | {'exchange_id': 'resumed-workstream'}
+        record(next_prompt)
+        record(next_prompt | {'exchange_id': 'resumed-workstream-continue', 'status': 'decided',
+                              'responds_to': next_prompt['exchange_id'], 'review_action': 'continue',
+                              'response': 'Continue'})
+        preview = json.loads(self.cli('blueprint-approval-preview', '--approval-file', preview_file).stdout)
+        self.assertEqual(preview['instruction'], 'Approve blueprint spec-v1')
+        self.assertEqual(preview['approval_presentation'], draft)
+        record(prompt)
+        resume = json.loads(self.cli('resume', '--format', 'json').stdout)
+        self.assertEqual(resume['workflow_progress']['pending_question_id'], 'approval-prompt')
+        self.assertIn('approve blueprint spec-v1', self.cli('approve', '--approval-file',
+                      self.payload('approval', approval), ok=False).stderr.lower())
+        answer = {key: item for key, item in prompt.items() if key not in {'approval_presentation', 'evidence_paths'}}
+        answer.update(exchange_id='approval-reply', status='decided', responds_to='approval-prompt',
+                      review_action='confirm')
+        self.assertIn('Approve blueprint spec-v1', record(answer | {'response': 'Continue'}, ok=False).stderr)
+        revisit = answer | {'review_action': 'revisit', 'revisit_workstream': name}
+        record(revisit | {'response': 'Looks good'}, ok=False)
+        record(revisit | {'response': f'Revisit {name}'})
+        resume = json.loads(self.cli('resume', '--format', 'json').stdout)
+        self.assertEqual(resume['workflow_progress']['current_item'], name)
+        self.cli('blueprint-approval-preview', '--approval-file', preview_file, ok=False)
+        reopened = reopened | {'exchange_id': 'workstream-revisit-from-approval'}
+        record(reopened)
+        record(advance | {'exchange_id': 'workstream-revisit-reply', 'responds_to': reopened['exchange_id'],
+                          'response': 'Continue'})
+        record(reopened | {'exchange_id': 'unrequested-second-revisit'}, ok=False)
+        prompt = prompt | {'exchange_id': 'approval-prompt-after-revisit'}
+        record(prompt)
+        answer = answer | {'exchange_id': 'approval-reply-after-revisit', 'responds_to': prompt['exchange_id']}
+        record(answer | {'response': 'Approve blueprint spec-v1'})
+        final = approval | {'approval_exchange_id': answer['exchange_id'], 'user_approval_note': 'Approve blueprint spec-v1'}
+        self.assertIn('recorded approval request', self.cli('approve', '--approval-file',
+                      self.payload('approval', final | {'exceptions': ['An unreviewed exception']}), ok=False).stderr)
+        self.cli('approve', '--approval-file', self.payload('approval', final))
+        saved = self.manifest()['approvals'][approval['decision_id']]
+        self.assertIn('conversation/approval-prompt-after-revisit.json', saved['artifact_hashes'])
+        self.assertIn('conversation/approval-reply-after-revisit.json', saved['artifact_hashes'])
+        self.cli('validate')
 
     def test_guided_approval_requires_all_workstreams_and_consistency_evidence(self):
         self.start(review=True, guided=True)
