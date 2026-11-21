@@ -2,11 +2,17 @@
 import { execFile, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { promisify } from 'node:util';
+
+const run = promisify(execFile);
+const keyboardKeys = new Map([
+    ['Tab', 9], ['Enter', 13], ['Escape', 27], ['Space', 32], ['End', 35],
+    ['Home', 36], ['ArrowLeft', 37], ['ArrowUp', 38], ['ArrowRight', 39], ['ArrowDown', 40],
+]);
 
 async function waitFor(probe, message) {
     for (let attempt = 0; attempt < 100; attempt++) {
@@ -105,7 +111,7 @@ async function checkBuild(send, responses, build, url) {
     return evidence;
 }
 
-async function capture({ browser, appUrl, renderCase, checks, build }) {
+async function capture({ browser, appUrl, renderCase, checks = [], build, interaction_assertions = [] }, evidenceDirectory) {
     const url = new URL(renderCase.route, appUrl);
     if (!['http:', 'https:'].includes(url.protocol) || url.origin !== new URL(appUrl).origin) {
         throw new Error('The approved route must be on the configured HTTP(S) application');
@@ -182,7 +188,7 @@ async function capture({ browser, appUrl, renderCase, checks, build }) {
 
         if (renderCase.command) {
             const [command, ...commandArgs] = renderCase.command;
-            await promisify(execFile)(command, commandArgs, {
+            await run(command, commandArgs, {
                 env: { ...process.env, P2P_BROWSER_ENDPOINT: endpoint, P2P_BROWSER_PAGE: page.webSocketDebuggerUrl },
                 timeout: 45000,
             });
@@ -190,6 +196,19 @@ async function capture({ browser, appUrl, renderCase, checks, build }) {
         for (const step of renderCase.setup ?? []) {
             if (step.action === 'navigate') {
                 await navigate(new URL(step.route, url.origin));
+                continue;
+            }
+            if (step.action === 'press') {
+                const { result } = await send('Runtime.evaluate', { expression: 'location.origin', returnByValue: true });
+                const windowsVirtualKeyCode = keyboardKeys.get(step.key);
+                if (result.value !== url.origin || !windowsVirtualKeyCode) {
+                    throw new Error('Browser setup requires a supported key on the application origin');
+                }
+                const event = { key: step.key === 'Space' ? ' ' : step.key,
+                    code: step.key, windowsVirtualKeyCode, modifiers: step.shift ? 8 : 0 };
+                await send('Input.dispatchKeyEvent', { ...event, type: 'keyDown',
+                    ...(step.key === 'Enter' ? {text: '\r'} : step.key === 'Space' ? {text: ' '} : {}) });
+                await send('Input.dispatchKeyEvent', { ...event, type: 'keyUp' });
                 continue;
             }
             await waitFor(async () => {
@@ -255,14 +274,39 @@ async function capture({ browser, appUrl, renderCase, checks, build }) {
                 observer.observe(element);
             });
             const criteria = ${JSON.stringify(checks)};
-            const [state, ...targets] = await Promise.all([visible(ready), ...criteria.map(rule =>
-                rule.visibility === 'hidden' ? null : visible(document.querySelector(rule.selector))
-            )]);
+            const assertions = ${JSON.stringify(interaction_assertions)};
+            async function observeAssertion(rule) {
+                const node = document.querySelector(rule.selector);
+                switch (rule.probe) {
+                    case 'visible': return { target: await visible(node) };
+                    case 'focused': return { actual: Boolean(node && document.activeElement === node) };
+                    case 'text': return { missing: !node, actual: node?.textContent.trim() ?? null };
+                    case 'attribute': return { missing: !node, actual: node?.getAttribute(rule.attribute) ?? null };
+                    default: throw new Error('Unknown interaction assertion');
+                }
+            }
+            const visualEvidence = ${Boolean(evidenceDirectory)};
+            const describe = node => node && ({
+                tag: node.localName, id: node.id, role: node.getAttribute('role'),
+                testId: node.getAttribute('data-testid'), name: node.getAttribute('name'),
+            });
+            const geometry = node => node && ({
+                bounds: node.getBoundingClientRect().toJSON(),
+                clientWidth: node.clientWidth, clientHeight: node.clientHeight,
+                scrollWidth: node.scrollWidth, scrollHeight: node.scrollHeight,
+            });
+            const [state, targets, probes] = await Promise.all([
+                visible(ready),
+                Promise.all(criteria.map(rule =>
+                    rule.visibility === 'hidden' ? null : visible(document.querySelector(rule.selector)))),
+                Promise.all(assertions.map(observeAssertion)),
+            ]);
             return {
                 url: location.href,
                 viewport: { width: innerWidth, height: innerHeight },
                 state,
                 targets,
+                probes,
                 actual: criteria.map(rule => {
                     const element = document.querySelector(rule.selector);
                     if (rule.visibility === 'hidden' && (!element || element.checkVisibility({
@@ -271,27 +315,87 @@ async function capture({ browser, appUrl, renderCase, checks, build }) {
                     return measure(rule);
                 }),
                 ...(identities ? { identities } : {}),
+                ...(visualEvidence ? {
+                    browserState: {
+                        activeControl: describe(document.activeElement),
+                        colorScheme: getComputedStyle(document.documentElement).colorScheme,
+                        prefersDark: matchMedia('(prefers-color-scheme: dark)').matches,
+                        expandedControls: [...document.querySelectorAll('[aria-expanded="true"], details[open]')]
+                            .filter(node => node.getClientRects().length > 0).map(describe),
+                    },
+                    geometry: {
+                        component: geometry(ready), page: geometry(document.documentElement),
+                        targets: criteria.map(rule => geometry(document.querySelector(rule.selector))),
+                    },
+                } : {}),
             };
         })()`);
-        const { state, targets, ...measurements } = observation;
+        const { state, targets, probes, ...measurements } = observation;
         if (observation.url !== url.href || observation.viewport.width !== width ||
             observation.viewport.height !== height || !state) {
             throw new Error('The browser did not show the approved route, viewport and visible state');
         }
         const screenshot = await captureScreenshot();
-        if (!state.visiblyUnobstructed &&
-            !await markerPaints(evaluate, screenshot, captureScreenshot, renderCase.ready_selector, state.rect)) {
+        async function showsMarker(selector, target) {
+            return Boolean(target && (target.visiblyUnobstructed ||
+                await markerPaints(evaluate, screenshot, captureScreenshot, selector, target.rect)));
+        }
+        if (!await showsMarker(renderCase.ready_selector, state)) {
             throw new Error('The browser did not show the approved visible state in the screenshot');
         }
         for (const [index, rule] of checks.entries()) {
             if (rule.visibility === 'hidden') continue;
-            const target = targets[index];
-            if (!target || (!target.visiblyUnobstructed &&
-                !await markerPaints(evaluate, screenshot, captureScreenshot, rule.selector, target.rect))) {
-                throw new Error('The browser did not show the approved visible measurement target: ' + rule.selector);
+            if (!await showsMarker(rule.selector, targets[index])) {
+                if (!evidenceDirectory) {
+                    throw new Error('The browser did not show the approved visible measurement target: ' + rule.selector);
+                }
+                measurements.actual[index] = null;
+            }
+        }
+        if (evidenceDirectory || interaction_assertions.length) {
+            measurements.interactionAssertions = [];
+            for (const [index, rule] of interaction_assertions.entries()) {
+                const probe = probes[index];
+                const actual = rule.probe === 'visible'
+                    ? await showsMarker(rule.selector, probe.target) : probe.actual;
+                const result = !probe.missing && actual === rule.expected ? 'pass' : 'fail';
+                measurements.interactionAssertions.push({ ...rule, actual, result });
             }
         }
         const buildEvidence = build && await checkBuild(send, responses, build, url);
+        if (evidenceDirectory) {
+            // Crop the visible portion from the full page so animation cannot change between images.
+            const { cssContentSize, cssLayoutViewport } = await send('Page.getLayoutMetrics');
+            const fullPage = {
+                x: 0, y: 0, width: Math.ceil(Math.max(width, cssContentSize.width)),
+                height: Math.ceil(Math.max(height, cssContentSize.height)), scale: 1,
+            };
+            const x = Math.max(0, Math.floor(state.rect.left + cssLayoutViewport.pageX));
+            const y = Math.max(0, Math.floor(state.rect.top + cssLayoutViewport.pageY));
+            const right = Math.min(fullPage.width, Math.ceil(state.rect.right + cssLayoutViewport.pageX));
+            const bottom = Math.min(fullPage.height, Math.ceil(state.rect.bottom + cssLayoutViewport.pageY));
+            const closeup = {x, y, width: right - x, height: bottom - y, scale: 1};
+            const { data } = await send('Page.captureScreenshot', {
+                format: 'png', clip: fullPage, captureBeyondViewport: true,
+            });
+            const full = join(evidenceDirectory, 'full.png');
+            const detail = join(evidenceDirectory, 'closeup.png');
+            await mkdir(evidenceDirectory); // An existing attempt must never be overwritten.
+            try {
+                await writeFile(full, Buffer.from(data, 'base64'));
+                await run(process.env.P2P_CAPTURE_PYTHON || 'python3', ['-c', `
+import sys
+from PIL import Image
+
+with Image.open(sys.argv[1]) as page:
+    page.crop(tuple(map(int, sys.argv[3:]))).save(sys.argv[2])
+`, full, detail, ...[x, y, right, bottom].map(String)], { timeout: 30000 });
+            } catch (error) {
+                await rm(evidenceDirectory, { recursive: true, force: true });
+                throw error;
+            }
+            return { ...measurements, buildEvidence, component: renderCase.ready_selector, closeup, full, detail };
+        }
         return { ...measurements, stateVisible: true, ...(build ? { buildEvidence } : {}), screenshot };
     } finally {
         socket?.close();
@@ -310,7 +414,11 @@ try {
     }
     let input = '';
     for await (const chunk of process.stdin) input += chunk;
-    console.log(JSON.stringify(await capture(JSON.parse(input))));
+    const args = process.argv.slice(2);
+    if (args.length && (args.length !== 2 || args[0] !== '--visual-evidence' || !args[1])) {
+        throw new Error('Usage: blueprint_browser.mjs [--visual-evidence NEW_DIRECTORY] < capture.json');
+    }
+    console.log(JSON.stringify(await capture(JSON.parse(input), args[1])));
 } catch (error) {
     console.error(error.message);
     process.exitCode = 1;

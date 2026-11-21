@@ -297,6 +297,46 @@ class BlueprintState:
             result.update({entry['path']:entry['sha256'], **entry.get('evidence_hashes', {})})
         return result
 
+    def protected_visual_decisions(self, records, scope=None):
+        """Project approved visual requirements from immutable A+ exchanges."""
+        by_id, by_property = {}, {}
+        for record in records:
+            affected = set(record.get('feature_ids', []) + record.get('requirement_ids', []))
+            if scope is not None and not affected & scope:
+                continue
+            for decision in record.get('protected_visual_decisions', []):
+                key = decision['decision_id']
+                target = (decision['component'], decision['property'])
+                previous = by_property.setdefault(target, decision['requirement'])
+                self.require(previous == decision['requirement'] and
+                             (key not in by_id or all(by_id[key][field] == val for field, val in decision.items())),
+                             f'Conflicting protected visual decisions for {target[0]} / {target[1]}; '
+                             'record an explicit user correction')
+                entry = by_id.setdefault(key, {**decision, 'exchange_ids': []})
+                entry['exchange_ids'].append(record['exchange_id'])
+        return [by_id[key] for key in sorted(by_id)]
+
+    def check_protected_visual_decisions(self, value):
+        decisions = value.get('protected_visual_decisions', [])
+        fields = {'decision_id', 'component', 'property', 'requirement', 'purpose', 'verification'}
+        self.require(isinstance(decisions, list) and all(
+            isinstance(item, dict) and item.keys() == fields and self.identifier(item['decision_id'])
+            and all(self.text(item[field]) for field in fields) for item in decisions),
+            'Protected visual decisions need an ID, component, property, requirement, purpose and verification')
+        ids = [item['decision_id'] for item in decisions]
+        self.require(len(ids) == len(set(ids)), 'Protected visual decision IDs must be unique per exchange')
+        if decisions:
+            self.require(value['status'] == 'decided'
+                         and value.get('record_type') in (None, 'decision', 'slice_detail')
+                         and (value.get('feature_ids') or value.get('requirement_ids')),
+                         'Protected visual decisions require an explicit user decision with affected scope')
+            self.protected_visual_decisions([value])
+        if value.get('supersedes'):
+            previous = self.load('conversation', value['supersedes'])
+            prior_ids = {item['decision_id'] for item in previous.get('protected_visual_decisions', [])}
+            self.require(prior_ids <= set(ids),
+                         'A correction must explicitly carry forward or revise each protected visual decision')
+
     def conversation_record(self, value, *, transition=None):
         key = value.get('exchange_id')
         self.require(self.identifier(key), 'Stable exchange_id is required')
@@ -384,6 +424,7 @@ class BlueprintState:
             self.require(isinstance(change, dict) and change.get('baseline_id') in
                          value.get('feature_ids', []) + value.get('requirement_ids', [])
                          and change.get('classification') in {'MODIFY','REMOVE'}, 'Authorization exceeds exchange scope')
+        self.check_protected_visual_decisions(value)
         paths = value.get('illustration_paths', []) + value.get('evidence_paths', [])
         hashes = self.hashes(paths) if paths else {}
         sources = {p:self.api.digest_of(self.api.project_source_file(self.directory.parents[2], p))
@@ -552,12 +593,17 @@ class BlueprintState:
     def check_browser_setup(self, setup):
         self.require(isinstance(setup, list), 'Browser setup must be a list of actions')
         for step in setup:
-            self.require(isinstance(step, dict) and step.get('action') in {'navigate', 'wait', 'click', 'fill'},
-                         'Browser setup actions must be navigate, wait, click or fill')
+            self.require(isinstance(step, dict) and step.get('action') in ('navigate', 'wait', 'click', 'fill', 'press'),
+                         'Browser setup actions must be navigate, wait, click, fill or press')
             if step['action'] == 'navigate':
                 route = step.get('route')
                 self.require(isinstance(route, str) and route.startswith('/') and not route.startswith('//'),
                              'Browser setup navigation needs a local app route')
+            elif step['action'] == 'press':
+                self.require(step.get('key') in ('Tab', 'Enter', 'Escape', 'Space', 'End', 'Home',
+                                                'ArrowLeft', 'ArrowUp', 'ArrowRight', 'ArrowDown')
+                             and type(step.get('shift', False)) is bool,
+                             'Browser press requires a supported key and an optional boolean shift modifier')
             else:
                 self.require(self.text(step.get('selector')), 'Browser setup action needs a selector')
             if step['action'] == 'fill':
@@ -1052,6 +1098,9 @@ class BlueprintState:
                                  for k in ('width','height')), 'Concrete render viewport dimensions required')
                     self.argv(case.get('command'))
                     self.check_browser_setup(case.get('setup', []))
+                    if 'interaction_assertions' in case:
+                        self.api.sibling_module('visual_integrity').check_interaction_assertions(
+                            case['interaction_assertions'])
                     if 'role' in case or 'observations' in case:
                         self.require(self.text(case.get('role')), 'Browser identity observations require a role')
                         self.check_browser_observations(case.get('observations'))
@@ -1099,6 +1148,26 @@ class BlueprintState:
             self.require(ready, 'Unknown or circular blueprint feature prerequisite')
             unresolved -= ready
         self.require_applicable_decisions(value)
+        keys = set(value['decision_ids']) | {key for feature in features for key in feature['decision_ids']}
+        records = [self.load('conversation', key) for key in sorted(keys)]
+        protections = self.protected_visual_decisions(records)
+        inherited = set()
+        for feature in features:
+            if feature.get('visual_contract'):
+                scope = set(feature['baseline_ids']) | {feature['feature_id']}
+                applicable = self.protected_visual_decisions(records, scope)
+                inherited.update(item['decision_id'] for item in applicable)
+                if applicable:
+                    feature['protected_visual_decisions'] = applicable
+                else:
+                    feature.pop('protected_visual_decisions', None)
+            else:
+                self.require(not feature.get('protected_visual_decisions'),
+                             'Protected visual decisions apply only to UI features')
+        self.require(inherited == {item['decision_id'] for item in protections},
+                     'Map each protected visual decision to an affected UI feature')
+        if any(feature.get('visual_contract') for feature in features):
+            value['visual_qa_version'] = 1
         self.require(value.get('version') not in self.manifest.get('blueprints', {}),
                      'Immutable record already exists; use a new version')
         hashes.update(self.blueprint_documents(value, baseline, create=True))
@@ -1199,6 +1268,10 @@ class BlueprintState:
                              and set(report['suspected_features']) <= latest_features,
                              f'Missing report {report_id} needs full follow-up discovery and complete coverage')
         self.require(not self.check_records(), 'Blueprint record history is inconsistent')
+        if self.api.has_living_review(self.directory) or value.get('visual_review'):
+            viewer = self.api.sibling_module('living_review')
+            self.require(viewer.checkpoint(self.directory, self.manifest) == value.get('visual_review', {}),
+                         'Confirm the displayed blueprint visual_review hashes')
         return {**value, 'baseline_id':audit_id, 'artifact_hashes':hashes, 'visual_cases':[],
                 'presentation_evidence_hashes':presentation_hashes,
                 'workspace_snapshot': self.workspace_snapshot(),
@@ -1224,6 +1297,8 @@ class BlueprintState:
             self.require(self.approval_matches_audit(approval, active_audit),
                 'Stale baseline audit; approve a blueprint against the current audit')
             self.require_applicable_decisions(spec)
+            if approval.get('visual_review') or self.api.has_living_review(self.directory):
+                self.api.sibling_module('living_review').checkpoint(self.directory, self.manifest, receipt=approval)
             self.check_hashes(approval['artifact_hashes'])
             expected = self.bound_hashes('blueprint_coverage', approval['approved_version'])
             if 'presentation_evidence_hashes' in approval:
@@ -1319,11 +1394,14 @@ class BlueprintState:
         self.check_placeholders({field: candidate[field] for field in ('test_plan', 'prohibited_deviations')},
                                 f'slice {key}')
         baseline = self.baseline(approval['baseline_id'], current=False)
+        decision_ids = set(spec['decision_ids']) | {d for feature in selected for d in feature['decision_ids']}
+        decision_ids.update(d for feature in selected for protection in feature.get('protected_visual_decisions', [])
+                            for d in protection.get('exchange_ids', []))
         return {**candidate, 'approval_id':approval_id, 'approval_mode':'blueprint',
             'surface_contract_version':spec.get('surface_contract_version'),
+            **({'visual_qa_version': spec['visual_qa_version']} if 'visual_qa_version' in spec else {}),
             'approved_artifact_hashes':approval['artifact_hashes'], 'feature_contracts':selected,
-            'decision_records':[self.load('conversation', d) for d in sorted(set(
-                spec['decision_ids'] + [d for f in selected for d in f['decision_ids']]))],
+            'decision_records':[self.load('conversation', d) for d in sorted(decision_ids)],
             'baseline_contract':baseline, 'acceptance_checks':sorted(checks)}
 
     def create_slice(self, candidate):
@@ -1339,6 +1417,10 @@ class BlueprintState:
         self.check_baseline_before_delivery()
         packet = self.slice_packet(candidate)
         paths, deps = packet['allowed_paths'], packet['dependencies']
+        for dependency_id in deps:
+            dependency = self.manifest['slices'][dependency_id]
+            if dependency.get('status') == 'accepted' and dependency.get('visual_integrity_required'):
+                self.api.require_visual_integrity(self.directory, self.manifest, dependency_id)
         waiting = [dep for dep in deps if self.manifest['slices'][dep]['status'] != 'accepted']
         packet.update(status='blocked' if waiting else 'ready',
                       blockers=[f'Waiting for accepted dependency: {dep}' for dep in waiting])
@@ -1398,8 +1480,10 @@ class BlueprintState:
         self.require(app_url and browser and shutil.which('node'),
                      'Browser verification requires P2P_APP_URL, Chromium and Node.js 22 or later')
         driver = Path(__file__).with_name('blueprint_browser.mjs')
+        assertions = render_case.get('interaction_assertions', [])
         payload = {'browser': browser, 'appUrl': app_url, 'renderCase': render_case,
-                   'checks': [check['measurement'] for check in checks], 'build': build}
+                   'checks': [check['measurement'] for check in checks], 'build': build,
+                   'interaction_assertions': assertions}
         result = subprocess.run(['node', str(driver)], input=json.dumps(payload), cwd=self.directory.parents[2],
                                 text=True, capture_output=True, timeout=100, check=False)
         self.require(result.returncode == 0, 'Browser verification failed: ' + result.stderr.strip())
@@ -1409,6 +1493,16 @@ class BlueprintState:
             self.check_capture_identity(render_case['observations'], observation)
         self.require(observation.get('actual') == [check['expected'] for check in checks],
                      'Browser measurements differ from the approved visual criteria')
+        outcomes = observation.get('interactionAssertions', [])
+        self.require(isinstance(outcomes, list) and len(outcomes) == len(assertions),
+                     'Browser did not return every approved interaction assertion')
+        for rule, outcome in zip(assertions, outcomes):
+            self.require(isinstance(outcome, dict) and
+                         {key: value for key, value in outcome.items() if key not in ('actual', 'result')} == rule,
+                         'Browser did not return the approved interaction assertion for ' + rule['selector'])
+            self.require(outcome.get('result') == 'pass' and outcome.get('actual') == rule['expected'],
+                         f"Browser interaction assertion failed for {rule['selector']} ({rule['probe']}): "
+                         f"expected {rule['expected']!r}, observed {outcome.get('actual')!r}")
         return observation, screenshot
 
     def implementation_hashes(self, packet, paths):
@@ -1788,6 +1882,8 @@ class BlueprintState:
             if assignment['status'] != 'accepted':
                 return False
             packet = self.api.read_json(self.api.artifact_file(self.directory,assignment['contract_file']))
+            if assignment.get('visual_integrity_required'):
+                self.api.require_visual_integrity(self.directory, self.manifest, packet['slice_id'])
             if packet.get('approval_id') != active:
                 continue
             self.require(self.api.digest_of(self.directory/assignment['contract_file']) == assignment['contract_sha256'],

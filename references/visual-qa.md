@@ -4,6 +4,8 @@ The approved-B pixel, replay and capture-warning gates below apply to **prototyp
 
 The approved prototype defines the visual truth; generic opinions about dashboards do not. Verification must be **visible**: run the actual app and capture the rendered UI for each contract case so the coordinator can inspect it side by side with the hash-locked prototype screenshot. Source code and a green build are not visual proof.
 
+The post-implementation [Visual Integrity Gate](visual-integrity.md) applies to every prototype slice and to blueprint slices whose locked feature contract includes a UI or fullstack surface. Backend-only blueprint slices have no visual render cases and do not use this gate. Design and blueprint edits remain governed by their existing review and approval gates. Record real implementation defects and their repairs in the Visual Review Register. The capture-instability exception below has its own evidence and user-decision requirements.
+
 ## Before prototype approval: repeatable visual truth
 
 1. Create an **executable fixture loader**, not merely an exported JSON object. Include all UI-visible records and resources: deterministic timestamps/IDs, selected entities, permissions, locale, local storage/file blobs, active overlays, feature flags, network responses and clock **as relevant to the actual application**. Preserve original app A data separately; never let the prototype overwrite user storage.

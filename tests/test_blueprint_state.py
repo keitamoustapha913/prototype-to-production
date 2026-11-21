@@ -69,6 +69,32 @@ class BlueprintTests(unittest.TestCase):
         self.assertIn('/items component #items token gap has divergent values', conflicts)
         self.assertFalse(any('/settings token gap' in conflict for conflict in conflicts))
 
+    def test_protected_visual_decision_flows_from_exchange_to_reviewed_contract(self):
+        protection = {'decision_id': 'items-rounded', 'component': '/items trigger', 'property': 'shape',
+                      'requirement': 'Keep the rounded trigger.', 'purpose': 'Identify the primary action.',
+                      'verification': 'Inspect the trigger border radius.'}
+        self.start(review=True)
+        self.exchange(protected_visual_decisions=[protection])
+        self.record_baseline(self.baseline('ui'))
+        self.cli('plan-record', '--plan-file', self.payload('plan', self.plan()))
+        blueprint = self.blueprint(surface='ui')
+        self.cli('blueprint-record', '--blueprint-file', self.payload('blueprint', blueprint))
+        doc = self.directory / blueprint['features'][0]['spec_paths'][0]
+        self.assertIn('items-rounded', doc.read_text())
+        self.cli('blueprint-coverage', '--coverage-file', self.payload('coverage', self.coverage(surface='ui')))
+        self.cli('approve', '--approval-file', self.payload('approval', self.approval()))
+        candidate = self.guide_candidate(blueprint['features'][0], surfaces=('ui',))
+        result = self.review_cli('slice-plan', {'slices': [candidate]}, ok=False)
+        self.assertIn('Guide must cite protected visual decision items-rounded', result.stderr)
+        guide = self.directory / candidate['guide_path']
+        guide.write_text(guide.read_text().replace(
+            'Render the items list at', '`items-rounded` — Keep the rounded trigger. Render the items list at', 1))
+        self.review_cli('slice-plan', {'slices': [candidate]})
+        entry = self.manifest()['slice_review']['selected']['items-slice']
+        packet = json.loads((self.directory / entry['contract_path']).read_text())
+        self.assertEqual(packet['feature_contracts'][0]['protected_visual_decisions'],
+                         [{**protection, 'exchange_ids': ['choose-layout']}])
+
     def test_v3_dependency_requires_typed_declaration_and_rejects_implicit_provider_path(self):
         feature = self.reviewed_blueprint(multiple=True)
         provider = self.guide_candidate(feature)
@@ -380,6 +406,19 @@ class BlueprintTests(unittest.TestCase):
                           '--review-file', self.payload('review', review), ok=False)
         self.assertIn('src/outside.py', result.stderr)
 
+    def test_independent_render_rejects_failed_approved_interaction_assertions(self):
+        self.serve_items('<main id="ready">Items</main>')
+        self.directory.mkdir(parents=True)
+        state = FIXTURE_CLI.blueprint_state(self.directory, {})
+        case = {
+            'route': '/items', 'viewport': {'width': 800, 'height': 600},
+            'ready_selector': '#ready',
+            'interaction_assertions': [{'selector': '#missing', 'probe': 'visible', 'expected': True}],
+        }
+        with patch.dict(os.environ, self.env):
+            with self.assertRaisesRegex(FIXTURE_CLI.StateError, r'interaction assertion.*#missing'):
+                state.capture_render(case, [])
+
     def test_browser_verifies_approved_spacing_and_preserved_interaction(self):
         browser = shutil.which('google-chrome') or shutil.which('chromium')
         if not browser:
@@ -440,6 +479,7 @@ document.getElementById('observation').textContent = JSON.stringify({
             'case_id': 'success-case', 'route': '/items', 'state': 'success',
             'viewport': {'width': 800, 'height': 600},
             'ready_selector': '#detail:not([hidden])', 'command': [sys.executable, '-c', 'pass'],
+            'interaction_assertions': [{'selector': '#detail', 'probe': 'text', 'expected': 'Details'}],
         }]
         feature['acceptance_checks'] = [
             {'check_id': 'gap', 'kind': 'visual', 'expected': '16px', 'command': command('gap'),
@@ -478,12 +518,17 @@ document.getElementById('observation').textContent = JSON.stringify({
         review = {'slice_id': 'items-slice', 'reviewer': 'browser-reviewer', 'notes': 'Measured the actual browser output.',
                   'checks': checks, 'rendered_cases': [render], 'test_source_paths': ['tests/browser_probe.py'],
                   'specification_limits': 'Measured grid spacing and button interaction.'}
+        self.visual_integrity_attempt(review)
         self.cli('reconcile', '--slice-id', 'items-slice', '--action', 'verify',
                  '--review-file', self.payload('review', review))
         self.cli('reconcile', '--slice-id', 'items-slice', '--action', 'accept')
         self.cli('validate')
         self.assertEqual(self.manifest()['stage'], 'integrate')
         self.assertEqual(len(list(screenshot.parent.glob('verified-render-*.png'))), 1)
+        receipt = json.loads(next(screenshot.parent.glob('verified-render-*.json')).read_text())
+        self.assertEqual(receipt['browser']['interactionAssertions'], [
+            {'selector': '#detail', 'probe': 'text', 'expected': 'Details', 'actual': 'Details', 'result': 'pass'},
+        ])
 
     def test_new_mode_defaults_to_blueprint_and_cannot_be_changed(self):
         self.cli('init', '--scope', 'feature')
@@ -2530,7 +2575,7 @@ else:
 print(json.dumps(output))
 """)
 
-    def review(self, surface='backend'):
+    def review(self, surface='backend', record_integrity=True):
         expected='16px' if surface=='ui' else 'Member gets 200 array; nonmember gets 403'
         observation = {'check_id':'items-access','expected':expected,'actual':expected,'result':'PASS'}
         if surface != 'ui':
@@ -2558,7 +2603,63 @@ print(json.dumps(output))
                             'expected':'16px','actual':'16px','result':'PASS'}]})),
                     'tool':'fixture','command':self.test_command('render',state),
                                                          'ready_selector':f'#state-{state}'})
+            if record_integrity:
+                self.visual_integrity_attempt(review)
         return review
+
+    def visual_integrity_attempt(self, review, status='clean'):
+        packet = json.loads((self.directory / self.manifest()['slices']['items-slice']['contract_file']).read_text())
+        approved = [(feature['feature_id'], case)
+                    for feature in packet.get('feature_contracts', [])
+                    for case in feature.get('visual_contract', {}).get('render_cases', [])]
+        counts = {}
+        for _, case in approved:
+            counts[case['case_id']] = counts.get(case['case_id'], 0) + 1
+        cases = []
+        for feature_id, contract_case in approved:
+            case_id = (contract_case['case_id'] if counts[contract_case['case_id']] == 1
+                       else f"{feature_id}/{contract_case['case_id']}")
+            observed = next((item for item in review['rendered_cases']
+                             if item['state'] == contract_case['state']), review['rendered_cases'][0])
+            source = self.directory / observed['screenshot']
+            prefix = f"slices/items-slice/evidence/visual-integrity-{len(cases)}"
+            full = prefix + '-full.png'
+            closeup = prefix + '-closeup.png'
+            self.artifact(full, source.read_bytes())
+            from PIL import Image
+            with Image.open(source) as image:
+                image.crop((0, 0, 64, 32)).save(self.directory / closeup)
+            cases.append({
+                'case_id': case_id,
+                'viewport': contract_case['viewport'],
+                'state': {key: contract_case[key] for key in ('route', 'state', 'role', 'fixture', 'state_setup')
+                          if key in contract_case},
+                'full_screenshot': full,
+                'closeup_screenshot': closeup,
+                'closeup_bounds': {'x': 0, 'y': 0, 'width': 64, 'height': 32},
+            })
+        attempt = {
+            'status': status,
+            'observations': [
+                {'dimension': dimension, 'result': 'pass', 'note': note}
+                for dimension, note in (
+                    ('geometry', 'Compared rendered layout with the approved visual tokens.'),
+                    ('design', 'Compared typography and component treatment with the specification.'),
+                    ('interaction', 'Checked the documented UI state and controls.'),
+                    ('responsive', 'Checked the approved render viewport.'),
+                )
+            ],
+            'findings': [], 'rechecked_findings': [], 'cases': cases,
+        }
+        from fixtures.visual_capture import capture_fixture_case, coverage_row
+        for case in cases:
+            capture_fixture_case(self.directory, "items-slice", case)
+        check_ids = {check["check_id"] for feature in packet["feature_contracts"]
+                     if feature.get("visual_contract") for check in feature["acceptance_checks"]
+                     if check["kind"] in ("behavior", "visual")}
+        attempt["coverage"] = [coverage_row(case, sorted(check_ids)) for case in cases]
+        self.cli('visual-integrity', '--action', 'record', '--slice-id', 'items-slice',
+                 '--attempt-file', self.payload('visual-integrity', attempt))
 
     def test_backend_slice_accepts_without_screenshot_and_carries_exact_spec(self):
         self.assigned()
@@ -2573,11 +2674,22 @@ print(json.dumps(output))
         self.cli('reconcile','--slice-id','items-slice','--action','verify','--review-file',self.payload('review',self.review()))
         self.cli('reconcile','--slice-id','items-slice','--action','accept')
         self.assertEqual(self.manifest()['slices']['items-slice']['status'],'accepted')
+        self.assertNotIn('visual_integrity_required', self.manifest()['slices']['items-slice'])
         resumed = json.loads(self.cli('resume', '--format', 'json').stdout)
         self.assertEqual(resumed['active_work']['phase'], 'integrate')
         self.assertEqual(resumed['active_work']['next_action'], resumed['next_action'])
         self.assertEqual(resumed['active_work']['pending_steps'], cursor['pending_steps'])
         self.cli('validate')
+
+    def test_blueprint_ui_slice_requires_post_implementation_visual_integrity(self):
+        self.assigned('ui')
+        review = self.review('ui', record_integrity=False)
+
+        blocked = self.cli('reconcile', '--slice-id', 'items-slice', '--action', 'verify',
+                           '--review-file', self.payload('review', review), ok=False)
+
+        self.assertIn('visual integrity', blocked.stderr.lower())
+        self.assertEqual(self.manifest()['slices']['items-slice']['status'], 'blocked')
 
     def test_approval_and_slice_reject_missing_test_runner(self):
         self.prepared()
@@ -2744,6 +2856,41 @@ print(json.dumps(output))
         receipt.write_text('{}')
         self.assertIn('sha256', self.cli('validate', ok=False).stderr)
 
+    def test_reapproval_preserves_and_validates_archived_ui_inspection(self):
+        self.serve_fixture_states()
+        self.assigned('ui')
+        review = self.review('ui')
+        first = json.loads(self.cli('visual-integrity', '--slice-id', 'items-slice',
+                                     '--action', 'verify').stdout)
+        self.visual_integrity_attempt(review)
+        self.cli('reconcile', '--slice-id', 'items-slice', '--action', 'verify',
+                 '--review-file', self.payload('review', review))
+        self.cli('reconcile', '--slice-id', 'items-slice', '--action', 'accept')
+        attempt = json.loads(self.cli('visual-integrity', '--slice-id', 'items-slice',
+                                      '--action', 'verify').stdout)
+        archived_image = self.directory / attempt['cases'][0]['closeup_screenshot']
+
+        self.cli('blueprint-record', '--blueprint-file',
+                 self.payload('spec', self.blueprint('spec-v2', surface='ui')))
+        self.cli('blueprint-coverage', '--coverage-file',
+                 self.payload('coverage', self.coverage('spec-v2', surface='ui')))
+        self.cli('approve', '--approval-file', self.payload('approval', self.approval('spec-v2')))
+
+        self.cli('validate')
+        replacement = dict(self.slice(), slice_id='items-slice-v2', blueprint_version='spec-v2')
+        replacement['functional_tests'].append('items-behavior')
+        self.cli('slice-create', '--contract-file', self.payload('replacement', replacement))
+        self.cli('validate')
+        manifest_path = self.directory / 'manifest.json'
+        original_manifest = manifest_path.read_bytes()
+        damaged = self.manifest()
+        del damaged['slices']['items-slice']['visual_captures'][first['cases'][0]['capture_id']]
+        manifest_path.write_text(json.dumps(damaged))
+        self.assertIn('matching browser capture', self.cli('validate', ok=False).stderr)
+        manifest_path.write_bytes(original_manifest)
+        archived_image.write_bytes(b'altered image')
+        self.assertIn('Missing or altered visual evidence', self.cli('validate', ok=False).stderr)
+
     def test_conflicting_handwritten_feature_markdown_cannot_be_frozen(self):
         self.start()
         self.exchange()
@@ -2853,6 +3000,7 @@ print(json.dumps(output))
         self.cli('reconcile', '--slice-id', 'items-slice', '--action', 'unblock',
                  '--review-file', self.payload('resolution', resolution))
         self.cli('reconcile', '--slice-id', 'items-slice', '--action', 'report')
+        self.visual_integrity_attempt(review)
         self.cli('reconcile', '--slice-id', 'items-slice', '--action', 'verify',
                  '--review-file', self.payload('review', review))
         self.cli('reconcile', '--slice-id', 'items-slice', '--action', 'accept')

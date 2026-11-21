@@ -1,5 +1,7 @@
 # Conversational slice review
 
+Use the [living review viewer](living-review.md) for automatic, focused before-and-after comparisons while discussing blueprint and slice corrections.
+
 Use this workflow after the user approves an exact blueprint in a new blueprint-first initiative. The source of truth is the recorded current user decision and amendment, then the active approved blueprint and its coverage, then the locked package, then the guide and contract, then delivery evidence. Escalate conflicts to the user and preserve the old records.
 
 ## Draft the complete inventory
@@ -79,3 +81,8 @@ Transfer the entire ignored initiative directory, application source and relativ
 Prior blueprint initiatives can continue to use their legacy assignments. Offer `slice-review-migrate` when they are ready to adopt these gates. Require `approved_by_user: true` and the verbatim `user_response`. Migration preserves all recorded history. For existing active assignments, reconcile their source and receipts and obtain a new blueprint approval before planning the reviewed inventory. Full-prototype initiatives continue to use runnable-B parity, screenshot and replay gates.
 
 For saved slice-review packages created before scoped consent was introduced, reopen the applicable slices and record consent for a fresh reviewed package. Preserve old guide bytes, package locks and receipts as history.
+
+
+## Protect approved visual and interaction details
+
+Review the inherited protected decisions with the slice's component anatomy, responsive states and interactions. Record a newly confirmed, slice-local exception with `protected_visual_decisions` on the decided A+ `slice_detail` exchange. Include its ID and exact requirement in the guide and show it in the next review. A decision that revises an approved property or applies to other slices goes through a blueprint amendment. Update the affected guides and revalidate their approval and dependency contracts.

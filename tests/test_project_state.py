@@ -267,13 +267,15 @@ class ProjectStateTests(unittest.TestCase):
                  "--report-file", self.write_input("report.json", report))
         self.cli("reconcile", "--slice-id", "invoice-list", "--action", "report")
 
-    def review(self, approval, screenshot=True, tool="playwright", result="PASS"):
+    def review(self, approval, screenshot=True, tool="playwright", result="PASS", record_integrity=True):
         if screenshot:
             self.artifact("slices/invoice-list/evidence/implemented.png", png(color=(245, 247, 252)))
         self.artifact("slices/invoice-list/evidence/functional.log", b"PASS search/filter/detail")
         code = self.root / "src/features/invoices/table.tsx"
         code.parent.mkdir(parents=True, exist_ok=True)
         code.write_text("export const InvoiceTable = () => null;", encoding="utf-8")
+        if record_integrity:
+            self.visual_integrity_attempt(approval)
         relative_ref = approval["visual_cases"][0]["reference_file"]
         digest = hashlib.sha256((self.initiative / relative_ref).read_bytes()).hexdigest()
         return {
@@ -291,6 +293,59 @@ class ProjectStateTests(unittest.TestCase):
                 "covers": ["Search, filter, and invoice detail navigation work"],
             }],
         }
+
+    def visual_integrity_attempt(self, approval, status="clean", dimension="geometry"):
+        """Record the separate post-implementation QA evidence used by gate tests."""
+        cases = []
+        for case in approval["visual_cases"]:
+            latest = png(case["viewport"]["width"], case["viewport"]["height"])
+            prefix = f"slices/invoice-list/evidence/visual-integrity-{case['case_id']}"
+            full_path = f"{prefix}-full.png"
+            closeup_path = f"{prefix}-closeup.png"
+            self.artifact(full_path, latest)
+            self.artifact(closeup_path, png(64, 32))
+            case_record = {
+                "case_id": case["case_id"], "viewport": case["viewport"],
+                "state": {"route": case["route"], "fixture": case["fixture"],
+                          "state_setup": case["state_setup"]},
+                "full_screenshot": full_path, "closeup_screenshot": closeup_path,
+                "closeup_bounds": {"x": 0, "y": 0, "width": 64, "height": 32},
+            }
+            if status == "unresolved":
+                case_record["comparisons"] = [{
+                    "before": closeup_path, "latest": closeup_path,
+                    "finding_id": "geometry-mismatch", "severity": "major",
+                    "normalized_rect": {"x": 0.1, "y": 0.1, "width": 0.8, "height": 0.8},
+                }]
+            from fixtures.visual_capture import capture_fixture_case, coverage_row
+            capture_fixture_case(self.initiative, "invoice-list", case_record)
+            cases.append(case_record)
+        observations = [
+            {"dimension": dimension, "result": "pass", "note": note}
+            for dimension, note in (
+                ("geometry", "Compared layout bounds and spacing."),
+                ("design", "Compared typography, color, and component treatment."),
+                ("interaction", "Checked the documented visible state."),
+                ("responsive", "Checked the approved viewport."),
+            )
+        ]
+        findings = []
+        if status == "unresolved":
+            next(item for item in observations if item["dimension"] == dimension)["result"] = "fail"
+            findings = [{"finding_id": "geometry-mismatch", "case_id": cases[0]["case_id"],
+                         "dimension": dimension, "status": "open", "severity": "major",
+                         "description": "The content column is wider than the approved layout.",
+                         "classification": "confirmed_defect", "classification_reason": "Measured layout deviation",
+                         "evidence": "Column width exceeds the approved value", "protected_decision_ids": [],
+                         "repair_scope": "Spacing inside the owned component"}]
+        attempt = {
+            "status": status,
+            "observations": observations,
+            "findings": findings, "rechecked_findings": [], "cases": cases,
+            "coverage": [coverage_row(case) for case in cases],
+        }
+        self.cli("visual-integrity", "--action", "record", "--slice-id", "invoice-list",
+                 "--attempt-file", self.write_input("visual-integrity.json", attempt))
 
     def warning_review(self, approval):
         """An independently reviewed capture-only mismatch, not a visual PASS."""
@@ -1144,10 +1199,236 @@ class ProjectStateTests(unittest.TestCase):
         self.cli("reconcile", "--slice-id", "invoice-list", "--action", "accept")
         self.assertEqual(self.manifest()["slices"]["invoice-list"]["status"], "accepted")
         self.cli("validate")
+        attempts = json.loads(self.cli("visual-integrity", "--action", "list",
+                                       "--slice-id", "invoice-list").stdout)
+        image = self.initiative / attempts[-1]["cases"][0]["full_screenshot"]
+        original_image = image.read_bytes()
+        image.write_bytes(b"tampered finalization image")
+        integrity_failure = self.cli("validate", success=False)
+        self.assertIn("visual integrity", integrity_failure.stderr.lower())
+        image.write_bytes(original_image)
+        self.cli("validate")
         (self.root / "src/features/invoices/table.tsx").write_text("changed after review", encoding="utf-8")
         rejected = self.cli("validate", success=False)
         self.assertNotEqual(rejected.returncode, 0)
         self.assertIn("sha256", rejected.stderr.lower())
+
+    def test_post_implementation_visual_integrity_is_required_before_slice_verification(self):
+        self.init()
+        approval = self.approval()
+        self.approve(approval)
+        self.slice_create(self.slice_packet(approval))
+        self.submit_slice()
+        review = self.review(approval, record_integrity=False)
+
+        rejected = self.cli("reconcile", "--slice-id", "invoice-list", "--action", "verify",
+                            "--review-file", self.write_input("review.json", review), success=False)
+
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("visual integrity", rejected.stderr.lower())
+        self.assertEqual(self.manifest()["slices"]["invoice-list"]["status"], "blocked")
+
+    def test_unresolved_visual_integrity_blocks_only_the_slice_and_its_dependents(self):
+        self.init()
+        approval = self.approval()
+        self.approve(approval)
+        self.slice_create(self.slice_packet(approval))
+        dependent = self.slice_packet(approval, slice_id="invoice-export", paths=["src/features/export/**"])
+        dependent["dependencies"] = ["invoice-list"]
+        self.slice_create(dependent)
+        independent = self.slice_packet(approval, slice_id="invoice-history", paths=["src/features/history/**"])
+        self.slice_create(independent)
+        self.submit_slice()
+        review = self.review(approval)
+        self.visual_integrity_attempt(approval, status="unresolved")
+        rejected = self.cli("reconcile", "--slice-id", "invoice-list", "--action", "unblock", "--review-file",
+                            self.write_input("resolution.json", {"slice_id": "invoice-list",
+                                "resolution": "Ready to try again", "next_action": "Recheck"}), success=False)
+        self.assertIn("Visual integrity is unresolved", rejected.stderr)
+
+        rejected = self.cli("reconcile", "--slice-id", "invoice-list", "--action", "verify",
+                            "--review-file", self.write_input("review.json", review), success=False)
+
+        self.assertIn("visual integrity", rejected.stderr.lower())
+        states = self.manifest()["slices"]
+        self.assertEqual(states["invoice-list"]["status"], "blocked")
+        self.assertEqual(states["invoice-export"]["status"], "blocked")
+        self.assertEqual(states["invoice-history"]["status"], "ready")
+
+    def test_visual_gate_rejects_false_repairs_then_verifies_marked_change(self):
+        from PIL import Image
+
+        self.init()
+        approval = self.approval()
+        self.approve(approval)
+        self.slice_create(self.slice_packet(approval))
+        self.submit_slice()
+        self.review(approval, record_integrity=False)
+        self.visual_integrity_attempt(approval, status="unresolved")
+        attempt = json.loads((self.root / "visual-integrity.json").read_text())
+        case = attempt["cases"][0]
+        finding = attempt["findings"][0]
+        pair = case["comparisons"][0]
+        args = ("visual-integrity", "--slice-id", "invoice-list")
+
+        def record(expected_error=None):
+            file = self.write_input("repair.json", attempt)
+            result = self.cli(*args, "--action", "record", "--attempt-file", file, success=expected_error is None)
+            if expected_error:
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(expected_error, result.stderr)
+                self.assertNotEqual(self.cli(*args, "--action", "verify", success=False).returncode, 0)
+
+        attempt["status"] = "corrected"
+        attempt["rechecked_findings"] = [finding["finding_id"]]
+        attempt["observations"][0]["result"] = "pass"
+        finding.update(status="fixed", dimension="interaction", correction="Adjusted the column width",
+                       verification="Rechecked the marked column at the approved viewport")
+        record("original finding dimension")
+        finding["dimension"] = "geometry"
+        original = self.initiative / case["full_screenshot"]
+        case["full_screenshot"] = str(Path(case["full_screenshot"]).with_name("rechecked-full.png"))
+        case["closeup_screenshot"] = str(Path(case["closeup_screenshot"]).with_name("rechecked-close.png"))
+        pair["latest"] = case["closeup_screenshot"]
+        with Image.open(original) as page:
+            page.putpixel((0, 0), (0, 0, 0))
+            page.save(self.initiative / case["full_screenshot"])
+            page.save(self.initiative / case["closeup_screenshot"])
+            record("component bounds")
+            page.crop((0, 0, 64, 32)).save(self.initiative / case["closeup_screenshot"])
+            record("marked regions")
+            # Move the control: only its new marked location changes.
+            case["closeup_bounds"]["x"] = 80
+            page.putpixel((112, 16), (0, 0, 0))
+            page.save(self.initiative / case["full_screenshot"])
+            page.crop((80, 0, 144, 32)).save(self.initiative / case["closeup_screenshot"])
+        from fixtures.visual_capture import capture_fixture_case
+        capture_fixture_case(self.initiative, "invoice-list", case)
+        record()
+        self.cli(*args, "--action", "verify")
+
+    def test_responsive_finding_requires_visible_correction_even_with_fresh_capture(self):
+        from fixtures.visual_capture import capture_fixture_case
+
+        self.init()
+        approval = self.approval()
+        self.approve(approval)
+        self.slice_create(self.slice_packet(approval))
+        self.submit_slice()
+        self.review(approval, record_integrity=False)
+        self.visual_integrity_attempt(approval, status="unresolved", dimension="responsive")
+        attempt = json.loads((self.root / "visual-integrity.json").read_text())
+        attempt.update(status="corrected", rechecked_findings=["geometry-mismatch"])
+        attempt["findings"][0].update(status="fixed", correction="Widened the menu", verification="Rechecked clipping")
+        for item in attempt["observations"]:
+            item["result"] = "pass"
+        capture_fixture_case(self.initiative, "invoice-list", attempt["cases"][0])
+        result = self.cli("visual-integrity", "--action", "record", "--slice-id", "invoice-list",
+                          "--attempt-file", self.write_input("repair.json", attempt), success=False)
+        self.assertIn("identical image pixels in the marked regions", result.stderr)
+        self.assertEqual(self.manifest()["slices"]["invoice-list"]["status"], "blocked")
+
+    def test_capture_receipt_and_incomplete_history_through_cli(self):
+        from functools import partial
+        from http.server import ThreadingHTTPServer
+        import shutil
+        from threading import Thread
+        from fixtures.blueprint_browser_probe import ItemsHandler
+
+        browser = shutil.which("google-chrome") or shutil.which("chromium")
+        if not browser:
+            self.skipTest("Chromium is unavailable")
+        self.init()
+        approval = self.approval()
+        self.approve(approval)
+        self.slice_create(self.slice_packet(approval))
+        self.submit_slice()
+        self.review(approval, record_integrity=False)
+        self.visual_integrity_attempt(approval)
+        attempt = json.loads((self.root / "visual-integrity.json").read_text())
+        case = attempt["cases"][0]
+        args = ("visual-integrity", "--slice-id", "invoice-list")
+        case.pop("capture_id")
+        rejected = self.cli(*args, "--action", "record", "--attempt-file",
+                            self.write_input("generated.json", attempt), success=False)
+        self.assertIn("matching browser capture", rejected.stderr)
+        (self.root / "invoices.html").write_text(
+            "<details><summary>Open menu</summary><p>Classic</p></details>")
+
+        class MenuHandler(ItemsHandler):
+            def do_GET(self):
+                if self.path == "/invoices":
+                    self.path = "/invoices.html"
+                super().do_GET()
+
+        with ThreadingHTTPServer(("127.0.0.1", 0), partial(MenuHandler, directory=self.root)) as server:
+            Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                request = {"case_id": case["case_id"], "state": case["state"], "browser": browser,
+                           "appUrl": f"http://127.0.0.1:{server.server_port}",
+                           "interaction_assertions": [{"selector": "details[open] p", "probe": "text", "expected": "Classic"}],
+                           "renderCase": {"route": "/invoices", "viewport": case["viewport"],
+                                          "ready_selector": "details[open]",
+                                          "setup": [{"action": "click", "selector": "summary"}]}}
+                source = self.write_input("capture-request.json", request)
+                captured = json.loads(self.cli(*args, "--action", "capture", "--capture-file", source).stdout)
+            finally:
+                server.shutdown()
+        attempt["cases"] = [captured]
+        file = self.write_input("captured.json", attempt)
+        self.cli(*args, "--action", "record", "--attempt-file", file)
+        self.cli(*args, "--action", "verify")
+        self.assertIn("fresh browser capture", self.cli(*args, "--action", "record", "--attempt-file", file,
+                                                       success=False).stderr)
+        self.visual_integrity_attempt(approval, status="unresolved")
+        journal = self.initiative / "visual-integrity/invoice-list/attempts.jsonl"
+        journal.write_bytes(b"".join(journal.read_bytes().splitlines(keepends=True)[:-1]))
+        listed = self.cli(*args, "--action", "list", success=False)
+        self.assertNotEqual(listed.returncode, 0)
+        self.assertIn("incomplete visual history", listed.stderr)
+        self.assertEqual(len(json.loads(listed.stdout)), 2)
+        self.assertIn("head", self.cli(*args, "--action", "verify", success=False).stderr)
+        from urllib.request import urlopen
+        command = [sys.executable, str(SCRIPT), "review-viewer", "--project-root", str(self.root),
+                   "--initiative-id", "billing-refresh", "--port", "0"]
+        with subprocess.Popen(command, stdout=subprocess.PIPE, text=True, env=self.test_env) as viewer:
+            try:
+                address = viewer.stdout.readline().strip().split()[-1]
+                with urlopen(address + "visual-integrity", timeout=10) as response:
+                    register = json.load(response)
+                self.assertEqual(len(register["attempts"]), 2)
+                self.assertIn("incomplete visual history", register["project"]["history_warnings"][0])
+            finally:
+                viewer.terminate()
+
+
+    def test_tampered_visual_integrity_image_blocks_validate_and_dependent_dispatch(self):
+        self.init()
+        approval = self.approval()
+        self.approve(approval)
+        self.slice_create(self.slice_packet(approval))
+        dependent = self.slice_packet(approval, slice_id="invoice-export", paths=["src/features/export/**"])
+        dependent["dependencies"] = ["invoice-list"]
+        self.slice_create(dependent)
+        self.submit_slice()
+        review = self.review(approval)
+        self.cli("reconcile", "--slice-id", "invoice-list", "--action", "verify",
+                 "--review-file", self.write_input("review.json", review))
+        self.cli("reconcile", "--slice-id", "invoice-list", "--action", "accept")
+
+        attempts = json.loads(self.cli("visual-integrity", "--action", "list",
+                                       "--slice-id", "invoice-list").stdout)
+        image = self.initiative / attempts[-1]["cases"][0]["full_screenshot"]
+        resumed = json.loads(self.cli("resume", "--format", "json").stdout)
+        self.assertIn("invoice-export", resumed["dispatchable_slices"])
+        self.assertNotIn("invoice-list", resumed["dispatchable_slices"])
+        image.write_bytes(b"tampered visual evidence")
+
+        invalid = self.cli("validate", success=False)
+        resumed = json.loads(self.cli("resume", "--format", "json", success=False).stdout)
+
+        self.assertIn("visual integrity", invalid.stderr.lower())
+        self.assertNotIn("invoice-export", resumed["dispatchable_slices"])
 
     def test_self_review_or_failed_functional_check_blocks_acceptance(self):
         self.init()

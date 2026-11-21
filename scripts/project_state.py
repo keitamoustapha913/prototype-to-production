@@ -34,6 +34,9 @@ HIDDEN_ARTIFACT_ROOT = Path(".artifacts") / "prototype-to-production"
 LEGACY_ARTIFACT_ROOT = Path("design") / "redesigns"
 
 
+VISUAL_DEFECT_BLOCKER = "Unresolved visual defect in Visual Review Register"
+
+
 class StateError(Exception):
     """A stopped stage gate, never an implicit success."""
 
@@ -58,6 +61,46 @@ def blueprint_state(directory: Path, manifest: dict):
     return sibling_module("blueprint_state").BlueprintState(SimpleNamespace(**globals()), directory, manifest)
 
 
+def require_visual_integrity(directory: Path, manifest: dict, slice_id: str, *, historical: bool = False) -> None:
+    """Require a verified visual inspection for the current or superseded assignment."""
+    sibling_module("visual_integrity").require_verified(directory, manifest, slice_id, historical=historical)
+
+
+def slice_has_visual_scope(directory: Path, manifest: dict, slice_id: str) -> bool:
+    """Use the locked assignment to decide whether this slice changes a UI surface."""
+    if initiative_mode(manifest) == "prototype":
+        return True
+    assignment = manifest.get("slices", {}).get(slice_id, {})
+    packet = read_json(artifact_file(directory, assignment["contract_file"]))
+    features = packet.get("feature_contracts", [])
+    if not features:
+        return False
+    spec = blueprint_state(directory, manifest).load("blueprints", packet["blueprint_version"])
+    return any(feature.get("surface", spec.get("surface")) in {"ui", "fullstack"}
+               for feature in features)
+
+
+def require_visual_integrity_if_required(directory: Path, manifest: dict, slice_id: str) -> None:
+    assignment = manifest.get("slices", {}).get(slice_id, {})
+    required = assignment.get("visual_integrity_required")
+    if required is None and assignment.get("status") in {"verified", "provisional"}:
+        required = slice_has_visual_scope(directory, manifest, slice_id)
+    if required:
+        require_visual_integrity(directory, manifest, slice_id)
+
+
+def all_slices_accepted(directory: Path, manifest: dict) -> bool:
+    """Return whether every active slice is accepted and its required gates remain current."""
+    for slice_id, assignment in manifest.get("slices", {}).items():
+        if assignment.get("status") != "accepted":
+            return False
+        # Existing accepted records predate the gate. Keep their history intact; every
+        # slice verified by the current workflow records that the new gate applies.
+        if assignment.get("visual_integrity_required"):
+            require_visual_integrity(directory, manifest, slice_id)
+    return True
+
+
 REVIEW_COMMANDS = (
     "slice-plan", "slice-draft", "slice-guide-validate", "slice-review-record",
     "slice-register", "slice-collection-validate", "slice-package-lock",
@@ -68,6 +111,10 @@ REVIEW_READ_ONLY = {"slice-guide-validate", "slice-register", "slice-package-pre
 
 def slice_review_state(directory: Path, manifest: dict):
     return sibling_module("slice_review").SliceReview(blueprint_state(directory, manifest))
+
+
+def has_living_review(directory: Path) -> bool:
+    return (directory / "living-review/sections.json").exists() or (directory / ".living-review.sqlite3").is_file()
 
 
 def requires_slice_review(manifest: dict) -> bool:
@@ -1204,6 +1251,9 @@ def render_checkpoint(manifest: dict, *, resume_action: str | None = None) -> st
         if item.get("superseded_by"):
             status += f", superseded by {item['superseded_by']}"
         lines.append(f"- {slice_id}: {status} ({item.get('owner', 'unassigned')})")
+    if any(item.get("visual_integrity_head") for item in manifest.get("slices", {}).values()):
+        lines += ["", "## Visual Review Register", "",
+                  "Open the register with review-viewer or list saved inspections with visual-integrity --action list."]
     lines += ["", "## Functionality coverage", ""]
     lines.append(f"- Latest application-A audit: {manifest.get('active_discovery_id') or 'none'}")
     coverage_group = "blueprint_coverage" if mode == "blueprint" else "prototype_coverage"
@@ -1257,6 +1307,7 @@ def initialize(directory: Path, scope: str, next_action: str | None, mode: str |
         template.update({
             "initiative_mode": mode or "blueprint",
             "schema_version": 4,
+            "visual_qa_version": 1,
             "initiative_id": directory.name,
             "scope": scope,
             "stage": "discover",
@@ -1610,6 +1661,12 @@ def create_slice(directory: Path, contract_file: str) -> None:
         for dep in dependencies:
             if dep == slice_id or dep not in manifest.get("slices", {}):
                 errors.append(f"Unknown or circular slice dependency: {dep}")
+            elif (manifest["slices"][dep].get("status") == "accepted"
+                  and manifest["slices"][dep].get("visual_integrity_required")):
+                try:
+                    require_visual_integrity(directory, manifest, dep)
+                except (StateError, OSError, ValueError, KeyError, TypeError) as error:
+                    errors.append(f"Dependency {dep} visual integrity gate is not verified: {error}")
         if errors:
             raise StateError("Invalid slice handoff: " + "; ".join(errors))
         pending = [dep for dep in dependencies if manifest["slices"][dep]["status"] not in {"accepted", "provisional"}]
@@ -1691,7 +1748,8 @@ def record_worker_report(directory: Path, slice_id: str, owner: str, report_file
         raise StateError(f"Unknown slice: {slice_id}")
     if assigned.get("superseded_by"):
         raise StateError(f"Slice {slice_id} was superseded by {assigned['superseded_by']}")
-    if assigned.get("status") not in {"ready", "reported"}:
+    repairing_visual_defect = assigned.get("status") == "blocked" and assigned.get("blockers") == [VISUAL_DEFECT_BLOCKER]
+    if assigned.get("status") not in {"ready", "reported"} and not repairing_visual_defect:
         raise StateError(f"Slice {slice_id} is {assigned.get('status')}; not ready for worker reporting")
     report = read_json(Path(report_file))
     allowed = {
@@ -2401,6 +2459,12 @@ def check_initiative(directory: Path, manifest: dict, *, allow_questions: bool =
             errors.append(str(error))
         if assignment.get("status") in {"verified", "provisional", "accepted"}:
             errors.extend(check_saved_verification(directory, slice_id, assignment, manifest))
+            if assignment.get("visual_integrity_required"):
+                try:
+                    require_visual_integrity(directory, manifest, slice_id,
+                                             historical=bool(assignment.get("superseded_by")))
+                except (StateError, OSError, ValueError, KeyError, TypeError) as error:
+                    errors.append(f"Slice {slice_id}: visual integrity evidence is invalid: {error}")
         for path, saved_digest in assignment.get("block_evidence_hashes", {}).items():
             try:
                 if digest_of(artifact_file(directory, path)) != saved_digest:
@@ -2408,7 +2472,80 @@ def check_initiative(directory: Path, manifest: dict, *, allow_questions: bool =
             except (StateError, OSError) as error:
                 errors.append(str(error))
     errors.extend(check_warning_evidence(directory, manifest))
+    if manifest.get("stage") == "integrate" and initiative_mode(manifest) == "prototype":
+        try:
+            if not all_slices_accepted(directory, manifest):
+                errors.append("Integration lacks accepted slices with current visual integrity evidence")
+        except (StateError, OSError, ValueError, KeyError, TypeError) as error:
+            errors.append(f"Integration visual integrity is not verified: {error}")
     return errors
+
+
+def visual_inspection_assignment(directory, manifest, slice_id):
+    assignment = manifest["slices"].get(slice_id)
+    if (not assignment or assignment.get("superseded_by") or assignment["status"] == "cancelled"
+            or not manifest.get("active_approval_id")
+            or assignment.get("blueprint_version", assignment.get("prototype_version")) != manifest["approved_version"]
+            or not slice_has_visual_scope(directory, manifest, slice_id)):
+        raise StateError("Visual inspection requires an active UI implementation assignment")
+    if requires_slice_review(manifest) and slice_id not in active_review_release(manifest):
+        raise StateError("Visual inspection requires a released UI assignment")
+    return assignment
+
+
+def record_visual_inspection(directory, slice_id, payload):
+    """Publish the register entry and its delivery consequences as one recoverable change."""
+    visual = sibling_module("visual_integrity")
+    request = {"command": "visual-integrity record", "slice_id": slice_id, "input": payload}
+    with coordinator_lock(directory):
+        if recover_workflow_transition(directory, request):
+            return visual.list_attempts(directory, slice_id)[-1]
+        manifest = manifest_at(directory)
+        assignment = visual_inspection_assignment(directory, manifest, slice_id)
+        if isinstance(payload, dict) and "coverage" not in payload:
+            raise StateError("Record adaptive visual coverage for each new inspection")
+
+        def commit(record, path, records):
+            head = assignment.get("visual_integrity_head")
+            if head and (not records or records[-1]["record_hash"] != head):
+                raise StateError("Visual integrity register differs from its last saved receipt")
+            assignment["visual_integrity_head"] = record["record_hash"]
+            assignment["visual_integrity_required"] = True
+            events = [{"type": "visual_inspection_recorded", "slice_id": slice_id,
+                       "attempt_id": record["attempt_id"], "status": record["status"],
+                       "record_hash": record["record_hash"]}]
+            artifacts = {}
+            if record["status"] not in visual.VERIFIED_STATUSES:
+                assignment["status"] = "blocked"
+                if VISUAL_DEFECT_BLOCKER not in assignment["blockers"]:
+                    assignment["blockers"].append(VISUAL_DEFECT_BLOCKER)
+                block_dependents(directory, manifest, slice_id, staged=(events, artifacts))
+                if manifest["stage"] == "integrate":
+                    manifest["stage"] = "implement"
+                if manifest["stage"] != "slice_review":
+                    if record["status"] == "improved_not_verified":
+                        action = "Complete adaptive visual verification for"
+                    elif any(item.get("classification") == "approval_conflict" for item in record["findings"]):
+                        action = "Resolve the approval conflict for"
+                    else:
+                        action = "Repair"
+                    manifest["next_action"] = f"{action} {slice_id} and continue eligible independent slices"
+            elif VISUAL_DEFECT_BLOCKER in assignment["blockers"]:
+                assignment["blockers"].remove(VISUAL_DEFECT_BLOCKER)
+                if not assignment["blockers"]:
+                    report = read_json(directory / "slices" / slice_id / "worker-report.json")
+                    if report["status"] == "submitted":
+                        assignment["status"] = "reported"
+                        if manifest["stage"] != "slice_review":
+                            manifest["next_action"] = f"Independently verify the corrected implementation of {slice_id}"
+                    else:
+                        assignment["blockers"] = report.get("blockers") or ["Worker report still blocked"]
+            prior = path.read_bytes() if path.exists() else b""
+            save_workflow_state(directory, manifest, transition=(request, events, artifacts),
+                                binary_artifacts={path.relative_to(directory).as_posix():
+                                                  prior + journal_line(record).encode("utf-8")})
+
+        return visual.record_attempt(directory, manifest, slice_id, payload, commit=commit)
 
 
 def pending_supplemental_warnings(manifest: dict, slice_id: str) -> list[str]:
@@ -2449,14 +2586,18 @@ def block_dependents(directory: Path, manifest: dict, prerequisite_id: str,
         block_dependents(directory, manifest, dependent_id, staged=staged)
 
 
+def dependencies_satisfied(manifest, dependencies, *, reviewed):
+    allowed = {"accepted"} if reviewed else {"accepted", "provisional"}
+    return all(manifest["slices"].get(dep, {}).get("status") in allowed for dep in dependencies)
+
+
 def unblock_dependents(directory: Path, manifest: dict) -> None:
     """Release implementation dependencies, not final acceptance, after reviewed warnings."""
     for dependent_id, dependent in manifest["slices"].items():
         if dependent["status"] != "blocked" or not dependent["dependencies"] or dependent.get("superseded_by"):
             continue
         reviewed = bool(dependent.get("review_package_id"))
-        allowed = {"accepted"} if reviewed else {"accepted", "provisional"}
-        if any(manifest["slices"][dep]["status"] not in allowed for dep in dependent["dependencies"]):
+        if not dependencies_satisfied(manifest, dependent["dependencies"], reviewed=reviewed):
             continue
         if any(not str(blocker).startswith("Waiting for accepted dependency:") for blocker in dependent["blockers"]):
             continue
@@ -2503,6 +2644,8 @@ def reconcile_slice(directory: Path, slice_id: str, action: str, review_file: st
         if manifest["stage"] == "slice_review" and review_state and (
                 slice_id in review_state.registry.get("continuing_releases", {})):
             review_cursor = {field: manifest[field] for field in ("stage", "next_action")}
+        if action in {"unblock", "verify"} and VISUAL_DEFECT_BLOCKER in assignment.get("blockers", []):
+            raise StateError("Visual integrity is unresolved; record the corrected browser inspection first")
         if action == "block":
             if assignment["status"] == "cancelled" or not review_file:
                 raise StateError("Blocking an active slice requires --review-file with the defect and next action")
@@ -2520,7 +2663,10 @@ def reconcile_slice(directory: Path, slice_id: str, action: str, review_file: st
                 hashes[path] = digest_of(artifact_file(directory, path))
             assignment.setdefault("block_evidence_hashes", {}).update(hashes)
             assignment["status"] = "blocked"
+            open_visual_defect = VISUAL_DEFECT_BLOCKER in assignment.get("blockers", [])
             assignment["blockers"] = [blocker["reason"]]
+            if open_visual_defect and VISUAL_DEFECT_BLOCKER != blocker["reason"]:
+                assignment["blockers"].append(VISUAL_DEFECT_BLOCKER)
             _, events, artifacts = transition
             block_dependents(directory, manifest, slice_id, staged=(events, artifacts))
             manifest["stage"] = "implement"
@@ -2574,6 +2720,12 @@ def reconcile_slice(directory: Path, slice_id: str, action: str, review_file: st
                 raise StateError("Verification requires --review-file with independently inspected visual and functional evidence")
             review = read_json(Path(review_file))
             verified, failures = validate_verification(directory, slice_id, manifest, review)
+            if slice_has_visual_scope(directory, manifest, slice_id):
+                assignment["visual_integrity_required"] = True
+                try:
+                    require_visual_integrity(directory, manifest, slice_id)
+                except (StateError, OSError, ValueError, KeyError, TypeError) as error:
+                    failures.append(f"Visual integrity gate: {error}")
             if failures:
                 assignment["status"] = "blocked"
                 assignment["blockers"] = failures
@@ -2614,6 +2766,7 @@ def reconcile_slice(directory: Path, slice_id: str, action: str, review_file: st
         elif action == "accept":
             if assignment["status"] != "verified":
                 raise StateError("Slice must have PASS verification and independent reviewer before acceptance")
+            require_visual_integrity_if_required(directory, manifest, slice_id)
             pending = pending_supplemental_warnings(manifest, slice_id)
             if pending:
                 raise StateError("Review supplemental side-by-side capture warnings before acceptance: " + ", ".join(pending))
@@ -2624,11 +2777,12 @@ def reconcile_slice(directory: Path, slice_id: str, action: str, review_file: st
             assignment["blockers"] = []
             journal(directory, {"type": "slice_accepted", "slice_id": slice_id, "approved_version": manifest["approved_version"]})
             unblock_dependents(directory, manifest)
-            manifest["stage"] = "integrate" if (blueprint_state(directory, manifest).all_accepted() if initiative_mode(manifest) == "blueprint" else all(item["status"] == "accepted" for item in manifest["slices"].values())) else "implement"
+            manifest["stage"] = "integrate" if (blueprint_state(directory, manifest).all_accepted() if initiative_mode(manifest) == "blueprint" else all_slices_accepted(directory, manifest)) else "implement"
             manifest["next_action"] = "Review accepted slice integration and remaining dependencies; do not merge/deploy without user authorization"
         elif action == "accept-warning":
             if assignment["status"] != "provisional":
                 raise StateError("Only a provisional capture WARNING can receive explicit later user acceptance")
+            require_visual_integrity_if_required(directory, manifest, slice_id)
             pending = pending_supplemental_warnings(manifest, slice_id)
             if pending:
                 raise StateError("Resolve supplemental side-by-side warnings before slice acceptance: " + ", ".join(pending))
@@ -2651,7 +2805,7 @@ def reconcile_slice(directory: Path, slice_id: str, action: str, review_file: st
             journal(directory, {"type": "capture_warning_user_accepted", "slice_id": slice_id,
                                 "warning_case_ids": saved["warning_case_ids"], "decision": decision})
             unblock_dependents(directory, manifest)
-            manifest["stage"] = "integrate" if (blueprint_state(directory, manifest).all_accepted() if initiative_mode(manifest) == "blueprint" else all(item["status"] == "accepted" for item in manifest["slices"].values())) else "implement"
+            manifest["stage"] = "integrate" if (blueprint_state(directory, manifest).all_accepted() if initiative_mode(manifest) == "blueprint" else all_slices_accepted(directory, manifest)) else "implement"
             manifest["next_action"] = "Review accepted slice integration and remaining dependencies; do not merge/deploy without user authorization"
         else:
             raise StateError(f"Unknown reconciliation action: {action}")
@@ -2826,12 +2980,15 @@ def build_resume_packet(directory: Path, project_root: Path, *, delivery_slice: 
                         pending_questions and not independent_question):
                     continue
                 assignment = manifest["slices"][key]
-                if all(manifest["slices"].get(dep, {}).get("status") == "accepted"
-                       for dep in assignment["dependencies"]):
+                if dependencies_satisfied(manifest, assignment["dependencies"], reviewed=True):
                     dispatchable.append(key)
     work_ready_for_delivery = (not work or work.get("status") == "in_progress" or
                                (independent_review_wait and work.get("status") == "waiting_user"
                                 and work.get("pending_question_id") == review["pending_question_id"]))
+    if (not requires_slice_review(manifest) and not errors and not reconciliation and not blockers
+            and work_ready_for_delivery and not pending_questions):
+        dispatchable = [key for key, status in delivery.items() if status == "ready"
+                        and dependencies_satisfied(manifest, manifest["slices"][key]["dependencies"], reviewed=False)]
     return {
         "initiative_id": manifest["initiative_id"], "initiative_directory": str(directory),
         "scope": manifest["scope"], "phase": manifest["stage"],
@@ -2942,7 +3099,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     for name in (
-        "init", "artifact-setup", "event", "checkpoint", "conversation-record", "plan-record", "blueprint-record", "blueprint-coverage", "blueprint-index-rebuild", "work-update", "discovery-record", "discovery-capture", "browser-build-fingerprint", "missing-feature", "prototype-coverage", "approve", "revoke-approval", "slice-create", "slice-cancel",
+        "init", "artifact-setup", "review-viewer", "review-revision", "visual-integrity", "event", "checkpoint", "conversation-record", "plan-record", "blueprint-record", "blueprint-coverage", "blueprint-index-rebuild", "work-update", "discovery-record", "discovery-capture", "browser-build-fingerprint", "missing-feature", "prototype-coverage", "approve", "revoke-approval", "slice-create", "slice-cancel",
         "slice-report", "reconcile", "warning-record", "warning-decide", "resume", "validate", *REVIEW_COMMANDS,
     ):
         sub = commands.add_parser(name)
@@ -2950,6 +3107,13 @@ def main(argv: list[str] | None = None) -> int:
         sub.add_argument("--initiative-id", required=name not in {"resume", "validate"})
         if name in REVIEW_COMMANDS and name not in {"slice-register", "slice-package-preview"}:
             sub.add_argument("--input-file", required=name not in {"slice-collection-validate"})
+        if name == "review-viewer":
+            sub.add_argument("--port", type=int)
+        if name == "visual-integrity":
+            sub.add_argument("--action", choices=["capture", "record", "list", "verify"], required=True)
+            sub.add_argument("--slice-id")
+            sub.add_argument("--attempt-file")
+            sub.add_argument("--capture-file")
         if name == "browser-build-fingerprint":
             sub.add_argument("--source-path", action="append", default=[])
         if name == "init":
@@ -3016,6 +3180,40 @@ def main(argv: list[str] | None = None) -> int:
         ensure_local_git_ignore(project_root, directory, configure=explicit_setup or not review_workflow)
         if args.command == "init":
             initialize(directory, args.scope, args.next_action, args.mode)
+        elif args.command in {"review-viewer", "review-revision"}:
+            viewer = sibling_module("living_review")
+            if args.command == "review-viewer":
+                viewer.serve(directory, args.port)
+            else:
+                with viewer.History(directory) as history:
+                    state = history.sync(viewer.Documents(directory))
+                print(json.dumps(state, indent=2))
+        elif args.command == "visual-integrity":
+            visual = sibling_module("visual_integrity")
+            if args.action == "capture":
+                if not args.slice_id or not args.capture_file:
+                    raise StateError("visual-integrity capture requires --slice-id and --capture-file")
+                try:
+                    captured = visual.capture_case(directory, args.slice_id, read_json(Path(args.capture_file)))
+                except visual.project_state.StateError as error:
+                    raise StateError(str(error)) from error
+                print(json.dumps(captured, indent=2))
+            elif args.action == "record":
+                if not args.slice_id or not args.attempt_file:
+                    raise StateError("visual-integrity record requires --slice-id and --attempt-file")
+                attempt = read_json(Path(args.attempt_file))
+                print(json.dumps(record_visual_inspection(directory, args.slice_id, attempt), indent=2))
+            elif args.action == "list":
+                warnings = []
+                with coordinator_lock(directory):
+                    attempts = visual.list_attempts(directory, args.slice_id, manifest=manifest_at(directory), warnings=warnings)
+                print(json.dumps(attempts, indent=2))
+                if warnings:
+                    raise StateError("; ".join(warnings))
+            else:
+                if not args.slice_id:
+                    raise StateError("visual-integrity verify requires --slice-id")
+                print(json.dumps(visual.require_verified(directory, manifest_at(directory), args.slice_id), indent=2))
         elif args.command == "artifact-setup":
             print(f"Artifact setup complete for {directory}")
         elif args.command in REVIEW_COMMANDS:

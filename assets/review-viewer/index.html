@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Blueprint review</title>
+  <link rel="stylesheet" href="/viewer.css">
+  <script defer src="/markdown.js"></script>
+  <script defer src="/sanitize.js"></script>
+  <script defer src="/comparisons.js"></script>
+  <script defer src="/viewer.js"></script>
+</head>
+<body>
+  <header>
+    <strong>Blueprint review</strong>
+    <span id="revision"></span>
+    <button id="register-toggle" type="button" aria-expanded="false">Visual Review Register</button>
+  </header>
+  <div id="layout">
+    <nav aria-label="Review sections"></nav>
+    <main>
+      <p id="error" role="alert"></p>
+      <section id="visual-register" aria-labelledby="register-title" hidden>
+        <h1 id="register-title">Visual Review Register</h1>
+        <p id="register-counts" aria-live="polite"></p>
+        <div id="register-project-status"></div>
+        <p class="register-note">This register preserves observations and evidence. Optional review is a handoff only; it does not record user approval.</p>
+        <div id="register-filters">
+          <label>Slice <select id="register-slice"><option value="">All slices</option></select></label>
+          <label>Status <select id="register-status">
+            <option value="">All findings and clean evidence</option><option value="open">Unresolved</option>
+            <option value="corrected">Verified fixed</option>
+            <option value="improved">Improved — not verified</option><option value="noted">For review</option><option value="clean">Clean evidence</option>
+          </select></label>
+          <label>Find <input id="register-search" type="search" autocomplete="off" placeholder="Route, finding, attempt"></label>
+          <button id="register-refresh" type="button">Refresh register</button>
+        </div>
+        <div id="register-entries" aria-live="polite"></div>
+      </section>
+      <h1 id="title">Review sections</h1>
+      <div id="impact"></div>
+      <p id="why"></p>
+      <div id="tools">
+        <label>Compare with
+          <select id="baseline">
+            <option value="previous">Previous revision</option>
+            <option value="approved">Last approved revision</option>
+          </select>
+        </label>
+        <label>Context
+          <select id="context">
+            <option>Component</option>
+            <option>Feature</option>
+            <option>Slice</option>
+            <option>Blueprint</option>
+            <option>Application</option>
+          </select>
+        </label>
+      </div>
+      <div id="cards"></div>
+    </main>
+  </div>
+</body>
+</html>

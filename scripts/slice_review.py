@@ -269,6 +269,17 @@ class SliceReview:
                 self.advance(value['slice_id'])
         self.persist(request)
 
+    def visual_consent_target(self, key, entry):
+        target = self.api.sibling_module('slice_consent').review_target(key, entry)
+        if self.api.has_living_review(self.directory):
+            viewer = self.api.sibling_module('living_review')
+            with viewer.History(self.directory) as history:
+                state = history.sync(viewer.Documents(self.directory))
+            visual = viewer.review_bindings(state['sections'], key, state['removals'])
+            if visual:
+                target['visual_sha256'] = viewer.digest(viewer.encode(visual))
+        return target
+
     def validate_consent(self, exchange):
         service = self.api.sibling_module('slice_consent')
         action, target = exchange.get('consent_action'), exchange.get('target')
@@ -280,7 +291,7 @@ class SliceReview:
                          'Consent must identify exact slice revisions')
             keys = [self.selected_id(item) for item in items]
             self.require(len(keys) == len(set(keys)), 'Consent cannot name the same slice twice')
-            expected = {'slices': [service.review_target(key, self.registry['selected'][key]) for key in keys]}
+            expected = {'slices': [self.visual_consent_target(key, self.registry['selected'][key]) for key in keys]}
             if action == 'delegate':
                 self.require(self.blueprint.text(target.get('constraints')), 'Delegation must record its exact constraints')
                 expected['constraints'] = target['constraints']
@@ -341,6 +352,13 @@ class SliceReview:
                      'Collection validation_id must be a stable ID')
         scope = {field: self.registry.get(field) for field in
                  ('approval_id', 'selected', 'reviews', 'pending_question_id', 'review_blockers')}
+        if self.api.has_living_review(self.directory):
+            viewer = self.api.sibling_module('living_review')
+            with viewer.History(self.directory) as history:
+                state = history.sync(viewer.Documents(self.directory))
+            scope['visual_review'] = state['visual_review']
+            scope['removed_sections'] = {key: removal['stamp'] for key, removal in state['removals'].items()
+                                         if removal['active']}
         return canonical_hash({'input': value, 'scope': scope, 'active_approval_id': self.active_approval})
 
     def run(self, request):
@@ -651,6 +669,12 @@ class SliceReview:
             references.update(self.blueprint.bound_hashes('conversation', decision['exchange_id']))
         self.references.update(references)
         packet['decision_records'].extend(details)
+        for feature in selected:
+            if feature.get('visual_contract'):
+                scope = set(feature['baseline_ids']) | {feature['feature_id']}
+                protections = self.blueprint.protected_visual_decisions(packet['decision_records'], scope)
+                if protections:
+                    feature['protected_visual_decisions'] = protections
         anchors = list({
             (anchor['path'], anchor['contains']): anchor
             for feature in packet['baseline_contract'].get('features', [])
@@ -776,6 +800,10 @@ class SliceReview:
 
     def validate_guide(self, packet, guide, assets):
         self.api.sibling_module('slice_guide').validate_guide(self, packet, guide, assets)
+        for feature in packet['feature_contracts']:
+            for decision in feature.get('protected_visual_decisions', []):
+                self.require(decision['decision_id'] in guide and decision['requirement'] in guide,
+                             f"Guide must cite protected visual decision {decision['decision_id']}")
 
     def check_packet_runtime(self, packet):
         allowed = packet['allowed_paths'] + [path for key in packet['dependencies']
@@ -900,7 +928,7 @@ class SliceReview:
         if action == 'delegate':
             self.require(value.get('delegated_slice_ids') == [key] and self.blueprint.text(value.get('constraints')),
                          'Delegation must explicitly cover this exact slice and state its constraints')
-        target = {'slices': [self.api.sibling_module('slice_consent').review_target(key, entry)]}
+        target = {'slices': [self.visual_consent_target(key, entry)]}
         if action == 'delegate':
             target['constraints'] = value['constraints']
         self.guard_source(self.manifest['approvals'][self.active_approval], self.authorized_paths())
@@ -917,6 +945,10 @@ class SliceReview:
                   'approved_at': self.api.utc_now(), 'handoff_review': handoff, 'evidence_hashes': evidence}
         if action == 'delegate':
             result.update(delegated_slice_ids=[key], constraints=value['constraints'])
+        if self.api.has_living_review(self.directory) or value.get('visual_review'):
+            visual = self.api.sibling_module('living_review').checkpoint(self.directory, self.manifest, key)
+            self.require(visual == value.get('visual_review', {}), 'Confirm the displayed slice visual_review hashes')
+            result['visual_review'] = visual
         path = f'slice-proposals/{key}/reviews/{review_id}.json'
         self.files[path] = result
         self.registry['review_sequence'] = self.registry.get('review_sequence', 0) + 1
@@ -998,6 +1030,7 @@ class SliceReview:
         api_routes = {}
         ui_tokens = {}
         api_schemas = {}
+        protected_properties = {}
         for slice_id, packet in packets.items():
             for feature in packet.get('feature_contracts', []):
                 backend = feature.get('backend_contract', {})
@@ -1025,6 +1058,9 @@ class SliceReview:
                 if match:
                     identity = match if isinstance(match, tuple) else (match.group(1).upper(), match.group(2))
                     api_routes.setdefault(identity, []).append((slice_id, feature['feature_id'], backend.get('response'), backend.get('authorization')))
+                for decision in feature.get('protected_visual_decisions', []):
+                    target = (decision['component'], decision['property'])
+                    protected_properties.setdefault(target, set()).add(decision['requirement'])
                 visual = feature.get('visual_contract', {})
                 routes = {case.get('route') for case in visual.get('render_cases', [])
                           if isinstance(case, dict) and isinstance(case.get('route'), str)}
@@ -1037,7 +1073,8 @@ class SliceReview:
                         if isinstance(value, dict) and (value.get('component') or value.get('selector')):
                             component = value.get('component') or value.get('selector')
                         ui_tokens.setdefault((route, token, component), []).append((slice_id, feature['feature_id'], value))
-        conflicts = []
+        conflicts = [f'{component} / {prop} has conflicting protected visual decisions'
+                     for (component, prop), values in sorted(protected_properties.items()) if len(values) > 1]
         for identity, records in api_routes.items():
             responses = {json.dumps(record[2], sort_keys=True, separators=(',', ':'))
                          for record in records if record[2] is not None}
@@ -1194,7 +1231,28 @@ class SliceReview:
             prior.add(key)
         self.dependency_contracts(packets)
 
+    def check_visual_review(self, key):
+        receipt = self.registry.get('reviews', {}).get(key, {})
+        if receipt.get('visual_review') or self.api.has_living_review(self.directory):
+            self.api.sibling_module('living_review').checkpoint(self.directory, self.manifest, key, receipt)
+
+    def check_visual_owners(self, packets):
+        if self.api.has_living_review(self.directory):
+            viewer = self.api.sibling_module('living_review')
+            with viewer.History(self.directory) as history:
+                state = history.sync(viewer.Documents(self.directory))
+            for section in state['sections'].values():
+                owner = section['slice']
+                self.require(not owner or owner in packets,
+                             f"{section['id']}: unknown review slice {owner}")
+            # A retired slice no longer reaches the per-packet review loop.
+            retired = {scope for removal in state['removals'].values() if removal['active']
+                       for scope in removal['affected_scopes'] if scope and scope not in packets}
+            for scope in retired:
+                viewer.checkpoint(self.directory, self.manifest, scope)
+
     def ensure_reviews(self, packets):
+        self.check_visual_owners(packets)
         self.require(not self.registry.get('pending_question_id') and not self.blueprint.pending(),
                      'Open consequential review question')
         blockers = self.registry.get('review_blockers', {})
@@ -1208,9 +1266,10 @@ class SliceReview:
                          and result['reviewed_guide_sha256'] == entry['guide_sha256']
                          and result['reviewed_contract_sha256'] == entry['contract_sha256'],
                          f'{key}: missing or stale slice review')
+            self.check_visual_review(key)
             self.blueprint.check_hashes(result['evidence_hashes'])
             action = 'approve' if result['review_mode'] == 'manual' else 'delegate'
-            target = {'slices': [self.api.sibling_module('slice_consent').review_target(key, entry)]}
+            target = {'slices': [self.visual_consent_target(key, entry)]}
             if action == 'delegate':
                 target['constraints'] = result['constraints']
             self.check_consent(result.get('consent_id'), action, target, result['user_response'])
@@ -1475,9 +1534,13 @@ class SliceReview:
                    for key, entry in entries.items() if entry.get('contract_path')}
         self.api.sibling_module('slice_evidence').check_saved_case_kinds(self, report, packets)
 
-    def validate_package_active_decisions(self, package):
+    def validate_package_active_decisions(self, package, visual_scope=None):
         """Reject active packages that froze clarifications outside the current decision set."""
+        if visual_scope is None:
+            self.check_visual_owners(package['slices'])
         for key in package['order']:
+            if visual_scope is None or visual_scope == key:
+                self.check_visual_review(key)
             package_entry = package['slices'][key]
             contract_path = package_entry.get('contract_path')
             if not contract_path:
@@ -1539,9 +1602,10 @@ class SliceReview:
         self.require(entry.get('authorization_path'), f'{key}: separate explicit start authorization required')
         self.check_package_consents(key, entry, package)
         if key == self.registry.get('active_package'):
-            self.validate_package_active_decisions(package)
+            self.validate_package_active_decisions(package, slice_id or (value or {}).get('slice_id'))
         self.source(approval, self.authorized_paths())
         if origin:
+            self.check_visual_review(slice_id)
             selected = package['slices'][slice_id]
             self.require(self.registry['selected'][slice_id] ==
                          {field: selected[field] for field in self.registry['selected'][slice_id]},
@@ -1578,6 +1642,9 @@ class SliceReview:
                          f'{slice_id}: release and accept locked dependencies first ({key})')
             errors = self.blueprint.check_saved_verification(key, assignment)
             self.require(not errors, f'{slice_id}: accepted dependency {key} is stale: ' + '; '.join(errors))
+            if assignment.get('visual_integrity_required'):
+                self.blueprint.api.require_visual_integrity(self.blueprint.directory,
+                                                            self.manifest, key)
             verified.add(key)
             pending.extend(assignment['dependencies'])
         return sorted(verified)

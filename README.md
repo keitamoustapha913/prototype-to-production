@@ -1,5 +1,7 @@
 # Prototype to Production
 
+Use the [living review viewer](references/living-review.md) for automatic, focused before-and-after comparisons while discussing blueprint and slice corrections.
+
 A Codex skill for turning substantial frontend, backend, full-stack and greenfield work into an illustrated blueprint, then reviewing and locking the complete slice package before implementation. The full runnable-prototype route remains available for high-fidelity redesigns.
 
 The workflow discovers existing behavior, records exact consequential conversations, locks approved specifications and evidence, and resumes unfinished tasks or unanswered questions across sessions. Existing prototype initiatives retain their original approval and visual verification semantics.
@@ -23,7 +25,7 @@ python3 ~/.codex/skills/.system/skill-installer/scripts/install-skill-from-githu
 
 The default installation directory is `~/.codex/skills/prototype-to-production`. The installer refuses to overwrite an existing installation; back up and move the existing directory before reinstalling. The skill is available on your next turn after installation.
 
-Blueprint slice guide validation uses the pinned Mermaid parser. With Node.js 22.12 or later, run `npm ci` from the installed skill directory to install its parser dependencies.
+Blueprint slice guide validation uses the pinned Mermaid parser. With Node.js 22.12 or later, run `npm ci` from the installed skill directory to install its parser dependencies. To approve raster illustrations and record visual QA screenshots, install Pillow with `python3 -m pip install -r requirements.txt` in the Python environment used by the skill.
 
 ## Use
 
@@ -90,6 +92,8 @@ Use the initiative directory printed by `init`. In every Git repository, new des
 
 When transferring a reviewed blueprint initiative to a Git checkout, configure its local Git exclude with `artifact-setup --project-root /path/to/app --initiative-id billing-redesign` before resuming. If a slice review amendment is in progress, use `resume --slice-id <id>` and `validate --slice-id <id>` to check a continuing assignment.
 
+Each implemented UI slice receives a [Visual Integrity Gate](references/visual-integrity.md). Codex chooses critical states and viewports for each changed component, exercises the UI in a browser, and checks rendered evidence against the approved blueprint and protected design decisions. The register preserves before-and-after evidence and distinguishes verified fixes, incomplete repairs and unresolved defects. Open the Visual Review Register in the browser viewer to inspect findings after a slice or at project handoff.
+
 Blueprint verification executes approved tests from the app root. UI verification uses Node.js 22 or later and Chrome or Chromium to capture the running app at `P2P_APP_URL`. Use an independent reviewer to inspect the assertions and captured results. See the [blueprint verification contract](references/blueprint-workflow.md#approval-implementation-and-verification).
 
 ## Repository guide
@@ -110,11 +114,13 @@ Blueprint verification executes approved tests from the app root. UI verificatio
 
 ## Development
 
-Install the parser dependencies and run the Python suite.
+Run the workflow and browser viewer tests from the skill directory.
 
 ```bash
+python3 -m pip install -r requirements.txt
 npm ci
 python3 -m unittest discover -s tests
+node --test tests/review_viewer.test.js tests/test_review_viewer.js
 ```
 
 ### Live workflow checks

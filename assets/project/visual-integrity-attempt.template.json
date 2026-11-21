@@ -1,0 +1,111 @@
+{
+  "status": "unresolved",
+  "observations": [
+    {
+      "dimension": "geometry",
+      "result": "fail",
+      "note": "REPLACE with measured positions and the visible defect."
+    },
+    {
+      "dimension": "design",
+      "result": "not_checked",
+      "note": "REPLACE with comparison to approved styling and adjacent components."
+    },
+    {
+      "dimension": "interaction",
+      "result": "not_checked",
+      "note": "REPLACE with the observed pointer and keyboard outcomes."
+    },
+    {
+      "dimension": "responsive",
+      "result": "not_checked",
+      "note": "REPLACE with wrapping, clipping and target-size observations."
+    }
+  ],
+  "findings": [
+    {
+      "finding_id": "action-alignment",
+      "case_id": "example-case",
+      "dimension": "geometry",
+      "severity": "minor",
+      "status": "open",
+      "description": "REPLACE with the defect seen in the component close-up.",
+      "expected": "REPLACE with the approved requirement.",
+      "observed": "REPLACE with the measured deviation.",
+      "remaining_defect": "REPLACE with the outstanding problem.",
+      "classification": "confirmed_defect",
+      "classification_reason": "REPLACE with the approval or objective failure that establishes the defect.",
+      "evidence": "REPLACE with measurement or failed interaction and capture evidence.",
+      "protected_decision_ids": []
+    }
+  ],
+  "rechecked_findings": [],
+  "cases": [
+    {
+      "case_id": "example-case",
+      "capture_id": "REPLACE with the capture command result",
+      "viewport": {
+        "width": 390,
+        "height": 844
+      },
+      "state": {
+        "route": "/example",
+        "state": "default",
+        "theme": "light",
+        "data": "example fixture",
+        "interaction": "default",
+        "active_control": null,
+        "open_menus": []
+      },
+      "full_screenshot": "slices/example-slice/evidence/initial/full.png",
+      "closeup_screenshot": "slices/example-slice/evidence/initial/closeup.png",
+      "closeup_bounds": {
+        "x": 16,
+        "y": 48,
+        "width": 240,
+        "height": 64
+      },
+      "comparisons": [
+        {
+          "finding_id": "action-alignment",
+          "before": "slices/example-slice/evidence/initial/closeup.png",
+          "latest": "slices/example-slice/evidence/initial/closeup.png",
+          "normalized_rect": {
+            "x": 0.1,
+            "y": 0.6,
+            "width": 0.5,
+            "height": 0.25
+          }
+        }
+      ]
+    }
+  ],
+  "coverage": [
+    {
+      "case_id": "example-case",
+      "component": "Example component",
+      "state": "default",
+      "viewport": {
+        "width": 390,
+        "height": 844
+      },
+      "reason": "REPLACE with the reason this case matters.",
+      "acceptance_ids": [],
+      "protected_decision_ids": [],
+      "checks": {
+        "visual": {
+          "result": "fail",
+          "note": "REPLACE with the observed outcome or blocker."
+        },
+        "interaction": {
+          "result": "not_checked",
+          "note": "REPLACE with the observed outcome or blocker."
+        },
+        "blueprint": {
+          "result": "not_checked",
+          "note": "REPLACE with the observed outcome or blocker."
+        }
+      }
+    }
+  ]
+}
