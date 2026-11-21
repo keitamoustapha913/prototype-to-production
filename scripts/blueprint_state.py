@@ -94,7 +94,8 @@ class BlueprintState:
         sections = {}
         for feature in spec['features']:
             self.require(self.strings(feature.get('spec_paths')), 'Feature needs generated blueprint document paths')
-            section = [f"## {feature['feature_id']}", feature['purpose']]
+            heading = 'Feature ' if spec.get('requirement_traceability_version') else ''
+            section = [f"## {heading}{feature['feature_id']}", feature['purpose']]
             for label, key in (('Anatomy', 'anatomy'), ('Behavior', 'behavior_contract')):
                 section.extend((f'### {label}', feature[key]))
             fields = {key: value for key, value in feature.items()
@@ -111,6 +112,12 @@ class BlueprintState:
                 fields['requirements'] = requirements
             for key, value in sorted(fields.items()):
                 label = key.replace('_', ' ').capitalize()
+                if key == 'acceptance_checks' and spec.get('requirement_traceability_version'):
+                    section.append(f'### {label}')
+                    for check in value:
+                        content = json.dumps(check, indent=2, ensure_ascii=False, sort_keys=True)
+                        section.extend((f"#### Check {check['check_id']}", '~~~json\n' + content + '\n~~~'))
+                    continue
                 content = json.dumps(value, indent=2, ensure_ascii=False, sort_keys=True)
                 section.extend((f'### {label}', '~~~json\n' + content + '\n~~~'))
             diagrams = feature.get('diagrams', [])
@@ -447,12 +454,18 @@ class BlueprintState:
             self.require(isinstance(change, dict) and change.get('baseline_id') in
                          value.get('feature_ids', []) + value.get('requirement_ids', [])
                          and change.get('classification') in {'MODIFY','REMOVE'}, 'Authorization exceeds exchange scope')
+        if self.manifest.get('requirement_traceability_required'):
+            self.api.sibling_module('requirement_traceability').check_scope_exchange(self, value)
         self.check_protected_visual_decisions(value)
         paths = value.get('illustration_paths', []) + value.get('evidence_paths', [])
         hashes = self.hashes(paths) if paths else {}
         sources = {p:self.api.digest_of(self.api.project_source_file(self.directory.parents[2], p))
                    for p in value.get('source_paths', [])}
         if record_type == 'review_checkpoint' and value.get('review_step') == 'initial_alignment' and value['status'] == 'open':
+            if self.manifest.get('requirement_traceability_required'):
+                self.api.sibling_module('requirement_traceability').check_source_lines(
+                    self, value.get('reviewed_source_paths', []), value.get('source_line_mappings', {}),
+                    {row['requirement_id']: row['kind'] for row in value['requirement_mappings']}, hashes)
             hashes.update(self.decisions(value.get('scope_removal_decision_ids', []), allow_empty=True))
             self.write_alignment_map(value)
             hashes.update(self.hashes([value['alignment_map_path']]))
@@ -499,7 +512,8 @@ class BlueprintState:
             self.require(value.get('review_action') != 'skip', 'The plan overview cannot be waived')
             self.require(value['review_version'] not in self.manifest.get('blueprint_plans', {}),
                          'Use a new plan version to revise the roadmap overview')
-        if self.manifest.get('guided_design_review'):
+        if self.manifest.get('guided_design_review') or (step == 'workstream' and
+                                                         self.manifest.get('requirement_traceability_required')):
             version = value.get('review_version')
             self.require(self.identifier(version), 'Review checkpoint needs the exact audit, roadmap or blueprint version')
             if step == 'workstream':
@@ -507,9 +521,12 @@ class BlueprintState:
                 plan = self.load('blueprint_plans', spec['plan_version'])
                 self.require(value.get('review_workstream') in plan['workstreams'],
                              'Review checkpoint must name an exact roadmap workstream')
-                feature_ids = {feature['feature_id'] for feature in spec['features']}
-                self.require(value.get('feature_ids') and set(value['feature_ids']) <= feature_ids,
-                             'Workstream checkpoint needs the blueprint feature IDs shown or waived')
+                if spec.get('requirement_traceability_version'):
+                    self.check_coverage_workstream(value, spec, plan)
+                else:
+                    feature_ids = {feature['feature_id'] for feature in spec['features']}
+                    self.require(value.get('feature_ids') and set(value['feature_ids']) <= feature_ids,
+                                 'Workstream checkpoint needs the blueprint feature IDs shown or waived')
         action = value.get('review_action')
         if value['status'] == 'open':
             self.require(not action and not value.get('responds_to') and self.strings(value.get('evidence_paths')),
@@ -671,6 +688,27 @@ class BlueprintState:
                 evidence.update(row.get('evidence_paths', []))
             self.require(ids == set(value.get('requirement_ids', [])),
                          'Checkpoint scope must include every mapped requirement ID')
+            if self.manifest.get('requirement_traceability_required'):
+                module = self.api.sibling_module('requirement_traceability')
+                self.require(self.strings(value.get('reviewed_sources')),
+                             'Identify every fully examined brief, source document and relevant amendment')
+                self.check_placeholders(value['reviewed_sources'], 'reviewed_sources')
+                source_documents = value.get('reviewed_source_paths', [])
+                self.require(self.strings(source_documents, False),
+                             'List distinct initiative files for the saved source documents')
+                self.require(not prior or set(prior[-1].get('reviewed_source_paths', [])) <= set(source_documents),
+                             'Keep original source documents in every revised inventory')
+                evidence.update(source_documents)
+                module.check_inventory(self, [dict(row, repository_finding=row['finding']) for row in rows])
+                self.require(not prior or set(prior[-1]['requirement_ids']) <= ids,
+                             'Keep previously inventoried IDs and record any authorized exclusions in coverage')
+                if prior:
+                    earlier = {row['requirement_id']: row for row in prior[-1]['requirement_mappings']}
+                    for row in rows:
+                        key = row['requirement_id']
+                        self.require(key not in earlier or all(row.get(field) == earlier[key].get(field)
+                                     for field in ('kind', 'parent_requirement_id')),
+                                     f'{key}: preserve the source item kind and parent across revisions')
             removal_ids = value.get('scope_removal_decision_ids', [])
             self.require(self.strings(removal_ids, False), 'Scope removal decision IDs must be distinct')
             dropped = set(prior[-1]['requirement_ids']) - ids if prior else set()
@@ -687,7 +725,8 @@ class BlueprintState:
         action = value.get('review_action')
         self.require(value['status'] == 'decided' and action in ('confirm', 'revise') and value.get('responds_to'),
                      'Initial understanding cannot be waived; record an actual confirmation or correction to the open presentation')
-        self.require(not any(field in value for field in ('requirement_mappings', 'alignment_map_path',
+        self.require(not any(field in value for field in ('requirement_mappings', 'alignment_map_path', 'reviewed_sources',
+                                                          'reviewed_source_paths', 'source_line_mappings',
                                                           'scope_removal_decision_ids')),
                      'Record a new presentation to change the requirement map')
         if action == 'confirm':
@@ -705,6 +744,14 @@ class BlueprintState:
 
     def write_alignment_map(self, value):
         lines = ['# Initial Understanding and Alignment', '', f"Revision `{value['review_version']}`"]
+        if sources := value.get('reviewed_sources'):
+            lines.extend(['', '## Reviewed sources', '', *(f'- {source}' for source in sources)])
+            for path, spans in value.get('source_line_mappings', {}).items():
+                lines.extend(['', f'### `{path}`', ''])
+                for span in spans:
+                    refs = ', '.join(f'[{key}](#{key})' for key in span['requirement_ids'])
+                    lines.append(f"- Lines {span['start_line']}–{span['end_line']} — "
+                                 + (refs or span['context_reason']))
         if removal_ids := value.get('scope_removal_decision_ids'):
             lines.extend(['', 'Scope removal decisions', '', *[f'- `{key}`' for key in removal_ids]])
         for row in value['requirement_mappings']:
@@ -712,6 +759,10 @@ class BlueprintState:
                           f"- Request reference — {row['request_reference']}",
                           f"- Classification — {ALIGNMENT_CLASSIFICATIONS[row['classification']]}",
                           f"- Finding — {row['finding']}", f"- Proposed direction — {row['direction']}"])
+            if 'kind' in row:
+                lines.append(f"- Source item kind — {row['kind']}")
+            if 'parent_requirement_id' in row:
+                lines.append(f"- Parent requirement — {row['parent_requirement_id']}")
             lines.extend(f"- {label} — `{path}`" for field, label in
                          (('source_paths', 'Repository source'), ('evidence_paths', 'Evidence'))
                          for path in row.get(field, []))
@@ -778,10 +829,32 @@ class BlueprintState:
             for decision in packet['decision_records']:
                 usage[decision['exchange_id']]['slice_ids'].append(slice_id)
             if assignment.get('blueprint_version') == active and assignment['status'] != 'cancelled':
-                for feature_id in packet['feature_ids']:
-                    feature_slices.setdefault(feature_id, []).append(slice_id)
-        coverage = self.load('blueprint_coverage', active)['mappings'] if active else []
-        return usage, [{**row, 'slice_ids': feature_slices.get(row['feature_id'], [])} for row in coverage]
+                for feature in packet['feature_contracts']:
+                    checks = {check['check_id'] for check in feature['acceptance_checks']}
+                    feature_slices.setdefault(feature['feature_id'], []).append((slice_id, checks))
+        coverage = self.load('blueprint_coverage', active) if active else {}
+        exact = self.manifest.get('blueprint_coverage', {}).get(active, {}).get('report_path')
+        return usage, [{**row, 'slice_ids': [
+            slice_id for slice_id, checks in feature_slices.get(row['feature_id'], [])
+            if not exact or set(row['acceptance_ids']) & checks
+        ]} for row in coverage.get('mappings', [])]
+
+    def final_requirement_traceability(self, approval_id, accepted):
+        version = self.manifest['approvals'][approval_id]['approved_version']
+        if not self.manifest.get('blueprint_coverage', {}).get(version, {}).get('report_path'):
+            return None
+        coverage = self.load('blueprint_coverage', version)
+        evidence = []
+        for slice_id, assignment in accepted.items():
+            path = f'slices/{slice_id}/verification.json'
+            digest = assignment['verification_sha256']
+            self.check_hashes({path: digest})
+            receipt = self.api.read_json(self.api.artifact_file(self.directory, path))
+            self.require(receipt['approval_id'] == approval_id and receipt['status'] == 'PASS',
+                         f'{slice_id}: final source traceability requires an accepted verification receipt')
+            evidence.extend({**link, 'slice_id': slice_id, 'verification_path': path, 'verification_sha256': digest}
+                            for link in receipt['requirement_traceability'])
+        return self.api.sibling_module('requirement_traceability').final_links(coverage, evidence)
 
     def record_discovery(self, project_root, candidate):
         open_reviews = {record['review_step'] for record in self.pending()
@@ -813,10 +886,42 @@ class BlueprintState:
         self.require(isinstance(requirements, list) and (requirements or kind == 'existing' or confirmed_requirements),
                      'Greenfield needs recorded user requirements; use a requirements list for existing apps')
         prior_requirements = (previous or {}).get('requirements', [])
+        traceability = self.manifest.get('requirement_traceability_required')
+        if traceability:
+            module = self.api.sibling_module('requirement_traceability')
+            intake = module.source_rows(alignment)
+            prior_metadata = {row['requirement_id']: row for row in prior_requirements}
+            self.require(all(isinstance(row, dict) and self.identifier(row.get('requirement_id'))
+                             for row in requirements), 'Requirements need stable IDs and actual intent')
+            requirements = [
+                {**row, **intake.get(row['requirement_id'], {})} if row['requirement_id'] in intake else row
+                for row in requirements
+            ]
+            module.check_inventory(self, requirements)
+            for row in requirements:
+                key = row['requirement_id']
+                earlier = prior_metadata.get(key)
+                self.require(not earlier or all(earlier.get(field) == row.get(field)
+                             for field in ('kind', 'parent_requirement_id')), f'{key}: source identity changed')
+                paths = row.get('repository_evidence_paths')
+                source_paths = row.get('repository_source_paths')
+                self.require(self.text(row.get('repository_status'))
+                             and row['repository_status'] in ALIGNMENT_CLASSIFICATIONS
+                             and self.strings(paths, False) and self.strings(source_paths, False)
+                             and (paths or source_paths), f'{key}: record the repository comparison with evidence')
+                if paths:
+                    review_hashes.update(self.hashes(paths))
+            candidate = {**candidate, 'requirements': requirements}
         previous_alignment = (previous or {}).get('initial_alignment_id')
         revised_ids = (set(self.load('conversation', previous_alignment)['requirement_ids'])
                        if alignment and previous_alignment and previous_alignment != alignment['exchange_id'] else set())
-        self.require(all(requirement in requirements or requirement['requirement_id'] in revised_ids
+        def source_definition(row):
+            if not traceability:
+                return row
+            return {key: item for key, item in row.items() if not key.startswith('repository_')}
+
+        definitions = [source_definition(row) for row in requirements]
+        self.require(all(source_definition(requirement) in definitions or requirement['requirement_id'] in revised_ids
                          for requirement in prior_requirements),
                      'Cannot remove/rewrite prior requirements')
         if kind == 'greenfield':
@@ -889,6 +994,9 @@ class BlueprintState:
                          and self.text(requirement.get('text')), 'Requirements need stable IDs and actual intent')
             key = requirement['requirement_id']
             self.require(key not in ids, f'Requirement ID {key} duplicates another requirement or observed A feature')
+            if traceability:
+                for path in requirement['repository_source_paths']:
+                    sources[path] = self.api.digest_of(self.api.project_source_file(project_root, path))
             if key in confirmed_requirements:
                 self.require(requirement['text'] == confirmed_requirements[key],
                              f'Discovery must match the confirmed requirement text for {key}')
@@ -1429,6 +1537,16 @@ class BlueprintState:
         baseline = self.baseline(value.get('baseline_id'))
         plan = self.load('blueprint_plans', value.get('plan_version'))
         self.require(plan['baseline_id'] == value['baseline_id'], 'Plan and blueprint baselines conflict')
+        if self.manifest.get('requirement_traceability_required'):
+            value = {**value, 'requirement_traceability_version': 1}
+            summaries = value.get('workstream_summaries')
+            self.require(isinstance(summaries, dict) and summaries.keys() == set(plan['workstreams'])
+                         and all(self.text(summary) and '\n' not in summary for summary in summaries.values()),
+                         'Write a plain-language summary for every roadmap workstream')
+            self.check_placeholders(summaries, 'workstream_summaries')
+        else:
+            self.require('requirement_traceability_version' not in value,
+                         'This initiative uses legacy blueprint coverage')
         self.require(value.get('surface') == baseline['surface'], 'Blueprint surface must match audited scope')
         self.require(set(plan['decision_ids']) <= set(value.get('decision_ids', [])),
                      'Blueprint cannot omit roadmap decisions; record an amendment or include them')
@@ -1448,6 +1566,10 @@ class BlueprintState:
             self.require(isinstance(feature, dict) and self.identifier(feature.get('feature_id')), 'Stable blueprint feature ID required')
             key = feature['feature_id']
             self.require(key not in seen, 'Duplicate blueprint feature')
+            if value.get('requirement_traceability_version'):
+                self.require(self.strings(feature.get('workstreams'))
+                             and set(feature['workstreams']) <= set(plan['workstreams']),
+                             f'{key}: identify the roadmap workstreams that specify this feature')
             seen.add(key)
             self.require(self.strings(feature.get('baseline_ids')) and set(feature['baseline_ids']) <= baseline_ids,
                          'Blueprint feature must map actual A/requirement IDs')
@@ -1545,6 +1667,8 @@ class BlueprintState:
                              'Acceptance check needs stable ID, kind and exact expected outcome')
                 self.require(check['check_id'] not in check_ids, 'Duplicate acceptance check ID')
                 self.argv(check.get('command'))
+                if value.get('requirement_traceability_version'):
+                    self.check_placeholders(check['expected'], f"acceptance check {check['check_id']}")
                 check_ids.add(check['check_id']); kinds.add(check['kind'])
                 if 'case_ids' in check:
                     self.require(check['kind'] == 'visual' and surface != 'backend'
@@ -1609,6 +1733,31 @@ class BlueprintState:
         hashes.update(self.bound_hashes('blueprints', value['version']))
         features = {f['feature_id']:f for f in spec['features']}
         mappings = value.get('mappings')
+        if spec.get('requirement_traceability_version'):
+            self.require(isinstance(mappings, list), 'Provide coverage mappings as an array')
+            module = self.api.sibling_module('requirement_traceability')
+            baseline = self.baseline(spec['baseline_id'])
+            plan = self.load('blueprint_plans', spec['plan_version'])
+            path, content, overview, issues = module.report(self, spec, baseline, plan, value)
+            target = self.directory / path
+            self.require(target.resolve() == self.directory.resolve() / path,
+                         'Coverage report must stay inside the initiative')
+            self.require(value['version'] not in self.manifest.get('blueprint_coverage', {}),
+                         'Immutable record already exists; use a new version')
+            if target.exists():
+                self.require(target.read_bytes() == content.encode('utf-8'),
+                             'Coverage report differs from retry input; use a new version')
+            else:
+                self.api.atomic_text(target, content)
+            hashes.update(self.hashes([path]))
+            self.freeze('blueprint_coverage', value['version'], value, hashes,
+                        report_path=path, overview=overview, coverage_gaps=issues,
+                        spec_paths=sorted({path for feature in spec['features'] for path in feature['spec_paths']}))
+            self.manifest['next_action'] = ('Present the coverage overview and reconcile the coverage gaps' if issues
+                                            else 'Present the coverage overview, then review the first blueprint workstream')
+            self.persist()
+            print('\n'.join([*overview, *(f'- {issue}' for issue in issues[:3]), f'Detailed coverage — {path}']))
+            return
         self.require(isinstance(mappings, list) and mappings, 'Complete coverage mappings required')
         seen, pairs = set(), set()
         for mapping in mappings:
@@ -1631,6 +1780,27 @@ class BlueprintState:
                                         'exact blueprint, decision recap and coverage for formal approval')
         self.persist()
 
+    def check_coverage_workstream(self, value, spec, plan):
+        self.load('blueprint_coverage', spec['version'])
+        coverage = self.manifest['blueprint_coverage'][spec['version']]
+        latest = {answer['review_workstream']: answer['review_action'] for answer in self.review_answers('workstream')
+                  if answer['review_version'] == spec['version']}
+        completed = {name for name, action in latest.items() if action in {'continue', 'skip'}}
+        current = next((name for name in plan['workstreams'] if name not in completed), None)
+        name = value['review_workstream']
+        waiver = value.get('review_action') == 'skip'
+        self.require(waiver or name == current or name in completed,
+                     f'Review the next blueprint workstream in plan order: {current}')
+        feature_ids = {feature['feature_id'] for feature in spec['features'] if name in feature['workstreams']}
+        requirement_ids = {key for key, names in plan['requirement_workstreams'].items() if name in names}
+        self.require(set(value.get('feature_ids', [])) == feature_ids
+                     and set(value.get('requirement_ids', [])) == requirement_ids,
+                     'Review every feature and source ID in the current workstream')
+        if (value['status'] == 'open' or (waiver and not value.get('responds_to'))) and not latest:
+            paths = value.get('evidence_paths', [])
+            self.require(coverage['report_path'] in paths and len(paths) > 1,
+                         'Include the coverage overview with the saved terminal presentation for the first workstream')
+
     def completed_workstream_reviews(self, spec, plan):
         versions = self.manifest['blueprints']
         current_sequence = versions[spec['version']]['sequence']
@@ -1639,6 +1809,8 @@ class BlueprintState:
         for answer in self.review_answers('workstream'):
             version = answer['review_version']
             if versions[version]['sequence'] > current_sequence:
+                continue
+            if spec.get('requirement_traceability_version') and version != spec['version']:
                 continue
             earlier = self.load('blueprints', version)
             if earlier['baseline_id'] == spec['baseline_id'] and answer['review_workstream'] in plan['workstreams']:
@@ -1665,6 +1837,8 @@ class BlueprintState:
         recap = value.get('decision_recap_path')
         coverage = self.manifest['blueprint_coverage'][spec['version']]['path']
         required = set(spec['document_paths']) | {p for f in spec['features'] for p in f['spec_paths']}
+        if spec.get('requirement_traceability_version'):
+            required.add(self.manifest['blueprint_coverage'][spec['version']]['report_path'])
         self.require(self.text(recap) and recap not in required and recap != coverage,
                      'Approval requires a separate decision recap Markdown file')
         self.markdown([recap])
@@ -1672,7 +1846,7 @@ class BlueprintState:
                      'Record the approved exceptions explicitly; use an empty list when there are none')
         shown = value.get('shown_paths')
         self.require(self.strings(shown) and required | {coverage, recap} <= set(shown),
-                     'Approval must name the displayed index, feature specs, exact coverage record and decision recap')
+                     'Approval must name the displayed index, feature specs, exact coverage record, coverage report and decision recap')
         hashes = self.hashes(shown)
         if 'workstream_review_ids' in value:
             report = value.get('workstream_consistency_path')
@@ -1713,7 +1887,13 @@ class BlueprintState:
         for feature in spec['features']:
             self.check_test_sources(feature, feature['implementation_paths'])
         plan = self.load('blueprint_plans', spec['plan_version'])
-        if self.manifest.get('guided_design_review'):
+        if spec.get('requirement_traceability_version'):
+            coverage = self.load('blueprint_coverage', version)
+            module = self.api.sibling_module('requirement_traceability')
+            _, issues, _, _ = module.audit(self, spec, baseline, plan, coverage)
+            report_path = self.manifest['blueprint_coverage'][version]['report_path']
+            self.require(not issues, 'Blueprint coverage is incomplete. ' + module.gap_summary(issues, report_path))
+        if self.manifest.get('guided_design_review') or spec.get('requirement_traceability_version'):
             answers = self.completed_workstream_reviews(spec, plan)
             value = {**value, 'workstream_review_ids': [answer['exchange_id'] for answer in answers]}
         else:
@@ -1866,12 +2046,17 @@ class BlueprintState:
         decision_ids = set(spec['decision_ids']) | {d for feature in selected for d in feature['decision_ids']}
         decision_ids.update(d for feature in selected for protection in feature.get('protected_visual_decisions', [])
                             for d in protection.get('exchange_ids', []))
+        traceability = {}
+        if spec.get('requirement_traceability_version'):
+            coverage = self.load('blueprint_coverage', spec['version'])
+            traceability['requirement_traceability'] = self.api.sibling_module('requirement_traceability').slice_links(
+                coverage, selected)
         return {**candidate, 'approval_id':approval_id, 'approval_mode':'blueprint',
             'surface_contract_version':spec.get('surface_contract_version'),
             **({'visual_qa_version': spec['visual_qa_version']} if 'visual_qa_version' in spec else {}),
             'approved_artifact_hashes':approval['artifact_hashes'], 'feature_contracts':selected,
             'decision_records':[self.load('conversation', d) for d in sorted(decision_ids)],
-            'baseline_contract':baseline, 'acceptance_checks':sorted(checks)}
+            'baseline_contract':baseline, 'acceptance_checks':sorted(checks), **traceability}
 
     def create_slice(self, candidate):
         self.require(not self.api.requires_slice_review(self.manifest),
@@ -2149,6 +2334,8 @@ class BlueprintState:
                 'test_source_hashes':test_sources,'implementation_hashes':sources,
                   'executed_commands': [command for command, _ in executions]
                   + [case['command'] for case, _, _ in render_jobs], 'executed_render_hashes': rendered}
+            if 'requirement_traceability' in packet:
+                frozen['requirement_traceability'] = packet['requirement_traceability']
         except (self.api.StateError, KeyError, TypeError, ValueError, OSError, subprocess.TimeoutExpired) as error:
             if isinstance(error, self.api.RequiredCheckFailed):
                 frozen["observed_failure"] = True

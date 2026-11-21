@@ -403,6 +403,11 @@ def audit(directory, payload):
                   "checks": outcomes, **assessment}
         if passed:
             report["review_scope"] = state.sibling_module("final_review").scope_rows(directory, manifest, list(slices))
+            if state.initiative_mode(manifest) == "blueprint":
+                trace = state.blueprint_state(directory, manifest).final_requirement_traceability(
+                    manifest["active_approval_id"], active_slices(manifest))
+                if trace is not None:
+                    report["requirement_traceability"] = trace
             visual = state.sibling_module("visual_integrity")
             cross = state.sibling_module("cross_screen")
             captures = {case["capture_id"] for key, row in slices.items() if row["ui"]

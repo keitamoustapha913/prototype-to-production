@@ -13,6 +13,25 @@ const context = vm.createContext({document:dom.window.document, localStorage:dom
   URL, state:{slice_status:{oldOwner:'Needs review',newOwner:'Draft'}}, selected:null, affected:[], impactChanges:[]});
 vm.runInContext(source,context);
 
+test('coverage documentation keeps links to the precise check on the full specification', () => {
+  vm.runInContext(`state = {sections: {
+    report: {id:'report', source:'blueprint-coverage/spec-v1.md'},
+    excerpt: {id:'excerpt', source:'blueprints/spec-v1/items.md', heading:'Behavior'},
+    spec: {id:'spec', source:'blueprints/spec-v1/items.md'}
+  }};`, context);
+  const body = dom.window.document.createElement('div');
+  body.innerHTML = '<h3>Source item outsider-denial</h3>' +
+    '<a href="../blueprints/spec-v1/items.md#check-items-denial">Denial check</a>' +
+    '<a href="#source-item-outsider-denial">Source scenario</a>';
+  context.sectionUrls(body, {source:'blueprint-coverage/spec-v1.md'});
+  assert.equal(body.querySelector('h3').dataset.reviewAnchor, 'source-item-outsider-denial');
+  const [check, scenario] = body.querySelectorAll('button');
+  assert.equal(check.dataset.reviewSection, 'spec');
+  assert.equal(check.dataset.reviewTargetAnchor, 'check-items-denial');
+  assert.equal(scenario.dataset.reviewSection, 'report');
+  assert.equal(scenario.dataset.reviewTargetAnchor, 'source-item-outsider-denial');
+});
+
 test('impact summary shows the old and new owners and consumers for an impact-only change', () => {
   const before = {id:'design',title:'Design',stamp:'same',impact:{
     oldOwner:{kind:'Direct',reasons:['slice owner','consumes old-api']},

@@ -10,11 +10,16 @@
   "unresolved": [],
   "requirements": [
     {
-      "requirement_id": "original-feature",
-      "text": "REPLACE actual user intent",
+      "requirement_id": "example-requirement",
+      "text": "REPLACE with the actual requirement",
       "decision_ids": [
         "answer-one"
       ]
+    },
+    {
+      "requirement_id": "example-scenario",
+      "text": "REPLACE with the exact scenario, conditions and expected outcomes",
+      "decision_ids": []
     }
   ],
   "evidence_paths": [

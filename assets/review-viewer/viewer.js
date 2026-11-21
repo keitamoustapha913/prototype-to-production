@@ -30,28 +30,44 @@ function button(label, action) {
   b.onclick = action;
   return b;
 }
-function choose(key, slice = '') {
+function choose(key, slice = '', anchor = '') {
   setReviewMode('');
   selected = key;
   scopeSlice = slice;
   $('context').value = 'Component';
   remember();
-  display().catch(showError);
+  display().then(() => {
+    if (!anchor || selected !== key) return;
+    const card = [...$('cards').children].find(node => node.dataset.id === key);
+    const headings = [...(card?.querySelectorAll('[data-review-anchor]') || [])].reverse();
+    headings.find(node => node.dataset.reviewAnchor === anchor)?.scrollIntoView?.({block:'start'});
+  }).catch(showError);
 }
 function showError(err) { $('error').textContent = err.message; }
 function sectionUrls(fragment, item) {
   const registered = Object.values(state.sections);
   const base = new URL(item.source,'https://review.invalid/');
+  for (const heading of fragment.querySelectorAll('h1,h2,h3,h4,h5,h6')) {
+    heading.dataset.reviewAnchor = heading.textContent.trim().toLowerCase().replace(/\s+/g, '-');
+  }
   for (const link of fragment.querySelectorAll('a,img')) {
     const raw = link.getAttribute(link.tagName === 'A' ? 'href' : 'src') || '';
-    let target;
+    let target, anchor;
     try {
       const url = new URL(raw,base);
-      if (url.origin === base.origin) target = registered.find(s => s.source === decodeURIComponent(url.pathname.slice(1)));
+      if (url.origin === base.origin) {
+        const path = decodeURIComponent(url.pathname.slice(1));
+        anchor = decodeURIComponent(url.hash.slice(1));
+        const matching = registered.filter(s => s.source === path);
+        target = (anchor && matching.find(s => !s.heading)) || matching[0];
+      }
     } catch {}
     const label = link.textContent || link.getAttribute('alt') || raw;
     const replacement = el(target ? 'button' : 'span',label);
-    if (target) replacement.dataset.reviewSection = target.id;
+    if (target) {
+      replacement.dataset.reviewSection = target.id;
+      if (anchor) replacement.dataset.reviewTargetAnchor = anchor;
+    }
     link.replaceWith(replacement);
   }
 }
@@ -304,7 +320,7 @@ async function display() {
     const approved = state.approved_by_scope ? state.approved_by_scope[scope]?.[s.id] : state.approved[s.id];
     const receipt = state.current_by_scope ? state.current_by_scope[scope]?.[s.id] : state.current[s.id];
     const binding = state.current_by_scope ? state.visual_review?.[scope]?.[s.id] : s.stamp;
-    const status = s.removed ? 'Removed' :
+    const status = s.removed ? 'Removed' : s.coverage_document ? 'Coverage reference' :
       state.slice_status[scope] === 'Needs review' ? 'Needs review' :
       binding && receipt === binding ? 'Approved' : approved ? 'Needs review' : 'Draft';
     const signature = JSON.stringify([s, status, approved, $('baseline').value, s.id === selected]);
@@ -1308,7 +1324,7 @@ $('register-search').oninput = () => renderVisualRegister();
 $('register-refresh').onclick = () => loadVisualRegister().catch(showError);
 $('cards').addEventListener('click', event => {
   const link = event.target.closest('button[data-review-section]');
-  if (link) choose(link.dataset.reviewSection);
+  if (link) choose(link.dataset.reviewSection, '', link.dataset.reviewTargetAnchor);
 });
 for (const id of ['context','baseline']) $(id).onchange = () => { remember(); display().catch(showError); };
 let scrollTimer;

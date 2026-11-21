@@ -4,6 +4,9 @@
   "plan_version": "plan-v1",
   "surface": "backend",
   "surface_contract_version": 2,
+  "workstream_summaries": {
+    "Example workstream": "REPLACE with what the user or service caller gains"
+  },
   "document_paths": [
     "blueprints/spec-v1/index.md"
   ],
@@ -15,8 +18,13 @@
     {
       "feature_id": "example-feature",
       "purpose": "REPLACE user goal",
+      "workstreams": [
+        "Example workstream"
+      ],
       "baseline_ids": [
-        "original-feature"
+        "original-feature",
+        "example-requirement",
+        "example-scenario"
       ],
       "classification": "KEEP",
       "decision_ids": [

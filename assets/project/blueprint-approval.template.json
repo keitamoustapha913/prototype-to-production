@@ -6,11 +6,14 @@
   "approved_by_user": false,
   "user_approval_note": "REPLACE only after actual explicit approval",
   "decision_recap_path": "approval-evidence/spec-v1-recap.md",
+  "workstream_consistency_path": "approval-evidence/spec-v1-consistency.md",
   "exceptions": [],
   "shown_paths": [
     "blueprints/spec-v1/index.md",
     "blueprints/spec-v1/feature.md",
     "blueprint-coverage/spec-v1.json",
+    "blueprint-coverage/spec-v1.md",
+    "approval-evidence/spec-v1-consistency.md",
     "approval-evidence/spec-v1-recap.md"
   ]
 }

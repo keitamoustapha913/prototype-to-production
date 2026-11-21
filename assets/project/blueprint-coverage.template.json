@@ -1,13 +1,35 @@
 {
   "version": "spec-v1",
   "baseline_id": "audit-v1",
+  "requirements": [
+    {
+      "requirement_id": "example-requirement",
+      "status": "covered",
+      "reason": "REPLACE with the scope and exact behavior specified for the requirement"
+    },
+    {
+      "requirement_id": "example-scenario",
+      "status": "covered",
+      "reason": "REPLACE with how the original scenario and its expected outcome are specified"
+    }
+  ],
   "mappings": [
     {
       "baseline_id": "original-feature",
       "feature_id": "example-feature",
-      "acceptance_ids": [
-        "example-check"
-      ]
+      "acceptance_ids": ["example-check"]
+    },
+    {
+      "baseline_id": "example-requirement",
+      "feature_id": "example-feature",
+      "spec_path": "blueprints/spec-v1/feature.md",
+      "acceptance_ids": ["example-check"]
+    },
+    {
+      "baseline_id": "example-scenario",
+      "feature_id": "example-feature",
+      "spec_path": "blueprints/spec-v1/feature.md",
+      "acceptance_ids": ["example-check"]
     }
   ]
 }

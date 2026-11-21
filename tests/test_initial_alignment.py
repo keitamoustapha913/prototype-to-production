@@ -50,7 +50,9 @@ class InitialAlignmentTests(unittest.TestCase):
             "status": "open", "response": None,
             "question": "Have I understood your request? Please confirm before planning.",
             "requirement_ids": ["items"], "evidence_paths": ["presentation.md"],
+            "reviewed_sources": ["User brief in full"],
             "requirement_mappings": [{
+                "kind": "requirement",
                 "requirement_id": "items", "text": "List items.", "request_reference": "User brief, item listing",
                 "classification": "missing", "finding": "The project has no application source.",
                 "direction": "Add an item listing.", "evidence_paths": ["inspection.txt"],
@@ -59,7 +61,7 @@ class InitialAlignmentTests(unittest.TestCase):
 
     def reply(self, presentation, action, response, **expectation):
         answer = {key: val for key, val in presentation.items()
-                  if key not in {"requirement_mappings", "evidence_paths"}}
+                  if key not in {"requirement_mappings", "evidence_paths", "reviewed_sources"}}
         answer.update(exchange_id=presentation["exchange_id"] + "-" + action, status="decided",
                       responds_to=presentation["exchange_id"], review_action=action, response=response)
         self.exchange(answer, **expectation)
@@ -161,16 +163,20 @@ class InitialAlignmentTests(unittest.TestCase):
         revised = self.presentation("intake-v2")
         (self.directory / "revised.md").write_text("# Revised\n\nThis request is for item listing only.\n")
         revised["evidence_paths"] = ["revised.md"]
-        self.exchange(revised, blocked="explicit scope removal")
+        self.exchange(revised, blocked="Keep previously inventoried IDs")
         self.exchange({"exchange_id": "remove-export", "phase": "discover", "status": "decided",
                        "question": "Have I understood your request? Please confirm before planning.",
                        "response": "Only implement item listing. Remove export from this request.",
                        "requirement_ids": ["export"],
                        "authorized_changes": [{"baseline_id": "export", "classification": "REMOVE"}]})
         revised["scope_removal_decision_ids"] = ["remove-export"]
+        self.exchange(revised, blocked="Keep previously inventoried IDs")
+        revised.pop("scope_removal_decision_ids")
+        revised["requirement_ids"].append("export")
+        revised["requirement_mappings"].append(first["requirement_mappings"][1])
         self.exchange(revised)
         markdown = (self.directory / "alignment/intake-v2.md").read_text()
-        self.assertIn("remove-export", markdown)
+        self.assertIn("Export items.", markdown)
 
     def test_prototype_uses_the_same_checkpoint_and_recovers_an_open_exchange(self):
         self.initialize("prototype")

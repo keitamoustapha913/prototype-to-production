@@ -1388,7 +1388,8 @@ def initialize(directory: Path, scope: str, next_action: str | None, mode: str |
             "next_action": next_action or template["next_action"],
         })
         if template["initiative_mode"] == "blueprint":
-            template.update(schema_version=5, slice_review_required=True, plan_review_required=True)
+            template.update(schema_version=5, slice_review_required=True, plan_review_required=True,
+                            requirement_traceability_required=True)
         if guided_design_review:
             template["guided_design_review"] = True
         template["provenance"]["created_at"] = utc_now()
@@ -3028,7 +3029,7 @@ def build_resume_packet(directory: Path, project_root: Path, *, delivery_slice: 
     conversation, pending_questions = [], []
     active_question_answer = None
     question_source_errors = []
-    conversation_usage, coverage_with_slices, plan_review = {}, [], None
+    conversation_usage, coverage_with_slices, plan_review, blueprint_coverage = {}, [], None, None
     if initiative_mode(manifest) == "blueprint" or manifest.get("initial_alignment_required") or manifest.get("conversation"):
         state = blueprint_state(directory, manifest)
         try:
@@ -3046,6 +3047,15 @@ def build_resume_packet(directory: Path, project_root: Path, *, delivery_slice: 
             try:
                 conversation_usage, coverage_with_slices = state.traceability()
                 plan_review = state.plan_review_progress(conversation)
+                blueprints = manifest.get("blueprints", {})
+                if blueprints:
+                    version = max(blueprints, key=lambda key: blueprints[key]["sequence"])
+                    spec = state.load("blueprints", version)
+                    if spec.get("requirement_traceability_version"):
+                        entry = manifest.get("blueprint_coverage", {}).get(version, {})
+                        blueprint_coverage = {"version": version, "report_path": entry.get("report_path"),
+                                              "overview": entry.get("overview", []),
+                                              "gaps": entry.get("coverage_gaps", [])}
             except (StateError, OSError, ValueError, KeyError, TypeError) as error:
                 errors.append(f"Traceability recovery is blocked: {error}")
     errors.extend(question_source_errors)
@@ -3175,6 +3185,7 @@ def build_resume_packet(directory: Path, project_root: Path, *, delivery_slice: 
         "active_question_answer": active_question_answer,
         "conversation_usage": conversation_usage,
         "coverage_with_slices": coverage_with_slices,
+        "blueprint_coverage": blueprint_coverage,
         "finished_tasks": sorted(task_id for task_id, item in manifest.get("work_items", {}).items()
                                  if item.get("status") == "done"),
         "slices": delivery,
@@ -3218,6 +3229,13 @@ def print_resume(directory: Path, project_root: Path, *, delivery_slice: str | N
         for path in active.get("source_paths", []):
             print(f"- {path}")
     review = packet["slice_review"]
+    if coverage := packet["blueprint_coverage"]:
+        if coverage["report_path"]:
+            print(f"Blueprint coverage report: {coverage['report_path']}")
+            if coverage["gaps"]:
+                print(f"Coverage gaps awaiting resolution: {len(coverage['gaps'])}")
+        else:
+            print(f"Blueprint coverage audit pending for {coverage['version']}")
     if review and review["required"]:
         print("Dispatchable reviewed slices: " + (", ".join(packet["dispatchable_slices"]) or "none"))
         if review["register_path"]:
@@ -3529,6 +3547,12 @@ def main(argv: list[str] | None = None) -> int:
             if initiative_mode(manifest) == "blueprint" or args.slice_id:
                 packet = build_resume_packet(directory, project_root, delivery_slice=args.slice_id)
                 errors = packet["validation_errors"] + packet["reconciliation_required"]
+                if not args.slice_id and manifest["stage"] == "blueprint" and (coverage := packet["blueprint_coverage"]):
+                    if not coverage["report_path"]:
+                        errors.append(f"Blueprint coverage audit pending for {coverage['version']}")
+                    elif coverage["gaps"]:
+                        errors.append(sibling_module("requirement_traceability").gap_summary(
+                            coverage["gaps"], coverage["report_path"]))
                 if not errors and args.slice_id and not packet["safe_to_continue"]:
                     errors = [f"{args.slice_id} has unresolved delivery work or workspace reconciliation"]
             else:

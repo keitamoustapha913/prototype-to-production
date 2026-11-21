@@ -4,6 +4,8 @@ When the final audit passes, open **Application Completion Review** in the Livin
 
 The implemented side of each comparison uses captures from the passing slice or cross-screen checks recorded by that report. Older reports without capture IDs use the saved captures for the report's approval and date.
 
+In blueprint initiatives with source traceability, the exact report includes every source requirement and acceptance criterion, its scope disposition and the accepted slice receipts for its approved checks. Use these links when the user asks how a specific source item was verified.
+
 ```mermaid
 flowchart TD
     A[Current technical audit passes] --> B[Publish Application Completion Review]

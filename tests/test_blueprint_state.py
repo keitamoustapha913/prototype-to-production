@@ -553,6 +553,7 @@ document.getElementById('observation').textContent = JSON.stringify({
         manifest = self.manifest()
         # Existing workflow fixtures predate the separate intake checkpoint.
         manifest.pop('initial_alignment_required', None)
+        manifest.pop('requirement_traceability_required', None)
         if not plan_review:
             manifest.pop('plan_review_required', None)
         if not review:
@@ -2631,6 +2632,9 @@ elif kind == 'api':
     output['states'] = dict(success=f'{{member_status}} JSON array', forbidden=f'{{outsider_status}} forbidden',
                             error=f'{{failure_status}} retryable',
                             backend_failure=f'{{outsider_status}} forbidden; {{failure_status}} retryable')
+    if key == 'items-denial':
+        output = result(key, f'Outsider gets {{outsider_status}}')
+        output['states'] = dict(forbidden=f'{{outsider_status}} forbidden')
     if key == 'application-api' and os.environ.get('P2P_FIXTURE_AUDIT_FAIL'):
         output.update(actual='Everyone gets 200', result='fail')
 else:
@@ -3321,6 +3325,227 @@ print(json.dumps(output))
         result=self.cli('validate',ok=False)
         self.assertIn('amended',result.stderr)
         self.cli('slice-create','--contract-file',self.payload('slice',self.slice()),ok=False)
+
+    def test_source_scenarios_gate_approval_and_follow_executed_checks(self):
+        self.start()
+        manifest = self.manifest()
+        manifest.update(initial_alignment_required=True, requirement_traceability_required=True)
+        (self.directory / 'manifest.json').write_text(json.dumps(manifest))
+        self.exchange()
+        baseline = self.baseline()
+        evidence = self.artifact('discovery/requirements.md', 'Inspected the item service and observed both caller outcomes.')
+        source_items = {
+            'item-access': 'Restrict item access to members.',
+            'member-list': 'Scenario 1. A member receives a JSON array.',
+            'outsider-denial': 'Scenario 2. An outsider receives HTTP 403.',
+            'guest-export': 'Scenario 3. Guests can export the list as CSV.',
+        }
+        supplied_design = self.artifact('inputs/supplied-design.md',
+                                        '# Item access\n\n' + '\n\n'.join(source_items.values()))
+        conflict = 'The brief also says outsiders may read items. These policies disagree.'
+        rows = []
+        for key, description in source_items.items():
+            rows.append({'requirement_id': key, 'text': description,
+                         'request_reference': f'Supplied design, item access, {description}',
+                         'kind': 'requirement' if key == 'item-access' else 'acceptance_criterion',
+                         **({'parent_requirement_id': 'item-access'} if key != 'item-access' else {}),
+                         'classification': {'guest-export': 'missing', 'outsider-denial': 'conflicting'}.get(
+                             key, 'already_implemented'),
+                         'finding': conflict if key == 'outsider-denial' else
+                         'Observed the supported caller outcomes and found no guest CSV export.',
+                         'direction': 'Keep item authorization and discuss the guest export.',
+                         'evidence_paths': [evidence]})
+        prompt = {'exchange_id': 'source-inventory', 'phase': 'discover', 'record_type': 'review_checkpoint',
+                  'review_step': 'initial_alignment', 'review_version': 'intake-v1',
+                  'review_target': 'Initial understanding of item access', 'status': 'open', 'response': None,
+                  'question': 'Have I captured the item access requirement and its three scenarios?',
+                  'requirement_ids': list(source_items), 'requirement_mappings': rows,
+                  'reviewed_sources': ['Supplied design, all sections and acceptance scenarios'],
+                  'reviewed_source_paths': [supplied_design],
+                  'source_line_mappings': {supplied_design: [
+                      {'start_line': 1, 'end_line': 1, 'requirement_ids': [], 'context_reason': 'Document title'},
+                      *({'start_line': line, 'end_line': line, 'requirement_ids': [key]}
+                        for line, key in zip((3, 5, 7, 9), source_items)),
+                  ]},
+                  'evidence_paths': [self.artifact('review/intake.md', 'Preserve member and outsider outcomes. Discuss guest export.')]}
+        rows_by_line = prompt['source_line_mappings'][supplied_design]
+        omitted = {**prompt, 'source_line_mappings': {supplied_design: rows_by_line[:-1]}}
+        result = self.cli('conversation-record', '--exchange-file', self.payload('intake', omitted), ok=False)
+        self.assertIn('unaccounted source line 9', result.stderr)
+        collapsed = {**prompt, 'source_line_mappings': {supplied_design: [
+            *rows_by_line[:-1], {**rows_by_line[-1], 'requirement_ids': ['outsider-denial']}]}}
+        result = self.cli('conversation-record', '--exchange-file', self.payload('intake', collapsed), ok=False)
+        self.assertIn('distinct acceptance criterion', result.stderr)
+        self.cli('conversation-record', '--exchange-file', self.payload('intake', prompt))
+        answer = {key: val for key, val in prompt.items() if key not in
+                  ('requirement_mappings', 'reviewed_sources', 'reviewed_source_paths', 'source_line_mappings',
+                   'evidence_paths')}
+        answer.update(exchange_id='source-confirmed', responds_to='source-inventory', status='decided',
+                      response='I confirm your understanding.', review_action='confirm')
+        self.cli('conversation-record', '--exchange-file', self.payload('intake-answer', answer))
+        exclusion = {'exchange_id': 'exclude-export-proposal', 'phase': 'discover', 'status': 'open',
+                     'question': 'Guests will have no CSV export in this release. Reply “Approve exclusion of guest-export”.',
+                     'requirement_exclusion': 'Guests will have no CSV export in this release.',
+                     'response': None, 'requirement_ids': ['guest-export'], 'basis': 'Supplied guest export scenario'}
+        self.cli('conversation-record', '--exchange-file', self.payload('exclusion', exclusion))
+        exclusion_answer = {
+            **{key: value for key, value in exclusion.items() if key != 'requirement_exclusion'},
+            'exchange_id': 'exclude-export', 'responds_to': exclusion['exchange_id'], 'status': 'decided',
+            'authorized_changes': [{'baseline_id': 'guest-export', 'classification': 'REMOVE'}],
+        }
+        for refusal in ('No. Keep guest CSV export.', 'Approve exclusion of guest-export only if stakeholders agree'):
+            result = self.cli('conversation-record', '--exchange-file', self.payload(
+                'exclusion-answer', {**exclusion_answer, 'response': refusal}), ok=False)
+            self.assertIn('explicit approval of this exclusion', result.stderr)
+        self.cli('conversation-record', '--exchange-file', self.payload(
+            'exclusion-answer', {**exclusion_answer, 'response': 'Approve exclusion of guest-export.'}))
+        self.exchange('unrelated-decision', requirement_ids=['outsider-denial'],
+                      question='Keep the member response schema?', response='Yes, keep the member response schema.')
+        resolution = 'Use HTTP 403 for outsiders across every item route.'
+        conflict_prompt = {'exchange_id': 'permission-conflict', 'phase': 'discover', 'status': 'open',
+                           'question': f'{conflict} {resolution} Reply “Approve resolution of outsider-denial”.',
+                           'requirement_conflict': {'finding': conflict, 'resolution': resolution},
+                           'requirement_ids': ['outsider-denial'], 'basis': 'Conflicting source access rules',
+                           'response': None}
+        self.cli('conversation-record', '--exchange-file', self.payload('conflict', conflict_prompt))
+        self.cli('conversation-record', '--exchange-file', self.payload('conflict-answer', {
+            **{key: value for key, value in conflict_prompt.items() if key != 'requirement_conflict'},
+            'exchange_id': 'approved-resolution', 'responds_to': 'permission-conflict',
+            'status': 'decided', 'response': 'Approve resolution of outsider-denial.',
+        }))
+        baseline['requirements'] = [{'requirement_id': key, 'text': value} for key, value in source_items.items()]
+        self.record_baseline(baseline)
+        plan = self.plan()
+        plan['decision_ids'].extend(['exclude-export', 'unrelated-decision', 'approved-resolution'])
+        self.record_reviewed_plan(plan)
+        stream = plan['workstreams'][0]
+
+        def spec_for(version):
+            blueprint = self.blueprint(version)
+            blueprint['decision_ids'].extend(['exclude-export', 'unrelated-decision', 'approved-resolution'])
+            blueprint['workstream_summaries'] = {stream: 'Keep member access to items and deny outsiders.'}
+            feature = blueprint['features'][0]
+            feature['baseline_ids'].extend(['item-access', 'member-list', 'outsider-denial'])
+            feature['workstreams'] = [stream]
+            feature['acceptance_checks'].append({
+                'check_id': 'items-denial', 'kind': 'backend', 'expected': 'Outsider gets 403',
+                'command': self.test_command('api', 'items-denial'),
+                'state_expectations': {'forbidden': BACKEND_OUTCOMES['forbidden']},
+            })
+            self.cli('blueprint-record', '--blueprint-file', self.payload('spec', blueprint))
+
+        def coverage_for(version):
+            coverage = self.coverage(version)
+            coverage['mappings'][0]['acceptance_ids'].append('items-denial')
+            coverage['mappings'].extend(
+                {'baseline_id': key, 'feature_id': 'items-feature', 'acceptance_ids': [check],
+                 'spec_path': f'blueprints/{version}/items.md'}
+                for key, check in [('item-access', 'items-access'), ('member-list', 'items-access'),
+                                   ('outsider-denial', 'items-denial')]
+            )
+            coverage['requirements'] = [
+                {'requirement_id': key, 'status': 'covered' if key == 'outsider-denial' else 'already_satisfied',
+                 **({'resolution_decision_id': 'approved-resolution'} if key == 'outsider-denial' else {}),
+                 'reason': 'The observed caller behavior is retained by the item service.'}
+                for key in ('item-access', 'member-list', 'outsider-denial')
+            ] + [{'requirement_id': 'guest-export', 'status': 'excluded', 'exclusion_decision_id': 'exclude-export',
+                  'reason': 'Guests have no CSV export in this release, with explicit user approval.'}]
+            return coverage
+
+        spec_for('spec-v1')
+        coverage = coverage_for('spec-v1')
+        coverage['mappings'][-1]['acceptance_ids'] = ['items-access']
+        result = self.cli('blueprint-coverage', '--coverage-file', self.payload('coverage', coverage), ok=False)
+        self.assertIn('distinct check IDs', result.stderr)
+        coverage = coverage_for('spec-v1')
+        coverage['requirements'][-1]['exclusion_decision_id'] = 'choose-layout'
+        result = self.cli('blueprint-coverage', '--coverage-file', self.payload('coverage', coverage), ok=False)
+        self.assertIn('does not authorize', result.stderr)
+        coverage = coverage_for('spec-v1')
+        coverage['requirements'][-2]['resolution_decision_id'] = 'unrelated-decision'
+        result = self.cli('blueprint-coverage', '--coverage-file', self.payload('coverage', coverage), ok=False)
+        self.assertIn('specific recorded conflict', result.stderr)
+        coverage = coverage_for('spec-v1')
+        coverage['mappings'].pop()
+        overview = self.cli('blueprint-coverage', '--coverage-file', self.payload('coverage', coverage)).stdout
+        self.assertIn('3 source acceptance criteria', overview)
+        self.assertIn('Partially covered: 1', overview)
+        self.assertIn('outsider-denial', self.cli('validate', ok=False).stderr)
+        result = self.cli('approve', '--approval-file', self.payload('approval', self.approval()), ok=False)
+        self.assertIn('Blueprint coverage is incomplete', result.stderr)
+        self.assertIn('outsider-denial', result.stderr)
+
+        spec_for('spec-v2')
+        coverage = coverage_for('spec-v2')
+        overview = self.cli('blueprint-coverage', '--coverage-file', self.payload('coverage', coverage)).stdout
+        self.assertIn('0 outstanding coverage gaps', overview)
+        report_path = 'blueprint-coverage/spec-v2.md'
+        report = (self.directory / report_path).read_text()
+        self.assertIn('../blueprints/spec-v2/items.md#check-items-denial', report)
+        viewer = json.loads(self.cli('review-revision').stdout)
+        self.assertIn('traceability-report-spec-v2', viewer['sections'])
+        self.assertIn('traceability-spec-spec-v2-1', viewer['sections'])
+
+        review_path = self.artifact('review/spec-v2.md',
+                                    'Coverage overview shown. Member → item array. Outsider → denial. Guest export excluded.')
+        question = {'exchange_id': 'review-access', 'phase': 'blueprint', 'record_type': 'review_checkpoint',
+                    'status': 'open', 'response': None, 'review_step': 'workstream', 'review_version': 'spec-v2',
+                    'review_target': stream, 'review_workstream': stream, 'question': 'Continue after reviewing item access?',
+                    'feature_ids': ['items-feature'], 'requirement_ids': list(source_items),
+                    'evidence_paths': [review_path]}
+        result = self.cli('conversation-record', '--exchange-file', self.payload('question', question), ok=False)
+        self.assertIn('coverage overview', result.stderr)
+        question['evidence_paths'].append(report_path)
+        self.cli('conversation-record', '--exchange-file', self.payload('question', question))
+        self.cli('conversation-record', '--exchange-file', self.payload('answer', {
+            **question, 'exchange_id': 'review-access-answer', 'responds_to': question['exchange_id'],
+            'status': 'decided', 'response': 'Continue', 'review_action': 'continue',
+        }))
+        approval = self.approval('spec-v2')
+        consistency = self.artifact('review/spec-v2-consistency.md', 'Item access, route and checks preserve the agreed service behavior.')
+        approval['workstream_consistency_path'] = consistency
+        approval['shown_paths'].extend([report_path, consistency])
+        self.cli('approve', '--approval-file', self.payload('approval', approval))
+
+        packet = {**self.slice(), 'blueprint_version': 'spec-v2', 'functional_tests': ['items-access', 'items-denial']}
+        self.cli('slice-create', '--contract-file', self.payload('slice', packet))
+        contract_file = self.directory / 'slices/items-slice/contract.json'
+        contract = json.loads(contract_file.read_text())
+        denial = next(row for row in contract['requirement_traceability'] if row['requirement_id'] == 'outsider-denial')
+        self.assertEqual(denial['check_ids'], ['items-denial'])
+        report = {'slice_id': 'items-slice', 'owner': 'builder', 'status': 'submitted',
+                  'summary': 'Verified the preserved item service', 'implementation_paths': ['src/service.py'],
+                  'functional_evidence': ['API tests'], 'shared_ui_paths': [], 'visual_evidence': [],
+                  'blockers': [], 'next_action': 'Independent verification'}
+        self.cli('slice-report', '--slice-id', 'items-slice', '--owner', 'builder',
+                 '--report-file', self.payload('worker-report', report))
+        self.cli('reconcile', '--slice-id', 'items-slice', '--action', 'report')
+        review = self.review()
+        output = {'check_id': 'items-denial', 'expected': 'Outsider gets 403', 'actual': 'Outsider gets 403',
+                  'result': 'PASS', 'states': {'forbidden': BACKEND_OUTCOMES['forbidden']}}
+        review['checks'].append({
+            'check_id': 'items-denial', 'expected': output['expected'], 'observed': output['actual'],
+            'result': 'PASS', 'command': self.test_command('api', 'items-denial'),
+            'output_file': self.artifact('slices/items-slice/evidence/denial.json', json.dumps(output)),
+        })
+        self.cli('reconcile', '--slice-id', 'items-slice', '--action', 'verify', '--review-file', self.payload('verification', review))
+        verification = json.loads((contract_file.parent / 'verification.json').read_text())
+        self.assertEqual(verification['requirement_traceability'], contract['requirement_traceability'])
+        self.cli('reconcile', '--slice-id', 'items-slice', '--action', 'accept')
+        plan = {'approval_id': 'approve-spec-v2', 'checks': [{
+            'check_id': 'application-api', 'kind': 'integration', 'slice_ids': ['items-slice'],
+            'scenario': 'Exercise item listing and authorization with the running service',
+            'command': self.test_command('api', 'application-api'), 'test_source_paths': ['tests/test_items.py'],
+            'expected': 'Member gets 200 array; nonmember gets 403',
+        }]}
+        completed = json.loads(self.cli('visual-quality', '--action', 'audit', '--input-file',
+                                        self.payload('completion-audit', plan)).stdout)
+        final = completed['requirement_traceability']
+        self.assertTrue(next(row for row in final if row['requirement_id'] == 'outsider-denial')['verification'])
+        self.assertEqual(next(row for row in final if row['requirement_id'] == 'guest-export')['verification'], [])
+        self.cli('validate')
+        self.artifact(supplied_design, 'Changed source design after confirmation.')
+        self.assertIn(supplied_design, self.cli('validate', ok=False).stderr)
 
     def test_greenfield_requirement_coverage_can_reach_approval(self):
         self.start(); self.exchange(requirement_ids=['list-items'])

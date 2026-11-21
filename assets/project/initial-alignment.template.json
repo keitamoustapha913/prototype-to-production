@@ -8,16 +8,32 @@
   "status": "open",
   "question": "REPLACE with the exact displayed request for confirmation of understanding",
   "response": null,
-  "requirement_ids": ["example-requirement"],
+  "requirement_ids": ["example-requirement", "example-scenario"],
+  "reviewed_sources": ["REPLACE with the complete sources and revisions examined"],
+  "reviewed_source_paths": [],
+  "source_line_mappings": {},
   "evidence_paths": ["alignment/presentations/alignment-v1.md"],
   "requirement_mappings": [
     {
       "requirement_id": "example-requirement",
+      "kind": "requirement",
       "text": "REPLACE with the actual requirement",
       "request_reference": "REPLACE with the exact brief section or message",
       "classification": "not_yet_verified",
       "finding": "REPLACE with what was inspected and what remains unknown",
       "direction": "REPLACE with the proposed direction and open issue",
+      "source_paths": [],
+      "evidence_paths": ["alignment/evidence/inspection.md"]
+    },
+    {
+      "requirement_id": "example-scenario",
+      "kind": "acceptance_criterion",
+      "parent_requirement_id": "example-requirement",
+      "text": "REPLACE with the exact scenario, conditions and expected outcomes",
+      "request_reference": "REPLACE with the exact acceptance scenario location",
+      "classification": "not_yet_verified",
+      "finding": "REPLACE with what was inspected and what remains unknown",
+      "direction": "REPLACE with how this outcome will be verified",
       "source_paths": [],
       "evidence_paths": ["alignment/evidence/inspection.md"]
     }

@@ -149,7 +149,20 @@ class Documents:
             sections = {}
             self.observed[CATALOG] = self.stamp(CATALOG)
             catalog = self.json(CATALOG) if self.observed[CATALOG] is not None else {'sections': []}
-            selected_specs = catalog.get('sections', []) if isinstance(catalog, dict) else []
+            selected_specs = catalog.get('sections') if isinstance(catalog, dict) else None
+            if not isinstance(selected_specs, list):
+                raise ValueError('The review catalog requires a sections array')
+            generated = []
+            for version, coverage in manifest.get('blueprint_coverage', {}).items():
+                if report := coverage.get('report_path'):
+                    generated.append({'id': f'traceability-report-{version}', 'source': report,
+                                      'title': f'Blueprint coverage · {version}', 'coverage_document': True})
+                    for index, path in enumerate(coverage['spec_paths'], 1):
+                        generated.append({'id': f'traceability-spec-{version}-{index}', 'source': path,
+                                          'title': f'{version} · {Path(path).stem}',
+                                          'coverage_document': True})
+            selected_specs = [*generated, *selected_specs]
+            catalog = {**catalog, 'sections': selected_specs}
             self.catalog_specs = deepcopy(selected_specs)
             self.catalog_removal_notes = deepcopy(catalog.get('removals', [])) if isinstance(catalog, dict) else []
         registry = manifest.get('slice_review', {})
@@ -279,6 +292,8 @@ class Documents:
             section = dict(id=key, title=spec.get('title', key), source=path, kind=kind, blob=checksum,
                            heading=spec.get('heading'), slice=scope, features=features, requirements=requirements,
                            contracts=contracts, owned_paths=files)
+            if spec.get('coverage_document'):
+                section['coverage_document'] = True
             if spec.get('reference'):
                 reference = spec['reference']
                 ref_kind = Path(reference).suffix[1:].lower()
@@ -314,7 +329,7 @@ def scope_stamp(section, scope):
 
 def bindings(sections, scope):
     return {k: scope_stamp(s, scope) for k, s in sections.items()
-            if (scope in s['impact'] if scope else not s['slice'])}
+            if not s.get('coverage_document') and (scope in s['impact'] if scope else not s['slice'])}
 
 
 def removal_bindings(removals, scope):
