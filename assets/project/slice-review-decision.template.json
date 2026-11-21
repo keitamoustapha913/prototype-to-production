@@ -6,6 +6,12 @@
   "contract_sha256": "",
   "user_response": "",
   "conversation_exchange_ids": [],
+  "assessment": {
+    "complexity": "",
+    "risk_factors": [],
+    "rationale": "",
+    "ambiguity_resolution": ""
+  },
   "handoff_review": {
     "reviewer": "",
     "result": "BLOCKED",

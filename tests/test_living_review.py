@@ -57,6 +57,30 @@ class LivingReviewTests(unittest.TestCase):
         confirmed = self.save()
         self.assertIn('confirmed', confirmed['sections']['implementation-slice-map']['title'])
         self.assertEqual(confirmed['visual_review'], before)
+
+        def publish(revision, state):
+            base = f'slice-proposals/provider/revisions/{revision}'
+            guide = f'{base}/implementation-guide.md'
+            diagram = f'{base}/diagrams/states.mmd'
+            contract = f'{base}/contract.json'
+            self.write(guide, f'# Provider guide\n\n{state}\n')
+            self.write(diagram, f'flowchart TD\n Startup --> {state}\n')
+            self.write(contract, {'dependencies': [], 'asset_hashes': {diagram: 'saved'}})
+            self.manifest['slice_review']['selected']['provider'].update(guide_path=guide, contract_path=contract)
+            self.write('manifest.json', self.manifest)
+            return self.save(), guide, diagram
+
+        first, _, first_diagram = publish(2, 'Idle')
+        version, current_guide, current_diagram = publish(3, 'Ready')
+        diagram_id = next(key for key, section in first['sections'].items() if section['source'] == first_diagram)
+        guide_id = next(key for key, section in confirmed['sections'].items() if section['source'] == guide)
+        self.assertEqual(version['sections'][diagram_id]['source'], current_diagram)
+        self.assertEqual(version['sections'][guide_id]['source'], current_guide)
+        with History(self.root) as history:
+            self.assertEqual(history.previous(diagram_id, version['revision'])['section']['source'], first_diagram)
+        self.assertIn(guide, {section['source'] for section in version['sections'].values()})
+        self.assertEqual(version['visual_review'], before)
+
         self.manifest['active_approval_id'] = 'blueprint-v2'
         self.write('manifest.json', self.manifest)
         next_blueprint = self.save()

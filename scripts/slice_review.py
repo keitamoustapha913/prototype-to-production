@@ -76,6 +76,14 @@ class SliceReview:
             self.require(current and current.get('consent_id') and not self.registry.get('planning_gaps'),
                          'Confirm the current slice map before beginning individual slice reviews or package approval')
 
+    @property
+    def adaptive_handoff(self):
+        return self.manifest.get('adaptive_handoff_required', self.map_required)
+
+    def require_review_turn(self):
+        self.require(not self.registry.get('pending_continue'),
+                     'Wait for the explicit instruction to continue to the next slice')
+
     def map_presentation(self, request=None):
         current = self.current_map()
         self.require(current and not self.registry.get('planning_gaps'),
@@ -156,6 +164,8 @@ class SliceReview:
             'slices': self.registry.get('selected', {}),
             'reviews': self.registry.get('reviews', {}),
             'review_blockers': self.registry.get('review_blockers', {}),
+            'handoff_readiness': self.registry.get('handoff_readiness', {}),
+            'pending_continue': None if waiting_for_map else self.registry.get('pending_continue'),
             'rejected_alternatives': self.registry.get('rejected_alternatives', {}),
             'planning_gaps': self.registry.get('planning_gaps', {}),
         }
@@ -199,7 +209,7 @@ class SliceReview:
         prior = items.get(task_id, {})
         cursor = {k: summary[k] for k in ('current_slice_id', 'current_revision', 'pending_question_id',
                                          'completed_review_ids', 'changed_dependents', 'register_path',
-                                         'inventory_path', 'active_package', 'slice_map', 'next_action')}
+                                         'inventory_path', 'active_package', 'slice_map', 'pending_continue', 'next_action')}
         initial = {'task_id': task_id, 'status': 'in_progress', 'summary': 'Review the complete slice inventory',
                    'phase': self.manifest['stage'], 'completed_steps': [],
                    'pending_steps': ['Review and authorize the slice collection'], 'blockers': [],
@@ -209,6 +219,8 @@ class SliceReview:
         if summary['pending_question_id']:
             item.update(pending_question_id=summary['pending_question_id'], status='waiting_user',
                         next_action=summary['next_action'])
+        elif summary['pending_continue']:
+            item.update(pending_question_id=None, status='waiting_user', next_action=summary['next_action'])
         elif item['status'] == 'waiting_user':
             item.update(pending_question_id=None, status='in_progress',
                         next_action=summary['next_action'])
@@ -244,6 +256,8 @@ class SliceReview:
         question = summary['pending_question']
         if question:
             rows.extend([f"Current review question ({question['exchange_id']})", '', question['question'], ''])
+        if ready := summary['handoff_readiness'].get(summary['current_slice_id']):
+            rows.extend(['## Handoff readiness', '', '~~~text', ready['terminal'].rstrip(), '~~~', ''])
         rows.extend(['| Slice | Purpose | Features | Revision | Method | Status | Blockers | Dependencies | Next action |',
                      '| --- | --- | --- | --- | --- | --- | --- | --- | --- |'])
         for key in self.registry.get('order', []):
@@ -289,7 +303,13 @@ class SliceReview:
                      'Plan the complete slice inventory before recording slice-review exchanges')
         for field in ('feature_ids', 'requirement_ids', 'illustration_paths', 'evidence_paths'):
             self.require(self.blueprint.strings(value.get(field, []), False), f'{field} must contain distinct references')
-        map_consent = value.get('record_type') == 'slice_consent' and value.get('consent_action') == 'confirm_map'
+        consent_action = value.get('consent_action') if value.get('record_type') == 'slice_consent' else None
+        map_consent = consent_action == 'confirm_map'
+        if consent_action == 'continue' and (exchange_id := value.get('exchange_id')) in self.registry.get('continuations', []):
+            saved = self.blueprint.load('conversation', exchange_id)
+            self.require(all(saved.get(field) == item for field, item in value.items()),
+                         'The recorded continuation is immutable')
+            return
         if map_consent and (exchange_id := value.get('exchange_id')) and (
                 self.current_map() or {}).get('consent_id') == exchange_id:
             saved = self.blueprint.load('conversation', exchange_id)
@@ -314,6 +334,10 @@ class SliceReview:
                          'Review exchange must belong to a selected slice')
             value['slice_id'] = key
             self.validate_exchange_scope(self.selected_packet(key), value)
+            if not linked_id and self.adaptive_handoff and key not in self.registry['reviews']:
+                self.require_review_turn()
+                self.require(key == self.registry['current_slice_id'], 'Discuss the current slice before opening another')
+                self.require_readiness_or_blocker_question(key, value)
             if value.get('status') in ('open', 'proposed'):
                 self.require(key == self.registry['current_slice_id'] and not self.registry.get('pending_question_id'),
                              'Finish the exact pending question before opening another')
@@ -330,6 +354,12 @@ class SliceReview:
             self.events.append({'type': 'slice_map_confirmed', 'exchange_id': value['exchange_id'],
                                 'target': value['target']})
             self.advance()
+        elif consent_action == 'continue':
+            self.registry.pop('pending_continue')
+            self.registry.setdefault('continuations', []).append(value['exchange_id'])
+            self.events.append({'type': 'slice_review_continued', 'exchange_id': value['exchange_id'],
+                                'target': value['target']})
+            self.advance(value['target']['slices'][0]['slice_id'])
         elif value.get('status') in ('open', 'proposed'):
             self.registry['pending_question_id'] = value['exchange_id']
             self.registry['collection'] = None
@@ -345,13 +375,16 @@ class SliceReview:
                 self.advance(value['slice_id'])
         self.persist(request)
 
-    def visual_consent_target(self, key, entry):
+    def visual_consent_target(self, key, entry, *, verify_illustrations=False):
         target = self.api.sibling_module('slice_consent').review_target(key, entry)
         if self.api.has_living_review(self.directory):
             viewer = self.api.sibling_module('living_review')
-            with viewer.History(self.directory) as history:
-                state = history.sync(viewer.Documents(self.directory))
-            visual = viewer.review_bindings(state['sections'], key, state['removals'])
+            if verify_illustrations:
+                visual = viewer.checkpoint(self.directory, self.manifest, key)
+            else:
+                with viewer.History(self.directory) as history:
+                    state = history.sync(viewer.Documents(self.directory))
+                visual = viewer.review_bindings(state['sections'], key, state['removals'])
             if visual:
                 target['visual_sha256'] = viewer.digest(viewer.encode(visual))
         return target
@@ -359,7 +392,7 @@ class SliceReview:
     def validate_consent(self, exchange):
         service = self.api.sibling_module('slice_consent')
         action, target = exchange.get('consent_action'), exchange.get('target')
-        self.require(isinstance(target, dict) and action in ('confirm_map', 'approve', 'delegate', 'lock', 'start'),
+        self.require(isinstance(target, dict) and action in ('confirm_map', 'approve', 'delegate', 'continue', 'lock', 'start'),
                      'Record an explicit slice consent action and exact scope')
         if action == 'confirm_map':
             current = self.current_map()
@@ -375,15 +408,24 @@ class SliceReview:
             self.source_guard['artifact_hashes'] = approval['artifact_hashes'] | {
                 expected['map_path']: expected['map_sha256'], presentation['path']: presentation['sha256']}
         elif action in ('approve', 'delegate'):
+            self.require_review_turn()
             items = target.get('slices')
             self.require(isinstance(items, list) and bool(items) and all(isinstance(item, dict) for item in items),
                          'Consent must identify exact slice revisions')
             keys = [self.selected_id(item) for item in items]
             self.require(len(keys) == len(set(keys)), 'Consent cannot name the same slice twice')
+            if self.adaptive_handoff and action == 'approve':
+                self.require(len(keys) == 1 and keys[0] == self.registry['current_slice_id'],
+                             'Manual approval must identify the current slice')
+                readiness = self.require_readiness(keys[0])
+                exchange['slice_presentation'] = self.check_slice_presentation(exchange, readiness)
             expected = {'slices': [self.visual_consent_target(key, self.registry['selected'][key]) for key in keys]}
             if action == 'delegate':
                 self.require(self.blueprint.text(target.get('constraints')), 'Delegation must record its exact constraints')
                 expected['constraints'] = target['constraints']
+        elif action == 'continue':
+            expected = self.registry.get('pending_continue')
+            self.require(expected, 'There is no slice review waiting for continuation')
         elif action == 'lock':
             preview = self.package_preview()
             expected = {field: preview[field] for field in
@@ -462,6 +504,7 @@ class SliceReview:
         if command == 'slice-collection-validate':
             if self.registry.get('selected') and self.registry.get('approval_id') == self.active_approval:
                 self.require_map_confirmed()
+                self.require_review_turn()
             request_key = self.collection_request_key(value)
             saved = self.registry.get('collection_requests', {}).get(request_key)
             if saved:
@@ -475,7 +518,7 @@ class SliceReview:
         if previous and previous[-1]['request_sha256'] == canonical_hash(request) and command not in {
                 'slice-guide-validate', 'slice-release', 'slice-collection-validate'}:
             if command != 'slice-review-migrate':
-                approval = self.approval(allow_questions=value.get('action') in ('question', 'block'))
+                approval = self.approval(allow_questions=value.get('action') in ('question', 'block', 'require-independent'))
                 self.source(approval, self.authorized_paths())
             if command == 'slice-plan' and self.registry.get('planning_gaps'):
                 return self.planning_blocker()
@@ -497,8 +540,14 @@ class SliceReview:
                 self.require_map_confirmed()
             if command == 'slice-guide-validate':
                 key = self.selected_id(value)
-                self.validate_frozen(key)
-                return {'result': 'PASS', 'slice': self.registry['selected'][key]}
+                packet = self.validate_frozen(key)
+                result = {'result': 'PASS', 'slice': self.registry['selected'][key]}
+                if 'assessment' in value:
+                    self.require_map_confirmed()
+                    self.require_review_turn()
+                    depth, reasons = self.api.sibling_module('slice_readiness').depth(self, packet, value['assessment'])
+                    result.update(depth=depth, reasons=reasons)
+                return result
             if command == 'slice-package-preview':
                 return self.package_preview()
             if command == 'slice-draft':
@@ -506,6 +555,7 @@ class SliceReview:
             elif command == 'slice-review-record':
                 self.review(value)
             elif command == 'slice-collection-validate':
+                self.require_review_turn()
                 report = self.collection(value)
                 requests = self.registry.setdefault('collection_requests', {})
                 requests[request_key] = report['path']
@@ -693,6 +743,7 @@ class SliceReview:
         if self.map_required:
             self.manifest['slice_map_required'] = True
         changed = {key for key in previous.keys() | selected.keys() if previous.get(key) != selected.get(key)}
+        changed.update(self.changed_readiness_providers(previous, selected, changed))
         self.registry.update(approval_id=self.active_approval, selected=selected, order=list(selected))
         self.invalidate(changed, reset=not same_approval)
         self.update_map(packets)
@@ -837,12 +888,24 @@ class SliceReview:
         if self.map_required:
             conflicts = self.map_conflicts(packets)
             self.require(not conflicts, f'Inventory has cross-slice conflicts: {conflicts}')
-        self.registry['selected'][key] = entry
+        previous = self.registry['selected']
+        selected = previous | {key: entry}
+        changed = {key} | self.changed_readiness_providers(previous, selected, {key})
+        self.registry['selected'] = selected
         if self.registry.get('pending_question_id'):
             self.clear_question_work(self.registry['pending_question_id'])
-        self.invalidate({key})
+        self.invalidate(changed)
         self.update_map(packets)
         self.advance(key)
+
+    def changed_readiness_providers(self, previous, selected, changed):
+        providers = set()
+        for key in changed:
+            before = set(previous.get(key, {}).get('dependencies', []))
+            after = set(selected.get(key, {}).get('dependencies', []))
+            providers.update(before ^ after)
+        pending_providers = self.registry.get('handoff_readiness', {}).keys() - self.current_deliveries().keys()
+        return providers & pending_providers
 
     def invalidate(self, changed, *, reset=False):
         impacted = set(changed)
@@ -882,6 +945,9 @@ class SliceReview:
         for key in list(blockers):
             if reset or key in changed:
                 blockers.pop(key)
+        for key in list(self.registry.get('handoff_readiness', {})):
+            if reset or key in impacted:
+                self.registry['handoff_readiness'].pop(key)
         self.registry.update(changed_dependents=sorted(impacted - changed), collection=None,
                              active_package=None, pending_question_id=None)
         if stale:
@@ -956,11 +1022,26 @@ class SliceReview:
             return
         pending = [key for key in self.registry['order'] if key not in self.registry['reviews']]
         key = preferred or (pending[0] if pending else None)
+        if 'pending_continue' in self.registry:
+            self.wait_for_next_slice(key)
+            return
         self.registry['current_slice_id'] = key
         self.registry['pending_question_id'] = None
         self.manifest.update(stage='slice_review',
-                             next_action=(f'Review {key} revision {self.registry["selected"][key]["revision"]}'
+                             next_action=(f'Prepare handoff readiness for {key} revision {self.registry["selected"][key]["revision"]}'
+                                          if key and self.adaptive_handoff and key not in self.registry.get('handoff_readiness', {})
+                                          else f'Review {key} revision {self.registry["selected"][key]["revision"]}'
                                           if key else 'Validate the reviewed collection'))
+
+    def wait_for_next_slice(self, key):
+        self.registry.update(current_slice_id=None, pending_question_id=None)
+        if not key:
+            self.registry.pop('pending_continue', None)
+            self.advance()
+            return
+        target = self.api.sibling_module('slice_consent').review_target(key, self.registry['selected'][key])
+        self.registry['pending_continue'] = {'slices': [target]}
+        self.manifest['next_action'] = f'Wait for the user to continue to {key} revision {target["proposal_revision"]}'
 
     def validate_guide(self, packet, guide, assets):
         self.api.sibling_module('slice_guide').validate_guide(self, packet, guide, assets)
@@ -996,19 +1077,132 @@ class SliceReview:
                                            for p in packet['asset_hashes']})
         return packet
 
+    def record_readiness(self, key, entry, value, approval):
+        self.require(self.adaptive_handoff and key not in self.registry['reviews'],
+                     'Readiness applies to pending adaptive reviews')
+        if key != self.registry.get('current_slice_id'):
+            consent_id = value.get('consent_id')
+            self.require(self.blueprint.identifier(consent_id), 'Prepare the current slice or supply scoped delegation')
+            exchange = self.blueprint.load('conversation', consent_id)
+            self.check_consent(consent_id, 'delegate', {'slices': [self.visual_consent_target(key, entry)],
+                'constraints': exchange.get('target', {}).get('constraints')}, exchange.get('response'))
+        if blocker := self.registry.get('review_blockers', {}).get(key):
+            self.require(blocker['revision'] != entry['revision'],
+                         'Correct the recorded blocker and freeze a new slice revision before repeating readiness')
+        packet = self.validate_frozen(key)
+        details = {record['exchange_id'] for record in self.active_slice_details(key)}
+        self.require(details <= set(packet['decision_ids']),
+                     'Freeze a new revision incorporating the recorded clarification before readiness')
+        service = self.api.sibling_module('slice_readiness')
+        assessment = value.get('assessment')
+        depth, reasons = service.depth(self, packet, assessment)
+        self.guard_source(approval, self.authorized_paths())
+        handoff = value.get('handoff_review')
+        hashes = self.api.sibling_module('slice_evidence').validate_handoff(
+            self, packet, entry, handoff, verify_symbols=True, depth=depth)
+        if 'ambiguity' in assessment['risk_factors']:
+            resolution = assessment.get('ambiguity_resolution')
+            self.require(self.blueprint.text(resolution),
+                         'Explain how the independent review resolved the material ambiguity')
+            self.blueprint.check_placeholders(resolution, 'handoff ambiguity resolution')
+        self.validate_handoff_illustrations(packet)
+        target = self.visual_consent_target(key, entry, verify_illustrations=True)
+        receipt = {'target': target, 'result': 'PASS', 'depth': depth, 'reasons': reasons,
+                   'assessment': assessment, 'handoff_review': handoff, 'evidence_hashes': hashes,
+                   'source_hashes': self.readiness_source_hashes(packet)}
+        receipt['terminal'] = service.terminal(entry, receipt)
+        path = f'slice-proposals/{key}/readiness/r{entry["revision"]}-{canonical_hash(receipt)}.json'
+        self.files[path] = receipt
+        self.references.update(hashes)
+        self.registry.setdefault('handoff_readiness', {})[key] = receipt | {'path': path}
+        self.events.append({'type': 'slice_handoff_ready', 'path': path, 'target': target, 'depth': depth})
+        if key == self.registry.get('current_slice_id'):
+            self.manifest['next_action'] = f'Discuss {key} revision {entry["revision"]} using its readiness result and guide'
+
+    def require_readiness(self, key, packet=None):
+        receipt = self.registry.get('handoff_readiness', {}).get(key)
+        entry = self.registry['selected'][key]
+        self.require(receipt and receipt['target'] == self.visual_consent_target(key, entry),
+                     f'{key}: verify handoff readiness for the current guide, contract and illustrations first')
+        self.blueprint.check_hashes(receipt['evidence_hashes'])
+        if packet is None:
+            packet = self.validate_frozen(key)
+        if key not in self.registry.get('continuing_releases', {}):
+            self.require(receipt['source_hashes'] == self.readiness_source_hashes(packet),
+                         f'{key}: approved repository references changed since handoff readiness')
+            depth, _ = self.api.sibling_module('slice_readiness').depth(self, packet, receipt['assessment'])
+            self.require(depth == receipt['depth'], f'{key}: repeat handoff readiness at the current verification depth')
+        return receipt
+
+    def validate_handoff_illustrations(self, packet):
+        media = self.api.sibling_module('review_media')
+        for relative in sorted(packet['asset_hashes'].keys() | packet['artifact_hashes'].keys()):
+            extension = Path(relative).suffix[1:].lower()
+            if extension not in media.RASTER_FORMATS and extension != 'svg':
+                continue
+            data = self.api.artifact_file(self.directory, relative).read_bytes()
+            if extension == 'svg':
+                media.validate_svg(data, relative)
+            else:
+                media.validate_raster(data, extension, relative)
+
+    def check_slice_presentation(self, exchange, readiness):
+        path = exchange.get('presentation_path')
+        self.require(self.blueprint.text(path) and path in exchange.get('evidence_paths', []),
+                     'Attach the saved terminal presentation in presentation_path and evidence_paths before approval')
+        hashes = self.api.sibling_module('slice_evidence').evidence_hashes(self, [path])
+        text = self.api.artifact_file(self.directory, path).read_text(encoding='utf-8')
+        summary = readiness['terminal']
+        self.require(text.startswith(summary) and text[len(summary):].strip(),
+                     'The terminal presentation must start with the current readiness summary and include the slice explanation')
+        return {'path': path, 'sha256': hashes[path], 'readiness_path': readiness['path']}
+
+    def require_readiness_or_blocker_question(self, key, exchange):
+        if exchange.get('handoff_blocker') is True:
+            blocker = self.registry.get('review_blockers', {}).get(key)
+            self.require(blocker and blocker.get('handoff_failure')
+                         and blocker['revision'] == self.registry['selected'][key]['revision']
+                         and exchange['status'] in ('open', 'proposed')
+                         and set(exchange.get('evidence_paths', [])) & blocker['evidence_hashes'].keys(),
+                         'A pre-readiness question must cite the current handoff blocker evidence')
+        else:
+            self.require_readiness(key)
+
+    def readiness_source_hashes(self, packet):
+        paths = {anchor['path'] for anchor in packet.get('approved_source_anchors', [])}
+        return {path: self.api.digest_of(self.api.project_source_file(self.directory.parents[2], path))
+                for path in sorted(paths)}
+
     def review(self, value):
         key = self.selected_id(value)
         entry = self.registry['selected'][key]
         self.require(type(value.get('proposal_revision')) is int and value['proposal_revision'] == entry['revision'],
                      f'{key}: review must target exact revision {entry["revision"]}')
         action = value.get('action')
-        self.require(action in ('question', 'reopen', 'block', 'approve', 'delegate'),
-                     'Choose a valid review action: question, reopen, block, approve or delegate')
+        self.require(action in ('question', 'reopen', 'block', 'approve', 'delegate', 'readiness', 'require-independent'),
+                     'Choose a valid review action: readiness, require-independent, question, reopen, block, approve or delegate')
+        if action not in ('reopen', 'block', 'require-independent'):
+            self.require_review_turn()
         if value.get('next_action') is not None:
             self.require(self.blueprint.text(value['next_action']), 'Review next_action must be text')
-        self.approval(allow_questions=action in ('question', 'block'))
-        if action == 'reopen':
+        approval = self.approval(allow_questions=action in ('question', 'block', 'require-independent'))
+        if action == 'readiness':
+            self.record_readiness(key, entry, value, approval)
+            return
+        if action == 'require-independent':
+            self.require(self.adaptive_handoff and key not in self.registry['reviews']
+                         and self.blueprint.text(value.get('user_response')),
+                         'Record the exact user request for an independent review of a pending slice')
+            self.registry.setdefault('handoff_escalations', {}).setdefault(key, {})['user'] = (
+                'The user requested independent review')
+            self.registry.get('handoff_readiness', {}).pop(key, None)
+            if key == self.registry.get('current_slice_id') and not self.registry.get('pending_question_id'):
+                self.manifest['next_action'] = f'Prepare independent handoff readiness for {key}'
+        elif action == 'reopen':
             self.require(self.blueprint.text(value.get('user_response')), 'Record the exact reopening request')
+            if self.registry.get('pending_continue'):
+                self.require(key in self.registry['reviews'], 'Continue explicitly or reopen an already reviewed slice')
+            self.registry.pop('pending_continue', None)
             self.invalidate({key})
             self.advance(key)
         elif action == 'question':
@@ -1022,6 +1216,8 @@ class SliceReview:
             self.require(self.registry.get('pending_question_id') in (None, question_id),
                          'The exact pending question must be resolved first')
             self.validate_exchange_scope(self.selected_packet(key), question)
+            if self.adaptive_handoff:
+                self.require_readiness_or_blocker_question(key, question)
             self.registry['pending_question_id'] = question_id
             self.manifest['next_action'] = value.get('next_action') or question['question']
             self.registry['collection'] = None
@@ -1031,6 +1227,11 @@ class SliceReview:
             self.require(self.blueprint.text(reason) and self.blueprint.strings(paths),
                          f'{key}: give the material blocker and its evidence paths')
             hashes = self.api.sibling_module('slice_evidence').evidence_hashes(self, paths)
+            handoff_failure = self.adaptive_handoff and (value.get('handoff_failure') is True
+                               or key not in self.registry.get('handoff_readiness', {}))
+            if handoff_failure:
+                self.registry.setdefault('handoff_escalations', {}).setdefault(key, {})['failure'] = (
+                    'A previous handoff readiness check failed')
             pending_question = self.registry.get('pending_question_id')
             current = self.registry.get('current_slice_id')
             next_action = self.manifest['next_action']
@@ -1039,6 +1240,8 @@ class SliceReview:
             self.registry['pending_question_id'] = pending_question
             self.registry['review_blockers'][key] = {'revision': entry['revision'], 'reason': reason,
                                                     'evidence_hashes': hashes}
+            if handoff_failure:
+                self.registry['review_blockers'][key]['handoff_failure'] = True
             self.references.update(hashes)
             self.events.append({'type': 'slice_review_blocked', 'slice_id': key,
                                 'revision': entry['revision'], 'reason': reason, 'evidence_hashes': hashes})
@@ -1047,7 +1250,10 @@ class SliceReview:
         else:
             self.approve_review(key, entry, value)
             self.registry['review_blockers'].pop(key, None)
-            if self.review_question_id(key) or not self.registry.get('pending_question_id'):
+            next_slice = next((item for item in self.registry['order'] if item not in self.registry['reviews']), None)
+            if self.adaptive_handoff and key == self.registry['current_slice_id'] and next_slice:
+                self.wait_for_next_slice(next_slice)
+            elif self.review_question_id(key) or not self.registry.get('pending_question_id'):
                 self.advance()
         self.events.append({'type': 'slice_review_action', 'slice_id': key, 'revision': entry['revision'],
                             'action': action, 'user_response': value.get('user_response'),
@@ -1085,9 +1291,16 @@ class SliceReview:
                          'Review exchange exceeds this slice scope')
             self.validate_exchange_scope(packet, q)
             evidence.update(self.blueprint.bound_hashes('conversation', exchange_id))
-        handoff = value.get('handoff_review')
-        evidence.update(self.api.sibling_module('slice_evidence').validate_handoff(
-            self, packet, entry, handoff, verify_symbols=True))
+        readiness = self.require_readiness(key, packet) if self.adaptive_handoff else None
+        handoff = readiness['handoff_review'] if readiness else value.get('handoff_review')
+        if readiness:
+            self.require(value.get('handoff_review', handoff) == handoff,
+                         'Approval must use the saved handoff readiness evidence')
+            evidence.update(readiness['evidence_hashes'])
+            evidence[readiness['path']] = self.registry['artifact_hashes'][readiness['path']]
+        else:
+            evidence.update(self.api.sibling_module('slice_evidence').validate_handoff(
+                self, packet, entry, handoff, verify_symbols=True))
         self.references.update(evidence)
         if action == 'delegate':
             self.require(value.get('delegated_slice_ids') == [key] and self.blueprint.text(value.get('constraints')),
@@ -1097,6 +1310,12 @@ class SliceReview:
             target['constraints'] = value['constraints']
         self.guard_source(self.manifest['approvals'][self.active_approval], self.authorized_paths())
         consent_id = self.consume_consent(value, action, target, slice_id=key)
+        presentation = None
+        if readiness and action == 'approve':
+            exchange = self.blueprint.load('conversation', consent_id)
+            presentation = self.check_slice_presentation(exchange, readiness)
+            self.require(exchange.get('slice_presentation') == presentation,
+                         'Slice consent must bind the current terminal presentation and readiness receipt')
         evidence.update(self.blueprint.bound_hashes('conversation', consent_id))
         review_id = f'{key}-r{entry["revision"]}-review-{self.registry.get("review_sequence", 0) + 1}'
         result = {'review_id': review_id, 'slice_id': key, 'proposal_revision': entry['revision'],
@@ -1107,6 +1326,10 @@ class SliceReview:
                   'conversation_exchange_ids': exchanges,
                   'reviewed_guide_sha256': entry['guide_sha256'], 'reviewed_contract_sha256': entry['contract_sha256'],
                   'approved_at': self.api.utc_now(), 'handoff_review': handoff, 'evidence_hashes': evidence}
+        if readiness:
+            result['readiness_path'] = readiness['path']
+        if presentation:
+            result['presentation'] = presentation
         if action == 'delegate':
             result.update(delegated_slice_ids=[key], constraints=value['constraints'])
         if self.api.has_living_review(self.directory) or value.get('visual_review'):
@@ -1439,8 +1662,14 @@ class SliceReview:
             if action == 'delegate':
                 target['constraints'] = result['constraints']
             self.check_consent(result.get('consent_id'), action, target, result['user_response'])
+            depth = None
+            if result.get('readiness_path'):
+                readiness = self.require_readiness(key, packet)
+                self.require(readiness['path'] == result['readiness_path'],
+                             f'{key}: the approved handoff readiness evidence changed')
+                depth = readiness['depth']
             self.api.sibling_module('slice_evidence').validate_handoff(
-                self, packet, entry, result['handoff_review'], verify_symbols=True)
+                self, packet, entry, result['handoff_review'], verify_symbols=True, depth=depth)
             pending = {q['exchange_id'] for q in self.blueprint.pending()}
             self.require(not pending.intersection(packet['unresolved_question_ids']),
                          f'{key}: proposal contains unresolved design choices')

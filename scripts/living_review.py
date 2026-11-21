@@ -327,26 +327,38 @@ class Documents:
                 del self.section_cache[key]
         return sections
 
-    @staticmethod
-    def add_slice_map_documents(generated, catalog, slice_map, selected):
+    def add_slice_map_documents(self, generated, catalog, slice_map, selected):
+        """Keep current handoff comparisons stable while preserving exact map links."""
         whole_sources = {spec.get('source') for spec in [*generated, *catalog]
                          if isinstance(spec, dict) and not spec.get('heading')}
         used_ids = {spec.get('id') for spec in [*generated, *catalog] if isinstance(spec, dict)}
-        documents = [('slice-review/register.md', 'Current slice register')]
-        for entries in (slice_map.get('documents', {}), selected):
-            for key, entry in entries.items():
-                for field, label in (('guide_path', 'Implementation guide'), ('contract_path', 'Handoff contract')):
-                    if path := entry.get(field):
-                        documents.append((path, f'{key} · {label}'))
-        for path, title in documents:
+
+        def add(path, title, identity, scope=''):
             if path in whole_sources:
-                continue
-            key = 'slice-map-document-' + digest(path.encode())[:16]
+                return
+            key = 'slice-map-document-' + digest(identity.encode())[:16]
             while key in used_ids:
                 key += '-reference'
-            generated.append({'id': key, 'source': path, 'title': title, 'coverage_document': True})
+            generated.append({'id': key, 'source': path, 'title': title, 'slice': scope, 'coverage_document': True})
             whole_sources.add(path)
             used_ids.add(key)
+
+        add('slice-review/register.md', 'Current slice register', 'slice-review/register.md')
+        for key, entry in selected.items():
+            for field, label in (('guide_path', 'Implementation guide'), ('contract_path', 'Handoff contract')):
+                if path := entry.get(field):
+                    add(path, f'{key} · {label}', f'{key}:{field}', key)
+            if guide_path := entry.get('guide_path'):
+                guide_dir = Path(guide_path).parent
+                for path in self.json(entry['contract_path']).get('asset_hashes', {}):
+                    asset = Path(path)
+                    if asset.is_relative_to(guide_dir) and asset.suffix[1:].lower() in FORMATS:
+                        relative = asset.relative_to(guide_dir).as_posix()
+                        add(path, f'{key} · {asset.stem}', f'{key}:{relative}', key)
+        for key, entry in slice_map.get('documents', {}).items():
+            for field, label in (('guide_path', 'Map guide snapshot'), ('contract_path', 'Map contract snapshot')):
+                if path := entry.get(field):
+                    add(path, f'{key} · {label}', path)
 
 
 def scope_stamp(section, scope):
@@ -382,6 +394,9 @@ def note_signature(section):
 
 def track_corrections(sections, previous, previous_revision=None):
     for key, section in sections.items():
+        if section['slice'] and section.get('coverage_document'):
+            # Frozen handoff references compare published revisions directly.
+            continue
         prior = previous.get(key, {})
         pending = prior.get('pending_note')
         content_changed = bool(prior.get('content_stamp') and

@@ -189,7 +189,7 @@ def _heading_lines(lines):
                 yield heading[1], number
 
 
-def validate_handoff(review, packet, entry, value, *, verify_symbols=False):
+def validate_handoff(review, packet, entry, value, *, verify_symbols=False, depth=None):
     """Validate a no-code walkthrough bound to one exact frozen slice revision.
 
     `value` contains exact slice/revision/digests; reviewer/result; detailed
@@ -206,25 +206,30 @@ def validate_handoff(review, packet, entry, value, *, verify_symbols=False):
     for field in ('guide_sha256', 'contract_sha256'):
         _require(review, value.get(field) == entry.get(field),
                  f'Handoff review must bind the exact {field}')
+    independent = depth in (None, 'independent')
+    context = 'fresh_session' if independent else 'coordinator'
     reviewer = value.get('reviewer')
     _require(review, isinstance(reviewer, str) and reviewer.strip()
-             and reviewer != packet.get('owner'), 'Independent reviewer is required')
+             and (not independent or reviewer != packet.get('owner')),
+             'Name the independent reviewer' if independent else 'Name the reviewing coordinator')
     _require(review, value.get('result') == 'PASS', 'Handoff walkthrough must pass before approval')
 
     schema_version = packet.get('evidence_schema_version', 1)
-    if schema_version >= 2:
+    evidence = _paths(review, value.get('evidence_paths'))
+    if schema_version >= 2 or depth:
         walkthrough = value.get('walkthrough')
         _require(review, isinstance(walkthrough, dict)
                  and walkthrough.get('mode') == 'no_code'
-                 and walkthrough.get('context') == 'fresh_session'
-                 and walkthrough.get('independent') is True
+                 and walkthrough.get('context') == context
+                 and walkthrough.get('independent') is independent
                  and walkthrough.get('performed') is True
                  and walkthrough.get('test_execution') is False
                  and isinstance(walkthrough.get('attestation'), str)
                  and walkthrough['attestation'].strip(),
-                 'An independent no-code walkthrough attestation is required')
+                 'An independent no-code walkthrough attestation with context fresh_session is required'
+                 if independent else 'A coordinator no-code walkthrough attestation is required')
         _require(review, isinstance(walkthrough.get('evidence_path'), str)
-                 and walkthrough['evidence_path'] in value.get('evidence_paths', []),
+                 and walkthrough['evidence_path'] in evidence,
                  'Walkthrough evidence must be included in evidence_paths')
 
     guide_path = review.api.artifact_file(review.directory, entry.get('guide_path'))
@@ -248,13 +253,22 @@ def validate_handoff(review, packet, entry, value, *, verify_symbols=False):
         next_heading = min((line for line in headings.values() if line > headings[title]), default=len(guide_lines) + 1)
         _require(review, headings[title] < start <= end < next_heading,
                  f'Handoff citation must point inside {title}')
-        _require(review, schema_version < 3 or finding.get('result') != 'BLOCKED',
+        _require(review, (schema_version < 3 and not depth) or finding.get('result') != 'BLOCKED',
                  f'Handoff records a blocker in {title}: {finding["finding"]}')
+        _require(review, not depth or finding.get('result') == 'PASS',
+                 f'Handoff finding is unresolved in {title}: {finding["finding"]}')
         if finding.get('result') == 'PASS' and any(line.strip() for line in guide_lines[start - 1:end]):
             reviewed_sections.add(title)
-    if schema_version >= 3:
+    if schema_version >= 3 or depth:
         normative_sections = {'Finished experience or service contract', 'Detailed functional requirements',
                               'Step-by-step implementation recipe'}
+        if depth:
+            normative_sections.update({
+                'What exists now', 'Architecture and anatomy', 'Visual specification', 'Interface specification',
+                'State and scenario matrix', 'Data and security rules', 'Exact implementation footprint',
+                'Dependencies and integration', 'Worked examples and diagrams', 'Traceability matrix',
+                'Tests and acceptance evidence', 'Safety, rollback and prohibited deviations', 'Fresh-session handoff',
+            })
         missing = normative_sections - reviewed_sections
         _require(review, not missing, f'Handoff needs passing, line-cited findings for normative guide sections: '
                  f'{", ".join(sorted(missing))}')
@@ -270,6 +284,10 @@ def validate_handoff(review, packet, entry, value, *, verify_symbols=False):
     known_sources.update(_anchor_paths({key: packet}))
     _require(review, set(sources) <= known_sources,
              'Handoff source paths must be grounded in this slice contract')
+    if depth:
+        missing_sources = _anchor_paths({key: packet}) - set(sources)
+        _require(review, not missing_sources,
+                 f'Trace existing behavior at the approved repository anchors: {sorted(missing_sources)}')
 
     scenarios = value.get('read_only_scenarios')
     _require(review, isinstance(scenarios, list) and bool(scenarios),
@@ -306,7 +324,7 @@ def validate_handoff(review, packet, entry, value, *, verify_symbols=False):
                          for field in ('scenario', 'expected', 'observed'))
                  and scenario.get('read_only') is True,
                  'Each walkthrough must name expected and observed outcomes and be read-only')
-        if schema_version >= 2:
+        if schema_version >= 2 or depth:
             _require(review, isinstance(scenario.get('observation_basis'), str)
                      and scenario['observation_basis'].strip(),
                      'Walkthrough observations need a source-based observation basis')
@@ -334,19 +352,22 @@ def validate_handoff(review, packet, entry, value, *, verify_symbols=False):
                         exists = any(target.search(line) for line in lines)
                     _require(review, exists,
                              f'Cannot resolve walkthrough symbol {symbol!r} in {source_path}')
+        _require(review, not depth or scenario['scenario'] not in actual_scenarios,
+                 f'Duplicate walkthrough scenario {scenario["scenario"]}')
         actual_scenarios[scenario['scenario']] = scenario
-    if schema_version >= 2:
+    if schema_version >= 2 or depth:
         try:
             evidence_path = review.api.artifact_file(review.directory, walkthrough['evidence_path'])
             walkthrough_record = json.loads(evidence_path.read_text(encoding='utf-8'))
         except (OSError, ValueError, TypeError):
             walkthrough_record = None
         _require(review, isinstance(walkthrough_record, dict)
-                 and walkthrough_record.get('record_type') == 'independent_no_code_walkthrough'
+                 and walkthrough_record.get('record_type') == (
+                     'independent_no_code_walkthrough' if independent else 'coordinator_no_code_walkthrough')
                  and walkthrough_record.get('reviewer') == reviewer
-                 and walkthrough_record.get('context') == 'fresh_session'
+                 and walkthrough_record.get('context') == context
                  and walkthrough_record.get('test_execution') is False,
-                 'A structured no-code walkthrough record with the independent reviewer is required')
+                 f'A structured no-code walkthrough record from the {context} is required')
         record_sources = walkthrough_record.get('source_paths')
         _require(review, isinstance(record_sources, list) and bool(record_sources)
                  and all(isinstance(path, str) and path in known_sources for path in record_sources),
@@ -416,7 +437,6 @@ def validate_handoff(review, packet, entry, value, *, verify_symbols=False):
     _require(review, expected_ids <= observed_ids,
              f'Handoff review omits acceptance checks: {sorted(expected_ids - observed_ids)}')
 
-    evidence = _paths(review, value.get('evidence_paths'))
     # Source documents and reviewer evidence are both content addressed.
     anchor_paths = _anchor_paths({key: packet})
     hash_sources = [path for path in sources if path not in anchor_paths]

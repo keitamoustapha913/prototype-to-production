@@ -6,6 +6,8 @@
   "consent_action": "approve",
   "question": "",
   "response": "",
+  "presentation_path": "",
+  "evidence_paths": [],
   "target": {
     "slices": [
       {

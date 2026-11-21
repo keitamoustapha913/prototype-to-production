@@ -1394,7 +1394,8 @@ def initialize(directory: Path, scope: str, next_action: str | None, mode: str |
             "next_action": next_action or template["next_action"],
         })
         if template["initiative_mode"] == "blueprint":
-            template.update(schema_version=5, slice_review_required=True, slice_map_required=True, plan_review_required=True,
+            template.update(schema_version=5, slice_review_required=True, slice_map_required=True,
+                            adaptive_handoff_required=True, plan_review_required=True,
                             requirement_traceability_required=True)
         if guided_design_review:
             template["guided_design_review"] = True
@@ -2500,8 +2501,10 @@ def check_work_state(directory: Path, manifest: dict) -> list[str]:
             errors.append(f"Task {task_id}: marked done with unfinished work")
     if active_id and active_id in items:
         active = items[active_id]
+        continuation = manifest.get("slice_review", {}).get("pending_continue")
         if (initiative_mode(manifest) == "blueprint" and active.get("status") == "waiting_user"
-                and not active.get("pending_question_id")):
+                and not (active.get("pending_question_id") or (continuation
+                         and active.get("slice_review", {}).get("pending_continue") == continuation))):
             errors.append(f"Task {active_id}: waiting_user cursor needs its exact conversation exchange linked")
         if active.get("status") == "done":
             errors.append(f"Completed task {active_id} cannot remain the active cursor")
@@ -3251,6 +3254,8 @@ def print_resume(directory: Path, project_root: Path, *, delivery_slice: str | N
                   f"{slice_map['target']['map_path']}")
         if review["current_slice_id"]:
             print(f"Open slice: {review['current_slice_id']} revision {review['current_revision']}")
+            if ready := review["handoff_readiness"].get(review["current_slice_id"]):
+                print(ready["terminal"], end="")
         if review["active_package"]:
             package = review["packages"][review["active_package"]]
             print(f"Package index: {package['index_path']} (hash {package['package_hash']})")

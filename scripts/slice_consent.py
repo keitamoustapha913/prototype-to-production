@@ -11,6 +11,10 @@ def review_target(key, entry):
 def confirmation_phrases(action, target):
     if action == 'confirm_map':
         return {f"{verb} {target['map_id']}" for verb in ('confirm', 'confirm slice map', 'approve slice map')}
+    if action == 'continue':
+        item, = target['slices']
+        return {f"continue to {item['slice_id']} revision {item['proposal_revision']}", 'continue to the next slice',
+                'continue'}
     if action in {'approve', 'delegate'}:
         items = target['slices']
         if action == 'approve' and len(items) != 1:

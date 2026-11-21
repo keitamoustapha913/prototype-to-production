@@ -4,6 +4,8 @@
   "current_revision": null,
   "pending_question_id": null,
   "pending_question": null,
+  "pending_continue": null,
+  "handoff_readiness": {},
   "completed_review_ids": [],
   "changed_dependents": [],
   "continuing_releases": {},

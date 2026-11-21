@@ -59,6 +59,218 @@ class BlueprintTests(unittest.TestCase):
         manifest['slice_map_required'] = True
         (self.directory / 'manifest.json').write_text(json.dumps(manifest))
 
+    def enable_adaptive_handoff(self):
+        manifest = self.manifest()
+        manifest['adaptive_handoff_required'] = True
+        (self.directory / 'manifest.json').write_text(json.dumps(manifest))
+
+    def readiness_input(self, slice_id='items-slice', *, independent=False, complexity='simple', risk_factors=()):
+        value = self.review_input(slice_id, adaptive=True)
+        handoff = value['handoff_review']
+        if not independent:
+            handoff['walkthrough'].update(context='coordinator', independent=False)
+            path = self.directory / handoff['walkthrough']['evidence_path']
+            record = json.loads(path.read_text())
+            record.update(context='coordinator', record_type='coordinator_no_code_walkthrough')
+            path.write_text(json.dumps(record))
+        return value | {'action': 'readiness', 'assessment': {
+            'complexity': complexity, 'risk_factors': list(risk_factors),
+            'rationale': 'Compared the candidate steps with the approved handler, guard and storage behavior.',
+            'specification_analysis': 'Traced the membership check, storage call and response to the contract and existing handler.',
+        }}
+
+    def test_adaptive_handoff_gates_discussion_and_survives_through_package_lock(self):
+        feature = self.reviewed_blueprint()
+        self.enable_slice_map()
+        self.enable_adaptive_handoff()
+        candidate = self.guide_candidate(feature) | {'boundary_reason': 'Keep the existing handler and item query together.'}
+        scope = self.review_cli('slice-plan', {'slices': [candidate]})['slice_map']['target']
+        self.cli('slice-map')
+        exchange = {'exchange_id': 'confirm-map', 'phase': 'slice_review', 'record_type': 'slice_consent',
+                    'status': 'decided', 'consent_action': 'confirm_map', 'target': scope,
+                    'question': f'Confirm this breakdown? {json.dumps(scope)}', 'response': f"Confirm {scope['map_id']}"}
+        self.cli('conversation-record', '--exchange-file', self.payload('confirm-map', exchange))
+        question = {'exchange_id': 'slice-question', 'phase': 'slice_review', 'status': 'open',
+                    'slice_id': 'items-slice', 'question': 'Which source handles authorization?',
+                    'scope_reason': 'Review the existing membership check.', 'basis': 'Preserve existing access.'}
+        self.assertIn('verify handoff readiness', self.cli(
+            'conversation-record', '--exchange-file', self.payload('question', question), ok=False).stderr)
+        self.assertIn('verify handoff readiness', self.with_slice_consent(
+            'slice-review-record', self.review_input(), ok=False).stderr)
+        readiness = self.readiness_input()
+        security = readiness['assessment'] | {'risk_factors': ['security']}
+        assessed = self.review_cli('slice-guide-validate', {'slice_id': 'items-slice', 'assessment': security})
+        self.assertEqual(assessed['depth'], 'independent')
+        incomplete = copy.deepcopy(readiness)
+        incomplete['handoff_review']['findings'] = [
+            finding for finding in incomplete['handoff_review']['findings']
+            if finding['section'] != 'Data and security rules']
+        self.assertIn('Data and security rules', self.review_cli('slice-review-record', incomplete, ok=False).stderr)
+        report = self.review_cli('slice-review-record', readiness)
+        receipt = report['handoff_readiness']['items-slice']
+        self.assertEqual(receipt['depth'], 'standard')
+        self.assertIn('Ready for discussion', self.cli('resume').stdout)
+        self.assertFalse(report['implementation_authorized'])
+        self.assertFalse(report['reviews'])
+        self.assertIn('Attach the saved terminal presentation', self.with_slice_consent(
+            'slice-review-record', readiness | {'action': 'approve'}, ok=False).stderr)
+        previous_presentation = receipt['terminal'] + '\nUse the current service and preserve membership checks.\n'
+        revision = self.guide_candidate(feature, revision=2) | {'boundary_reason': candidate['boundary_reason']}
+        report = self.review_cli('slice-draft', revision)
+        self.assertNotIn('items-slice', report['handoff_readiness'])
+        self.assertIn('confirm-map', report['slice_map']['consent_id'])
+        readiness = self.readiness_input()
+        report = self.review_cli('slice-review-record', readiness)
+        receipt = report['handoff_readiness']['items-slice']
+        approval = {key: value for key, value in readiness.items() if key not in ('handoff_review', 'assessment')}
+        self.assertIn('current readiness summary', self.with_slice_consent(
+            'slice-review-record', approval | {'action': 'approve'}, ok=False,
+            presentation=previous_presentation).stderr)
+        report = self.review_cli('slice-review-record', approval | {'action': 'approve'})
+        self.assertEqual(report['reviews']['items-slice']['readiness_path'], receipt['path'])
+        self.assertEqual(report['reviews']['items-slice']['presentation']['readiness_path'], receipt['path'])
+        self.lock_reviewed_package()
+        self.cli('validate')
+
+    def test_adaptive_handoff_rejects_unresolved_findings_and_requires_an_ambiguity_resolution(self):
+        feature = self.reviewed_blueprint()
+        self.enable_adaptive_handoff()
+        self.review_cli('slice-plan', {'slices': [self.guide_candidate(feature)]})
+        readiness = self.readiness_input(independent=True, risk_factors=('ambiguity',))
+        finding = next(row for row in readiness['handoff_review']['findings'] if row['section'] == 'Data and security rules')
+        unresolved = copy.deepcopy(readiness)
+        unresolved['handoff_review']['findings'].append(finding | {
+            'result': 'WARNING', 'finding': 'Outsider handling is materially unclear.',
+            'resolution': 'The implementer must decide whether to reject an outsider.',
+        })
+        self.assertIn('finding is unresolved', self.review_cli('slice-review-record', unresolved, ok=False).stderr)
+        self.assertIn('resolved the material ambiguity', self.review_cli(
+            'slice-review-record', readiness, ok=False).stderr)
+        resolution = 'The approved API contract resolves the question by requiring a 403 for outsiders.'
+        readiness['assessment']['ambiguity_resolution'] = resolution
+        result = self.review_cli('slice-review-record', readiness)['handoff_readiness']['items-slice']
+        self.assertIn(resolution, result['terminal'])
+        self.assertEqual(result['depth'], 'independent')
+
+    def test_adaptive_handoff_rejects_corrupt_frozen_illustrations(self):
+        feature = self.reviewed_blueprint()
+        self.enable_adaptive_handoff()
+        candidate = self.guide_candidate(feature)
+        guide = self.directory / candidate['guide_path']
+        guide.write_text(guide.read_text().replace('[Diagram source](diagrams/items.mmd)',
+                         '[Diagram source](diagrams/items.mmd)\n\n![Expected layout](examples/layout.png)'))
+        path = Path(candidate['guide_path']).parent / 'examples/layout.png'
+        candidate['asset_paths'].append(self.artifact(path.as_posix(), 'corrupt image data'))
+        self.review_cli('slice-plan', {'slices': [candidate]})
+        failure = self.review_cli('slice-review-record', self.readiness_input(), ok=False)
+        self.assertIn('layout.png: invalid PNG image', failure.stderr)
+
+    def test_revised_slice_map_preserves_the_continuation_checkpoint(self):
+        self.start(review=True)
+        self.exchange()
+        self.record_baseline(self.baseline())
+        self.record_reviewed_plan(self.plan())
+        blueprint = self.blueprint()
+        feature = blueprint['features'][0]
+        feature['implementation_paths'].append('src/adapter.py')
+        feature['acceptance_checks'].append(feature['acceptance_checks'][0] | {
+            'check_id': 'items-second', 'command': self.test_command('api', 'items-second')})
+        self.cli('blueprint-record', '--blueprint-file', self.payload('blueprint', blueprint))
+        coverage = self.coverage()
+        coverage['mappings'][0]['acceptance_ids'].append('items-second')
+        self.cli('blueprint-coverage', '--coverage-file', self.payload('coverage', coverage))
+        self.cli('approve', '--approval-file', self.payload('approval', self.approval()))
+        self.enable_slice_map()
+        self.enable_adaptive_handoff()
+
+        def candidate(index, key, path, revision=1):
+            part = feature | {'acceptance_checks': [feature['acceptance_checks'][index]]}
+            return self.guide_candidate(part, key, path=path, revision=revision) | {
+                'boundary_reason': f'Keep the approved responsibility in {key}.'}
+
+        def confirm(register, exchange_id):
+            self.cli('slice-map')
+            target = register['slice_map']['target']
+            exchange = {'exchange_id': exchange_id, 'phase': 'slice_review', 'record_type': 'slice_consent',
+                        'status': 'decided', 'consent_action': 'confirm_map', 'target': target,
+                        'question': f'Confirm {json.dumps(target)}?', 'response': f"Confirm {target['map_id']}"}
+            self.cli('conversation-record', '--exchange-file', self.payload(exchange_id, exchange))
+
+        first = candidate(0, 'items-slice', 'src/service.py')
+        second = candidate(1, 'adapter-slice', 'src/adapter.py')
+        confirm(self.review_cli('slice-plan', {'slices': [first, second]}), 'original-map')
+        readiness = self.readiness_input()
+        self.review_cli('slice-review-record', readiness)
+        approval = {key: value for key, value in readiness.items() if key not in ('handoff_review', 'assessment')}
+        original = self.review_cli('slice-review-record', approval | {'action': 'approve'})['pending_continue']
+        amended = candidate(1, 'adapter-slice', 'src/adapter.py', 2) | {
+            'boundary_reason': 'Keep the second check separate to verify the adapter boundary.'}
+        register = self.review_cli('slice-plan', {'slices': [{'slice_id': 'items-slice', 'retain': True}, amended],
+                                                 'amendment': 'Clarify the adapter boundary'})
+        confirm(register, 'revised-map')
+        register = self.review_cli('slice-register')
+        self.assertIsNone(register['current_slice_id'])
+        target = register['pending_continue']
+        self.assertNotEqual(original, target)
+        self.assertEqual(target['slices'][0]['proposal_revision'], 2)
+        exchange = {'exchange_id': 'continue-adapter', 'phase': 'slice_review', 'record_type': 'slice_consent',
+                    'status': 'decided', 'consent_action': 'continue', 'target': target,
+                    'question': f'Continue with {json.dumps(target)}?', 'response': 'Continue to adapter-slice revision 2'}
+        self.cli('conversation-record', '--exchange-file', self.payload('continue-adapter', exchange))
+        self.assertEqual(self.review_cli('slice-register')['current_slice_id'], 'adapter-slice')
+
+    def test_adaptive_handoff_requires_explicit_continuation_and_escalates_a_failed_revision(self):
+        feature = self.reviewed_blueprint(multiple=True)
+        self.enable_adaptive_handoff()
+        self.review_cli('slice-plan', {'slices': [self.guide_candidate(feature),
+            self.guide_candidate(feature, 'adapter-slice', path='src/adapter.py', deps=('items-slice',))]})
+        readiness = self.readiness_input()
+        assessed = self.review_cli('slice-guide-validate', {'slice_id': 'items-slice',
+                                                           'assessment': readiness['assessment']})
+        self.assertEqual(assessed['depth'], 'detailed')
+        self.review_cli('slice-review-record', readiness)
+        approval = {key: value for key, value in readiness.items() if key not in ('handoff_review', 'assessment')}
+        report = self.review_cli('slice-review-record', approval | {'action': 'approve'})
+        target = report['pending_continue']
+        self.assertIsNone(report['current_slice_id'])
+        resumed = json.loads(self.cli('resume', '--format', 'json').stdout)
+        self.assertEqual(resumed['slice_review']['pending_continue'], target)
+        self.assertEqual(resumed['active_work']['status'], 'waiting_user')
+        readiness = self.readiness_input('adapter-slice')
+        self.assertIn('explicit instruction to continue', self.review_cli(
+            'slice-review-record', readiness, ok=False).stderr)
+        exchange = {'exchange_id': 'continue-slices', 'phase': 'slice_review', 'record_type': 'slice_consent',
+                    'status': 'decided', 'consent_action': 'continue', 'target': target,
+                    'question': f'Continue with {json.dumps(target)}?', 'response': 'Yes'}
+        self.cli('conversation-record', '--exchange-file', self.payload('continue', exchange), ok=False)
+        self.cli('conversation-record', '--exchange-file', self.payload(
+            'continue', exchange | {'response': 'Continue to adapter-slice revision 1'}))
+        self.assertIsNone(self.review_cli('slice-register')['pending_continue'])
+        self.review_cli('slice-review-record', {'action': 'require-independent', 'slice_id': 'adapter-slice',
+                        'proposal_revision': 1, 'user_response': 'Use a fresh agent to review the adapter.'})
+        assessed = self.review_cli('slice-guide-validate', {'slice_id': 'adapter-slice',
+                                                           'assessment': readiness['assessment']})
+        self.assertIn('The user requested independent review', assessed['reasons'])
+        self.review_cli('slice-review-record', {'action': 'block', 'slice_id': 'adapter-slice',
+                        'proposal_revision': 1, 'handoff_failure': True,
+                        'reason': 'The recipe leaves the adapter response handling unclear.',
+                        'evidence_paths': [readiness['handoff_review']['evidence_paths'][0]]})
+        gap = self.exchange('adapter-gap', phase='slice_review', status='open', slice_id='adapter-slice',
+                            feature_ids=['items-feature'], handoff_blocker=True,
+                            evidence_paths=readiness['handoff_review']['evidence_paths'])
+        self.exchange('adapter-answer', phase='slice_review', slice_id='adapter-slice', proposal_revision=1,
+                      feature_ids=['items-feature'], responds_to='adapter-gap', record_type='slice_detail',
+                      clarifies_decision_ids=['choose-layout'], question=gap['question'])
+        self.review_cli('slice-draft', self.guide_candidate(
+            feature, 'adapter-slice', revision=2, path='src/adapter.py', deps=('items-slice',),
+            detail='adapter-answer'))
+        readiness = self.readiness_input('adapter-slice')
+        self.assertIn('fresh_session', self.review_cli('slice-review-record', readiness, ok=False).stderr)
+        report = self.review_cli('slice-review-record', self.readiness_input('adapter-slice', independent=True))
+        self.assertEqual(report['handoff_readiness']['adapter-slice']['depth'], 'independent')
+        self.assertIn('A previous handoff readiness check failed',
+                      report['handoff_readiness']['adapter-slice']['reasons'])
+
     def test_slice_map_requires_explicit_confirmation_of_current_breakdown(self):
         feature = self.reviewed_blueprint()
         self.enable_slice_map()
@@ -697,6 +909,7 @@ document.getElementById('observation').textContent = JSON.stringify({
         manifest.pop('initial_alignment_required', None)
         manifest.pop('requirement_traceability_required', None)
         manifest['slice_map_required'] = False
+        manifest['adaptive_handoff_required'] = False
         if not plan_review:
             manifest.pop('plan_review_required', None)
         if not review:
@@ -1613,7 +1826,7 @@ document.getElementById('observation').textContent = JSON.stringify({
         self.cli('approve', '--approval-file', self.payload('approval', self.approval()))
         return blueprint['features'][0]
 
-    def with_slice_consent(self, command, value, *, response=None, ok=True):
+    def with_slice_consent(self, command, value, *, response=None, ok=True, presentation=None):
         if command == 'slice-review-record':
             action = value['action']
             target = {'slices': [{field: value[field] for field in
@@ -1634,6 +1847,14 @@ document.getElementById('observation').textContent = JSON.stringify({
         exchange = {'exchange_id': consent_id, 'phase': 'slice_review', 'record_type': 'slice_consent',
                     'status': 'decided', 'question': f'Confirm {action} for {json.dumps(target)}',
                     'response': quote, 'consent_action': action, 'target': target}
+        if command == 'slice-review-record' and action == 'approve':
+            receipt = self.manifest()['slice_review'].get('handoff_readiness', {}).get(value['slice_id'])
+            if receipt and (ok or presentation is not None):
+                if presentation is None:
+                    presentation = receipt['terminal'] + ('\nThe service checks membership before loading items.\n'
+                        'Member -> list items. Outsider -> 403. Verify both responses against the approved check.\n')
+                path = self.artifact(f'inputs/{consent_id}-terminal.txt', presentation)
+                exchange.update(presentation_path=path, evidence_paths=[path])
         result = self.cli('conversation-record', '--exchange-file', self.payload(consent_id, exchange), ok=ok)
         return value | {'consent_id': consent_id} if ok else result
 
@@ -1796,7 +2017,7 @@ document.getElementById('observation').textContent = JSON.stringify({
             'dependency_contracts': dependency_contracts,
         }
 
-    def review_input(self, slice_id='items-slice', *, action='approve', exchanges=()):
+    def review_input(self, slice_id='items-slice', *, action='approve', exchanges=(), adaptive=False):
         item = self.manifest()['slice_review']['selected'][slice_id]
         contract = json.loads((self.directory / item['contract_path']).read_text())
         features = contract.get('feature_contracts', [])
@@ -1806,6 +2027,15 @@ document.getElementById('observation').textContent = JSON.stringify({
                             if line.strip() == '## State and scenario matrix')
         finding_sections = ['Finished experience or service contract', 'Detailed functional requirements',
                             'Step-by-step implementation recipe']
+        if adaptive:
+            finding_sections += ['What exists now', 'Architecture and anatomy', 'Visual specification',
+                                 'Interface specification', 'State and scenario matrix', 'Data and security rules',
+                                 'Exact implementation footprint', 'Dependencies and integration',
+                                 'Worked examples and diagrams', 'Traceability matrix', 'Tests and acceptance evidence',
+                                 'Safety, rollback and prohibited deviations', 'Fresh-session handoff']
+        sources = [item['guide_path']]
+        if adaptive:
+            sources += sorted({anchor['path'] for anchor in contract['approved_source_anchors']})
         normative_findings = []
         for section in finding_sections:
             start = guide_lines.index(f'## {section}') + 1
@@ -1842,7 +2072,7 @@ document.getElementById('observation').textContent = JSON.stringify({
                  for row in scenario_rows for reference in row['references']]
         handoff_path = self.artifact(f'inputs/{slice_id}-r{item["revision"]}-handoff.json', json.dumps({
             'record_type': 'independent_no_code_walkthrough', 'reviewer': 'fresh-reader',
-            'context': 'fresh_session', 'test_execution': False, 'source_paths': [item['guide_path']],
+            'context': 'fresh_session', 'test_execution': False, 'source_paths': sources,
             'cases': cases,
         }))
         value = {'action': action, 'slice_id': slice_id, 'proposal_revision': item['revision'],
@@ -1855,11 +2085,12 @@ document.getElementById('observation').textContent = JSON.stringify({
                      'walkthrough': {'mode': 'no_code', 'context': 'fresh_session', 'independent': True,
                          'performed': True, 'test_execution': False, 'evidence_path': handoff_path,
                          'attestation': 'Read the frozen guide and traced existing service paths without implementing or running tests.'},
-                     'findings': [{'section': 'State and scenario matrix', 'citation': f'line {section_line + 1}',
+                     'findings': normative_findings if adaptive else [
+                         {'section': 'State and scenario matrix', 'citation': f'line {section_line + 1}',
                          'finding': 'The guarded member and outsider outcomes are explicit.',
                          'resolution': 'Confirmed the stated outcomes against the approved contract.'},
                          *normative_findings],
-                     'source_paths': [item['guide_path']],
+                     'source_paths': sources,
                      'read_only_scenarios': scenario_rows,
                      'acceptance_checks': [{'check_id': check['check_id'], 'expected': check['expected'],
                          'observed': check['expected'], 'result': 'PASS'} for check in checks],
