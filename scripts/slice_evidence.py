@@ -668,8 +668,11 @@ def render_recap(review, package_id, collection_path, report):
              f'- Blueprint version: {review.manifest.get("approved_version", "unknown")}',
              f'- Collection report: `{collection_path}`',
              f'- Collection SHA-256: `{registry.get("artifact_hashes", {}).get(collection_path, "unknown")}`',
-             f'- Collection result: **{report.get("result", "BLOCKED")}**', '',
-             '## Blueprint approval exceptions', '']
+             f'- Collection result: **{report.get("result", "BLOCKED")}**']
+    if slice_map := report.get('slice_map'):
+        target = slice_map['target']
+        lines.append(f"- Confirmed slice map `{target['map_id']}` · `{target['map_path']}` · `{target['map_sha256']}`")
+    lines.extend(['', '## Blueprint approval exceptions', ''])
     approved = review.manifest.get('approvals', {}).get(review.active_approval, {})
     exceptions = approved.get('exceptions', [])
     lines.extend(f'- {exception}' for exception in exceptions)

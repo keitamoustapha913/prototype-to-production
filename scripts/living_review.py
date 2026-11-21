@@ -161,6 +161,13 @@ class Documents:
                         generated.append({'id': f'traceability-spec-{version}-{index}', 'source': path,
                                           'title': f'{version} · {Path(path).stem}',
                                           'coverage_document': True})
+            register = manifest.get('slice_review', {})
+            if register.get('approval_id') == manifest.get('active_approval_id') and (slice_map := register.get('slice_map')):
+                target = slice_map['target']
+                status = 'confirmed' if slice_map.get('consent_id') else 'proposed'
+                generated.append({'id': 'implementation-slice-map', 'source': target['map_path'],
+                                  'title': f'Implementation slice map · {status}', 'coverage_document': True})
+                self.add_slice_map_documents(generated, selected_specs, slice_map, register['selected'])
             selected_specs = [*generated, *selected_specs]
             catalog = {**catalog, 'sections': selected_specs}
             self.catalog_specs = deepcopy(selected_specs)
@@ -319,6 +326,27 @@ class Documents:
             for key in self.section_cache.keys() - active_ids:
                 del self.section_cache[key]
         return sections
+
+    @staticmethod
+    def add_slice_map_documents(generated, catalog, slice_map, selected):
+        whole_sources = {spec.get('source') for spec in [*generated, *catalog]
+                         if isinstance(spec, dict) and not spec.get('heading')}
+        used_ids = {spec.get('id') for spec in [*generated, *catalog] if isinstance(spec, dict)}
+        documents = [('slice-review/register.md', 'Current slice register')]
+        for entries in (slice_map.get('documents', {}), selected):
+            for key, entry in entries.items():
+                for field, label in (('guide_path', 'Implementation guide'), ('contract_path', 'Handoff contract')):
+                    if path := entry.get(field):
+                        documents.append((path, f'{key} · {label}'))
+        for path, title in documents:
+            if path in whole_sources:
+                continue
+            key = 'slice-map-document-' + digest(path.encode())[:16]
+            while key in used_ids:
+                key += '-reference'
+            generated.append({'id': key, 'source': path, 'title': title, 'coverage_document': True})
+            whole_sources.add(path)
+            used_ids.add(key)
 
 
 def scope_stamp(section, scope):
@@ -518,7 +546,7 @@ class History:
         """Persist deletions separately from the editable catalog and section snapshots."""
         records = {key: json.loads(raw) for key, raw in self.db.execute('SELECT id,record FROM removals')}
         for key, prior in previous.items():
-            if key in sections:
+            if key in sections or prior.get('coverage_document'):
                 continue
             record = records.get(key)
             if record is None or not record.get('active'):

@@ -1,0 +1,14 @@
+{
+  "exchange_id": "confirm-slice-map-v1",
+  "phase": "slice_review",
+  "record_type": "slice_consent",
+  "status": "decided",
+  "consent_action": "confirm_map",
+  "question": "",
+  "response": "",
+  "target": {
+    "map_id": "",
+    "map_path": "",
+    "map_sha256": ""
+  }
+}

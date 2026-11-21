@@ -135,7 +135,7 @@ def all_slices_accepted(directory: Path, manifest: dict) -> bool:
 REVIEW_COMMANDS = (
     "slice-plan", "slice-draft", "slice-guide-validate", "slice-review-record",
     "slice-register", "slice-collection-validate", "slice-package-lock",
-    "implementation-authorize", "slice-release", "slice-review-migrate", "slice-package-preview",
+    "implementation-authorize", "slice-release", "slice-review-migrate", "slice-package-preview", "slice-map",
 )
 REVIEW_READ_ONLY = {"slice-guide-validate", "slice-register", "slice-package-preview"}
 
@@ -178,6 +178,9 @@ def run_slice_review(directory: Path, command: str, input_file: str | None) -> N
     with coordinator_lock(directory):
         if command not in REVIEW_READ_ONLY and recover_workflow_transition(directory, request, replay=False):
             state = slice_review_state(directory, manifest_at(directory))
+            if command == "slice-map":
+                print(state.map_presentation(), end="")
+                return
             result = state.summary()
             if command == "slice-collection-validate":
                 result = read_json(artifact_file(directory, result["collection_report"]["path"]))
@@ -192,6 +195,9 @@ def run_slice_review(directory: Path, command: str, input_file: str | None) -> N
             raise StateError("Slice review requires blueprint mode")
         state = slice_review_state(directory, manifest)
         result = state.run(request)
+        if command == "slice-map":
+            print(result, end="")
+            return
         print(json.dumps(result, indent=2, ensure_ascii=False))
         if isinstance(result, dict) and result.get("result") == "BLOCKED":
             raise StateError(result.get("explanation", "Resolve the blockers in the validation report"))
@@ -1388,7 +1394,7 @@ def initialize(directory: Path, scope: str, next_action: str | None, mode: str |
             "next_action": next_action or template["next_action"],
         })
         if template["initiative_mode"] == "blueprint":
-            template.update(schema_version=5, slice_review_required=True, plan_review_required=True,
+            template.update(schema_version=5, slice_review_required=True, slice_map_required=True, plan_review_required=True,
                             requirement_traceability_required=True)
         if guided_design_review:
             template["guided_design_review"] = True
@@ -3240,6 +3246,9 @@ def print_resume(directory: Path, project_root: Path, *, delivery_slice: str | N
         print("Dispatchable reviewed slices: " + (", ".join(packet["dispatchable_slices"]) or "none"))
         if review["register_path"]:
             print(f"Slice review register: {review['register_path']}")
+        if slice_map := review.get("slice_map"):
+            print(f"Slice map ({'confirmed' if slice_map.get('consent_id') else 'proposed'}): "
+                  f"{slice_map['target']['map_path']}")
         if review["current_slice_id"]:
             print(f"Open slice: {review['current_slice_id']} revision {review['current_revision']}")
         if review["active_package"]:
@@ -3308,7 +3317,7 @@ def main(argv: list[str] | None = None) -> int:
         sub = commands.add_parser(name)
         sub.add_argument("--project-root", required=True)
         sub.add_argument("--initiative-id", required=name not in {"resume", "validate"})
-        if name in REVIEW_COMMANDS and name not in {"slice-register", "slice-package-preview"}:
+        if name in REVIEW_COMMANDS and name not in {"slice-register", "slice-package-preview", "slice-map"}:
             sub.add_argument("--input-file", required=name not in {"slice-collection-validate"})
         if name == "review-viewer":
             sub.add_argument("--port", type=int)

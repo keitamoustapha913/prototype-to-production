@@ -53,6 +53,147 @@ class BlueprintTests(unittest.TestCase):
         self.env = {**os.environ, 'GIT_CEILING_DIRECTORIES': str(self.root.parent)}
         self.env.pop('P2P_APP_URL', None)
 
+    def enable_slice_map(self):
+        # The shared approved-blueprint fixture predates map confirmation.
+        manifest = self.manifest()
+        manifest['slice_map_required'] = True
+        (self.directory / 'manifest.json').write_text(json.dumps(manifest))
+
+    def test_slice_map_requires_explicit_confirmation_of_current_breakdown(self):
+        feature = self.reviewed_blueprint()
+        self.enable_slice_map()
+        candidate = self.guide_candidate(feature) | {
+            'outcome': 'Members can list items and outsiders receive a refusal.',
+            'boundary_reason': 'Keep authorization and persistence together for an independently usable list.',
+        }
+        result = self.review_cli('slice-plan', {'slices': [candidate]})
+        self.assertIsNone(result['current_slice_id'])
+        scope = result['slice_map']['target']
+        self.assertIn('Confirm the current slice map', self.review_cli(
+            'slice-review-record', self.review_input(), ok=False).stderr)
+        exchange = {'exchange_id': 'confirm-map', 'phase': 'slice_review', 'record_type': 'slice_consent',
+                    'status': 'decided', 'consent_action': 'confirm_map', 'target': scope,
+                    'question': f'Confirm this breakdown? {json.dumps(scope)}'}
+        accepted = exchange | {'response': f"Confirm {scope['map_id']}"}
+        blocked = self.cli('conversation-record', '--exchange-file', self.payload('map-consent', accepted), ok=False)
+        self.assertIn('presentation', blocked.stderr)
+        terminal = self.cli('slice-map').stdout
+        for item in ('items-slice', 'src/service.py', 'Required by', 'No implementation', scope['map_sha256']):
+            self.assertIn(item, terminal)
+        presentation = self.review_cli('slice-register')['slice_map']['presentation']
+        self.assertEqual((self.directory / presentation['path']).read_text(), terminal)
+        for response in ('Yes', f"Do not confirm {scope['map_id']}", f"Confirm {scope['map_id']} if tests pass"):
+            self.cli('conversation-record', '--exchange-file', self.payload(
+                'map-consent', exchange | {'response': response}), ok=False)
+        self.cli('conversation-record', '--exchange-file', self.payload('map-consent', accepted))
+        result = self.review_cli('slice-register')
+        self.assertEqual(result['current_slice_id'], 'items-slice')
+        self.assertFalse(result['implementation_authorized'])
+        self.assertEqual(result['slice_map']['consent_id'], 'confirm-map')
+        self.assertNotIn(scope['map_path'], self.manifest()['approvals']['approve-spec-v1']['artifact_hashes'])
+        revision = self.guide_candidate(feature, revision=2) | {
+            field: candidate[field] for field in ('outcome', 'boundary_reason')}
+        result = self.review_cli('slice-draft', revision)
+        self.assertEqual(result['slice_map']['consent_id'], 'confirm-map')
+        revision = self.guide_candidate(feature, revision=3) | {
+            'outcome': candidate['outcome'],
+            'boundary_reason': 'Keep the list and guard together so both API outcomes ship at once.',
+        }
+        result = self.review_cli('slice-plan', {'slices': [revision], 'amendment': 'Clarify the slice boundary'})
+        self.assertIsNone(result['current_slice_id'])
+        self.assertNotEqual(scope, result['slice_map']['target'])
+        self.assertNotIn('presentation', result['slice_map'])
+        stale = exchange | {'exchange_id': 'stale-map', 'response': f"Confirm {scope['map_id']}"}
+        self.cli('conversation-record', '--exchange-file', self.payload('stale-map', stale), ok=False)
+
+    def test_slice_map_uses_approved_outcomes_instead_of_proposal_prose(self):
+        feature = self.reviewed_blueprint()
+        self.enable_slice_map()
+        forged = 'Outsiders can list the items without membership.'
+        result = self.review_cli('slice-plan', {'slices': [self.guide_candidate(feature) | {
+            'outcome': forged,
+            'boundary_reason': 'Keep item retrieval and caller policy together.',
+        }]})
+        path = result['slice_map']['target']['map_path']
+        for shown in (self.cli('slice-map').stdout, (self.directory / path).read_text()):
+            self.assertNotIn(forged, shown)
+            for check in feature['acceptance_checks']:
+                self.assertIn(check['expected'], shown)
+
+    def test_preexisting_unreviewed_inventory_must_replan_for_map_confirmation(self):
+        feature = self.reviewed_blueprint()
+        candidate = self.guide_candidate(feature)
+        self.review_cli('slice-plan', {'slices': [candidate]})
+        self.exchange('legacy-review-question', status='open', phase='slice_review', feature_ids=['items-feature'])
+        manifest = self.manifest()
+        manifest.pop('slice_map_required')
+        (self.directory / 'manifest.json').write_text(json.dumps(manifest))
+        self.assertIsNone(self.review_cli('slice-register')['current_slice_id'])
+        self.assertIn('Confirm the current slice map', self.review_cli(
+            'slice-review-record', self.review_input(), ok=False).stderr)
+        self.exchange('legacy-review-answer', phase='slice_review', feature_ids=['items-feature'],
+                      responds_to='legacy-review-question', record_type='slice_detail',
+                      slice_id='items-slice', proposal_revision=1, clarifies_decision_ids=['choose-layout'])
+        retained = {'slice_id': 'items-slice', 'retain': True}
+        amended = self.review_cli('slice-plan', {'slices': [retained], 'amendment': 'Review the old inventory as a map'})
+        self.assertIsNone(amended['current_slice_id'])
+        self.assertTrue(amended['slice_map']['target']['map_sha256'])
+
+    def test_confirmed_map_is_bound_to_the_locked_package_and_release(self):
+        feature = self.reviewed_blueprint()
+        self.enable_slice_map()
+        candidate = self.guide_candidate(feature) | {
+            'outcome': 'Members can list items and outsiders receive a refusal.',
+            'boundary_reason': 'Keep authorization and persistence together for an independently usable list.',
+        }
+        scope = self.review_cli('slice-plan', {'slices': [candidate]})['slice_map']['target']
+        self.cli('slice-map')
+        exchange_id = 'confirm-map'
+        self.cli('conversation-record', '--exchange-file', self.payload(exchange_id, {
+            'exchange_id': exchange_id, 'phase': 'slice_review', 'record_type': 'slice_consent',
+            'status': 'decided', 'consent_action': 'confirm_map', 'target': scope,
+            'question': f'Confirm the breakdown shown in {json.dumps(scope)}?',
+            'response': f"Confirm {scope['map_id']}",
+        }))
+        self.review_cli('slice-review-record', self.review_input())
+        package = self.lock_reviewed_package()
+        entry = self.manifest()['slice_review']['packages'][package['package_id']]
+        saved = json.loads((self.directory / entry['path']).read_text())
+        self.assertEqual(saved['slice_map']['target'], scope)
+        self.assertEqual(saved['artifact_hashes'][scope['map_path']], scope['map_sha256'])
+        release = package | {'slice_id': 'items-slice'}
+        self.assertIn('separate explicit start', self.review_cli('slice-release', release, ok=False).stderr)
+        self.authorize_fixture(package)
+        self.review_cli('slice-release', release)
+        self.cli('validate', '--slice-id', 'items-slice')
+        with (self.directory / scope['map_path']).open('a') as map_file:
+            map_file.write('Changed after confirmation.\n')
+        self.assertIn(scope['map_path'], self.cli('validate', '--slice-id', 'items-slice', ok=False).stderr)
+
+    def test_slice_map_reports_ownership_and_dependency_failures_before_review(self):
+        feature = self.reviewed_blueprint(multiple=True)
+        self.enable_slice_map()
+        first = self.guide_candidate(feature) | {'outcome': 'Serve the member item list.',
+                                                 'boundary_reason': 'Own the items service and its existing guard.'}
+        second = self.guide_candidate(feature, 'adapter-slice') | {
+            'outcome': 'External callers can retrieve their visible items.',
+            'boundary_reason': 'Connect external callers to the existing service.',
+        }
+        result = self.review_cli('slice-plan', {'slices': [first, second]}, ok=False)
+        checks = json.loads(result.stdout)['planning_gaps']
+        self.assertIn('Overlapping writable paths', checks['cross_slice']['source_ownership'])
+        self.assertIn('items-feature/items-access', checks['cross_slice']['duplicate_checks'])
+        second = self.guide_candidate(feature, 'adapter-slice', path='src/adapter.py') | {
+            field: second[field] for field in ('outcome', 'boundary_reason')
+        }
+        guide = self.directory / second['guide_path']
+        guide.write_text(guide.read_text().replace(
+            'The request handler checks the caller before invoking item storage.',
+            'The request handler calls `src/service.py` in the proposed provider slice.'), encoding='utf-8')
+        result = self.review_cli('slice-plan', {'slices': [first, second]}, ok=False)
+        self.assertIn('without a declared dependency',
+                      json.loads(result.stdout)['planning_gaps']['cross_slice']['dependencies'])
+
     def test_shared_identity_sweep_catches_same_api_route_and_scopes_tokens_to_route(self):
         packets = {
             'provider': {'feature_contracts': [{'feature_id': 'a',
@@ -533,6 +674,7 @@ document.getElementById('observation').textContent = JSON.stringify({
     def test_new_mode_defaults_to_blueprint_and_cannot_be_changed(self):
         self.cli('init', '--scope', 'feature')
         self.assertEqual(self.manifest()['initiative_mode'], 'blueprint')
+        self.assertTrue(self.manifest()['slice_map_required'])
         self.cli('init', '--scope', 'feature', '--mode', 'prototype', ok=False)
         self.assertEqual(self.manifest()['initiative_mode'], 'blueprint')
 
@@ -554,6 +696,7 @@ document.getElementById('observation').textContent = JSON.stringify({
         # Existing workflow fixtures predate the separate intake checkpoint.
         manifest.pop('initial_alignment_required', None)
         manifest.pop('requirement_traceability_required', None)
+        manifest['slice_map_required'] = False
         if not plan_review:
             manifest.pop('plan_review_required', None)
         if not review:

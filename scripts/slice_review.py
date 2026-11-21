@@ -57,6 +57,45 @@ class SliceReview:
     def active_approval(self):
         return self.manifest.get('active_approval_id')
 
+    @property
+    def map_required(self):
+        if self.registry.get('slice_map'):
+            return True
+        if 'slice_map_required' in self.manifest:
+            return self.manifest['slice_map_required'] is True
+        return not (self.registry.get('active_package') and self.registry.get('approval_id') == self.active_approval)
+
+    def current_map(self):
+        if self.registry.get('approval_id') == self.active_approval:
+            return self.registry.get('slice_map')
+        return None
+
+    def require_map_confirmed(self):
+        if self.map_required:
+            current = self.current_map()
+            self.require(current and current.get('consent_id') and not self.registry.get('planning_gaps'),
+                         'Confirm the current slice map before beginning individual slice reviews or package approval')
+
+    def map_presentation(self, request=None):
+        current = self.current_map()
+        self.require(current and not self.registry.get('planning_gaps'),
+                     'Resolve planning gaps and generate a complete slice map with slice-plan')
+        target = current['target']
+        status = 'Confirmed' if current.get('consent_id') else 'Awaiting explicit confirmation'
+        data_path = self.api.artifact_file(self.directory, str(Path(target['map_path']).with_suffix('.json')))
+        data = self.api.read_json(data_path)
+        service = self.api.sibling_module('slice_map')
+        terminal = service.terminal(data, current['documents'], target, status)
+        if request is not None and not current.get('presentation'):
+            path = str(Path(target['map_path']).with_suffix('.terminal.txt'))
+            body = terminal.encode()
+            self.binary[path] = body
+            current['presentation'] = {'path': path, 'sha256': digest(body)}
+            self.events.append({'type': 'slice_map_presented', 'target': target,
+                                'presentation': current['presentation']})
+            self.persist(request)
+        return terminal
+
     def records(self):
         return [json.loads(line) for line in (self.directory / 'decisions.jsonl').read_text().splitlines()]
 
@@ -76,7 +115,15 @@ class SliceReview:
     def summary(self):
         if not self.required:
             return {'required': False, 'migration_available': True}
+        current_map = self.current_map()
         current = self.registry.get('current_slice_id')
+        waiting_for_map = self.map_required and not (current_map or {}).get('consent_id')
+        if waiting_for_map:
+            current = None
+        pending = self.pending_question()
+        next_action = self.manifest['next_action']
+        if waiting_for_map and not current_map and self.registry.get('selected') and not pending:
+            next_action = 'Plan the complete slice map for the active blueprint before reviewing individual slices'
         approval = self.manifest.get('approvals', {}).get(self.active_approval, {})
         snapshot = approval.get('workspace_snapshot')
         active_package = self.registry.get('active_package') if self.registry.get('approval_id') == self.active_approval else None
@@ -85,16 +132,19 @@ class SliceReview:
             'phase': self.manifest['stage'],
             'inventory_path': INVENTORY if self.registry.get('selected') else None,
             'register_path': REGISTER + '.md' if (self.registry.get('selected') or self.registry.get('planning_gaps')) else None,
+            'slice_map_required': self.map_required,
+            'slice_map': current_map,
             'blueprint_approval_id': self.active_approval,
             'source_snapshot_sha256': canonical_hash(snapshot) if snapshot is not None else None,
-            'needs_plan': not self.registry.get('selected') or self.registry.get('approval_id') != self.active_approval,
+            'needs_plan': (not self.registry.get('selected') or self.registry.get('approval_id') != self.active_approval
+                           or (self.map_required and not current_map)),
             'current_slice_id': current,
             'current_revision': self.registry.get('selected', {}).get(current, {}).get('revision'),
             'pending_question_id': self.registry.get('pending_question_id'),
-            'pending_question': self.pending_question(),
+            'pending_question': pending,
             'completed_review_ids': [r['review_id'] for r in self.registry.get('reviews', {}).values()],
             'changed_dependents': self.registry.get('changed_dependents', []),
-            'next_action': self.manifest['next_action'],
+            'next_action': next_action,
             'collection_report': self.registry.get('collection'),
             'active_package': active_package,
             'continuing_releases': self.registry.get('continuing_releases', {}),
@@ -149,7 +199,7 @@ class SliceReview:
         prior = items.get(task_id, {})
         cursor = {k: summary[k] for k in ('current_slice_id', 'current_revision', 'pending_question_id',
                                          'completed_review_ids', 'changed_dependents', 'register_path',
-                                         'inventory_path', 'active_package', 'next_action')}
+                                         'inventory_path', 'active_package', 'slice_map', 'next_action')}
         initial = {'task_id': task_id, 'status': 'in_progress', 'summary': 'Review the complete slice inventory',
                    'phase': self.manifest['stage'], 'completed_steps': [],
                    'pending_steps': ['Review and authorize the slice collection'], 'blockers': [],
@@ -187,6 +237,10 @@ class SliceReview:
 
     def render_register(self, summary):
         rows = ['# Slice review register', '', f"Next action — {summary['next_action']}", '']
+        if current := summary['slice_map']:
+            target = current['target']
+            status = 'confirmed' if current.get('consent_id') else 'awaiting confirmation'
+            rows.extend([f"[Implementation slice map](../{target['map_path']}) · {status}", ''])
         question = summary['pending_question']
         if question:
             rows.extend([f"Current review question ({question['exchange_id']})", '', question['question'], ''])
@@ -211,6 +265,8 @@ class SliceReview:
                 rows.append(f'- Feature `{feature}` needs check `{check}`.')
             for baseline in summary['planning_gaps']['baseline_ids']:
                 rows.append(f'- Baseline behavior or requirement `{baseline}` needs a slice.')
+            for category, gap in summary['planning_gaps'].get('cross_slice', {}).items():
+                rows.append(f'- {category} — {gap}')
         if summary['rejected_alternatives']:
             rows.extend(['', '## Rejected alternatives', ''])
             for key, item in summary['rejected_alternatives'].items():
@@ -233,8 +289,23 @@ class SliceReview:
                      'Plan the complete slice inventory before recording slice-review exchanges')
         for field in ('feature_ids', 'requirement_ids', 'illustration_paths', 'evidence_paths'):
             self.require(self.blueprint.strings(value.get(field, []), False), f'{field} must contain distinct references')
+        map_consent = value.get('record_type') == 'slice_consent' and value.get('consent_action') == 'confirm_map'
+        if map_consent and (exchange_id := value.get('exchange_id')) and (
+                self.current_map() or {}).get('consent_id') == exchange_id:
+            saved = self.blueprint.load('conversation', exchange_id)
+            self.require(all(saved.get(field) == item for field, item in value.items()),
+                         'The recorded slice map confirmation is immutable')
+            return
+        # Finish a question saved before the map checkpoint so it cannot deadlock replanning.
+        legacy_answer = (self.map_required and not self.current_map()
+                         and value.get('responds_to') == self.registry.get('pending_question_id')
+                         and bool(value.get('responds_to')) and value.get('status') in ('decided', 'rejected'))
+        if not (map_consent or legacy_answer):
+            self.require_map_confirmed()
         if value.get('record_type') == 'slice_consent':
             self.validate_consent(value)
+            if map_consent:
+                value['map_presentation'] = self.current_map()['presentation']
         else:
             linked_id = value.get('responds_to')
             earlier = self.blueprint.load('conversation', linked_id) if linked_id else {}
@@ -254,7 +325,12 @@ class SliceReview:
         if paths:
             self.api.sibling_module('slice_evidence').evidence_hashes(self, paths)
         self.blueprint.conversation_record(value, transition=(self.files, self.events))
-        if value.get('status') in ('open', 'proposed'):
+        if map_consent:
+            self.registry['slice_map']['consent_id'] = value['exchange_id']
+            self.events.append({'type': 'slice_map_confirmed', 'exchange_id': value['exchange_id'],
+                                'target': value['target']})
+            self.advance()
+        elif value.get('status') in ('open', 'proposed'):
             self.registry['pending_question_id'] = value['exchange_id']
             self.registry['collection'] = None
             self.manifest['next_action'] = value['question']
@@ -283,9 +359,22 @@ class SliceReview:
     def validate_consent(self, exchange):
         service = self.api.sibling_module('slice_consent')
         action, target = exchange.get('consent_action'), exchange.get('target')
-        self.require(isinstance(target, dict) and action in ('approve', 'delegate', 'lock', 'start'),
+        self.require(isinstance(target, dict) and action in ('confirm_map', 'approve', 'delegate', 'lock', 'start'),
                      'Record an explicit slice consent action and exact scope')
-        if action in ('approve', 'delegate'):
+        if action == 'confirm_map':
+            current = self.current_map()
+            self.require(self.map_required and current and not self.registry.get('planning_gaps'),
+                         'Generate a complete slice map before requesting confirmation')
+            self.require(current.get('consent_id') in (None, exchange.get('exchange_id')),
+                         'The current slice map is already confirmed')
+            presentation = current.get('presentation')
+            self.require(presentation, 'Run slice-map to save the terminal presentation before confirming the breakdown')
+            approval = self.approval()
+            self.guard_source(approval, self.authorized_paths())
+            expected = current['target']
+            self.source_guard['artifact_hashes'] = approval['artifact_hashes'] | {
+                expected['map_path']: expected['map_sha256'], presentation['path']: presentation['sha256']}
+        elif action in ('approve', 'delegate'):
             items = target.get('slices')
             self.require(isinstance(items, list) and bool(items) and all(isinstance(item, dict) for item in items),
                          'Consent must identify exact slice revisions')
@@ -352,6 +441,8 @@ class SliceReview:
                      'Collection validation_id must be a stable ID')
         scope = {field: self.registry.get(field) for field in
                  ('approval_id', 'selected', 'reviews', 'pending_question_id', 'review_blockers')}
+        if current := self.current_map():
+            scope['slice_map'] = current
         if self.api.has_living_review(self.directory):
             viewer = self.api.sibling_module('living_review')
             with viewer.History(self.directory) as history:
@@ -364,9 +455,13 @@ class SliceReview:
     def run(self, request):
         command, value = request['command'], request['input']
         self.check_history()
+        if command == 'slice-map':
+            return self.map_presentation(request)
         if command == 'slice-review-migrate' and self.registry.get('migration_request_sha256') == canonical_hash(value):
             return self.summary()
         if command == 'slice-collection-validate':
+            if self.registry.get('selected') and self.registry.get('approval_id') == self.active_approval:
+                self.require_map_confirmed()
             request_key = self.collection_request_key(value)
             saved = self.registry.get('collection_requests', {}).get(request_key)
             if saved:
@@ -398,6 +493,8 @@ class SliceReview:
         else:
             self.require(self.registry.get('selected') and self.registry.get('approval_id') == self.active_approval,
                          'Plan the complete slice inventory for the current approved blueprint first')
+            if command not in {'slice-draft', 'slice-guide-validate'}:
+                self.require_map_confirmed()
             if command == 'slice-guide-validate':
                 key = self.selected_id(value)
                 self.validate_frozen(key)
@@ -517,6 +614,9 @@ class SliceReview:
 
     def plan(self, value):
         approval = self.approval()
+        adopt_map = not self.map_required and 'slice_map_required' not in self.manifest
+        if adopt_map:
+            self.manifest['slice_map_required'] = True
         self.require(self.registry.get('migration_approval_id') != self.active_approval,
                      'A new blueprint approval must reconcile legacy assignments before planning reviewed delivery')
         previous_registry = deepcopy(self.registry)
@@ -578,7 +678,11 @@ class SliceReview:
                 self.require(eligible,
                              f'{successor}: replacement predecessor must be a cancelled or newly superseded assignment')
         gaps = self.coverage_gaps(packets)
+        if self.map_required:
+            gaps['cross_slice'] = self.map_conflicts(packets)
         if any(gaps.values()):
+            if adopt_map:
+                self.manifest.pop('slice_map_required')
             self.registry = previous_registry
             self.registry['planning_gaps'] = gaps
             self.files.clear()
@@ -586,9 +690,12 @@ class SliceReview:
             self.references.clear()
             return self.planning_blocker()
         self.registry.pop('planning_gaps', None)
+        if self.map_required:
+            self.manifest['slice_map_required'] = True
         changed = {key for key in previous.keys() | selected.keys() if previous.get(key) != selected.get(key)}
         self.registry.update(approval_id=self.active_approval, selected=selected, order=list(selected))
         self.invalidate(changed, reset=not same_approval)
+        self.update_map(packets)
         self.manifest.pop('slice_review_needs_plan', None)
         self.advance()
         if previous:
@@ -694,6 +801,12 @@ class SliceReview:
                       dependency_contracts=dependency_contracts,
                       replaces_slice_ids=replaces,
                       unresolved_question_ids=item.get('unresolved_question_ids', []))
+        if self.map_required:
+            reason = item.get('boundary_reason')
+            self.require(self.blueprint.text(reason) and '\n' not in reason and '\r' not in reason,
+                         f'{key}: give the proposed slice a one-line boundary_reason for map review')
+            self.blueprint.check_placeholders(reason, f'slice map {key}')
+            packet['boundary_reason'] = reason
         self.require(self.blueprint.strings(packet['unresolved_question_ids'], False),
                      f'{key}: unresolved_question_ids must be distinct exchange IDs')
         self.require(set(packet['unresolved_question_ids']) <= set(self.manifest.get('conversation', {})),
@@ -721,10 +834,14 @@ class SliceReview:
                                              self.next_revision(key), source_hash)
         packets[key] = packet
         self.coverage(packets)
+        if self.map_required:
+            conflicts = self.map_conflicts(packets)
+            self.require(not conflicts, f'Inventory has cross-slice conflicts: {conflicts}')
         self.registry['selected'][key] = entry
         if self.registry.get('pending_question_id'):
             self.clear_question_work(self.registry['pending_question_id'])
         self.invalidate({key})
+        self.update_map(packets)
         self.advance(key)
 
     def invalidate(self, changed, *, reset=False):
@@ -786,10 +903,57 @@ class SliceReview:
 
     def planning_blocker(self):
         gaps = dict(sorted(self.registry['planning_gaps'].items()))
-        return {'result': 'BLOCKED', 'explanation': f'Inventory is missing approved coverage: {gaps}',
-                'planning_gaps': gaps}
+        explanation = (f'Inventory has unresolved coverage or cross-slice boundaries: {gaps}' if gaps.get('cross_slice')
+                       else f'Inventory is missing approved coverage: {gaps}')
+        return {'result': 'BLOCKED', 'explanation': explanation, 'planning_gaps': gaps,
+                'register_path': REGISTER + '.md'}
+
+    def map_conflicts(self, packets):
+        service = self.api.sibling_module('slice_map')
+        conflicts = {}
+        for name, check in (('source_ownership', self.ownership), ('dependencies', self.dependency_contracts),
+                            ('shared_interfaces', self.shared_checks),
+                            ('duplicate_checks', lambda proposed: service.duplicated_checks(self, proposed))):
+            try:
+                check(packets)
+            except self.api.StateError as error:
+                conflicts[name] = str(error)
+        untyped = [key for key, packet in packets.items()
+                   if packet['dependencies'] and packet.get('evidence_schema_version', 1) < 3]
+        if untyped:
+            conflicts['legacy_dependencies'] = 'Revise these slices with explicit dependency contracts: ' + ', '.join(untyped)
+        return conflicts
+
+    def update_map(self, packets):
+        if not self.map_required:
+            return
+        service = self.api.sibling_module('slice_map')
+        version = self.manifest['approved_version']
+        coverage = self.blueprint.load('blueprint_coverage', version)
+        data = service.breakdown(self.active_approval, packets, coverage)
+        checksum = canonical_hash(data)
+        if self.registry.get('slice_map', {}).get('breakdown_sha256') == checksum:
+            return
+        sequence = self.registry.get('map_sequence', 0) + 1
+        map_id = f'slice-map-v{sequence}'
+        path = f'slice-review/maps/{map_id}.md'
+        coverage_entry = self.manifest['blueprint_coverage'][version]
+        body = service.render(map_id, data, self.registry['selected'],
+                              coverage_entry.get('report_path') or coverage_entry['path']).encode()
+        self.binary[path] = body
+        self.files[f'slice-review/maps/{map_id}.json'] = data
+        target = {'map_id': map_id, 'map_path': path, 'map_sha256': digest(body)}
+        documents = {key: {field: item[field] for field in ('guide_path', 'contract_path')}
+                     for key, item in self.registry['selected'].items()}
+        self.registry.update(map_sequence=sequence, slice_map={'target': target, 'breakdown_sha256': checksum,
+                                                               'documents': documents})
+        self.events.append({'type': 'slice_map_proposed', 'target': target})
 
     def advance(self, preferred=None):
+        if self.map_required and not (self.current_map() or {}).get('consent_id'):
+            self.registry.update(current_slice_id=None, pending_question_id=None)
+            self.manifest.update(stage='slice_review', next_action='Present and confirm the proposed implementation slice map')
+            return
         pending = [key for key in self.registry['order'] if key not in self.registry['reviews']]
         key = preferred or (pending[0] if pending else None)
         self.registry['current_slice_id'] = key
@@ -1188,7 +1352,9 @@ class SliceReview:
 
     def referenced_dependency_paths(self, packet, provider):
         """Find provider-owned paths named in the consumer handoff or test commands."""
-        guide = self.api.artifact_file(self.directory, packet['guide_path']).read_text(encoding='utf-8')
+        path = packet['guide_path']
+        guide = (self.binary[path].decode('utf-8') if path in self.binary
+                 else self.api.artifact_file(self.directory, path).read_text(encoding='utf-8'))
         sections = self.api.sibling_module('slice_guide').markdown_sections(guide)
         prose = '\n'.join(sections.get(name, '') for name in
                            ('Architecture and anatomy', 'Detailed functional requirements',
@@ -1322,6 +1488,10 @@ class SliceReview:
                 checks[name] = {'result': 'BLOCKED', 'explanation': 'Resolve guide integrity first', 'evidence_paths': paths}
             else:
                 check(name, lambda action=action: action(packets), paths, explanation)
+        if self.map_required:
+            service = self.api.sibling_module('slice_map')
+            check('unique_acceptance_ownership', lambda: service.duplicated_checks(self, packets),
+                  paths, 'Every approved acceptance check has one responsible slice')
         check('freshness', lambda: self.source(approval, self.authorized_paths()),
               list(approval['artifact_hashes']), 'Blueprint evidence and source snapshot still match')
         check('handoff_portability', self.check_history, paths, 'Frozen artifact inventory resolves in this workspace')
@@ -1353,6 +1523,8 @@ class SliceReview:
         report = {'result': result, 'checks': checks, 'evidence_hashes': semantic_hashes,
                   'approval_id': self.active_approval, 'revisions': entries,
                   'review_ids': review_ids, 'path': path}
+        if self.map_required:
+            report['slice_map'] = self.current_map()
         self.files[path] = report
         self.references.update(semantic_hashes)
         self.registry.update(collection_sequence=sequence, collection={'path': path, 'result': result})
@@ -1452,6 +1624,15 @@ class SliceReview:
             path: self.registry['artifact_hashes'][path],
             f'{base}/final-recap.md': digest(recap),
         }
+        current_map = self.current_map()
+        if self.map_required:
+            self.require(report.get('slice_map') == current_map,
+                         'The collection report must validate the confirmed slice map')
+            target = current_map['target']
+            hashes[target['map_path']] = target['map_sha256']
+            presentation = current_map['presentation']
+            hashes[presentation['path']] = presentation['sha256']
+            hashes.update(self.blueprint.bound_hashes('conversation', current_map['consent_id']))
         package_slices = {}
         for key, packet in packets.items():
             entry, receipt = self.registry['selected'][key], self.registry['reviews'][key]
@@ -1473,6 +1654,8 @@ class SliceReview:
                    'order': self.registry['order'], 'slices': package_slices,
                    'review_receipts': {key: r['path'] for key, r in self.registry['reviews'].items()},
                    'collection_path': path, 'artifact_hashes': hashes, 'locked_at': timestamp}
+        if current_map:
+            package['slice_map'] = current_map
         package_hash = canonical_hash(package)
         package_path = f'{base}/package-manifest.json'
         receipt_path = f'{base}/lock-receipt.json'
@@ -1487,6 +1670,8 @@ class SliceReview:
                  'Run initiative resume and validate before using this handoff. Read the approved blueprint, then the guide and contract.',
                  'Implementation requires authorization and an executable release for this exact package.', '',
                  f'[Collection validation]({posixpath.relpath(path, base)})', '']
+        if current_map:
+            index.append(f"[Confirmed slice map]({posixpath.relpath(current_map['target']['map_path'], base)})")
         for previous_id, previous in packages.items():
             index.append(f"- [Earlier package {previous_id}]({posixpath.relpath(previous['index_path'], base)})")
         for key, entry in self.registry['selected'].items():
@@ -1578,6 +1763,8 @@ class SliceReview:
         self.events.append({'type': 'slice_implementation_authorized', 'receipt': receipt, 'receipt_path': path})
 
     def check_package_consents(self, key, entry, package):
+        if current_map := package.get('slice_map'):
+            self.check_map_consent(current_map)
         lock = self.api.read_json(self.api.artifact_file(self.directory, entry['receipt_path']))
         collection_path = package['collection_path']
         recap_path = f'slice-review/packages/{key}/final-recap.md'
@@ -1591,6 +1778,16 @@ class SliceReview:
                          f'{key}: execution authorization does not match package')
             self.check_consent(receipt.get('consent_id'), 'start',
                                {'package_id': key, 'package_hash': entry['package_hash']}, receipt['user_response'])
+
+    def check_map_consent(self, current_map):
+        key, target = current_map['consent_id'], current_map['target']
+        exchange = self.blueprint.load('conversation', key)
+        self.check_consent(key, 'confirm_map', target, exchange['response'])
+        presentation = current_map['presentation']
+        self.require(exchange.get('map_presentation') == presentation,
+                     'Map confirmation must refer to the saved terminal presentation')
+        self.blueprint.check_hashes({target['map_path']: target['map_sha256'],
+                                     presentation['path']: presentation['sha256']})
 
     def require_execution(self, slice_id=None, value=None):
         self.check_history()
@@ -1737,6 +1934,7 @@ class SliceReview:
         if existing and self.active_approval:
             self.registry['migration_approval_id'] = self.active_approval
         self.manifest['slice_review_required'] = True
+        self.manifest['slice_map_required'] = True
         self.registry['migration_request_sha256'] = canonical_hash(value)
         self.events.append({'type': 'slice_review_migrated', 'user_response': value['user_response'],
                             'preserved_assignments': sorted(self.manifest.get('slices', {})), 'approval_id': self.active_approval})
@@ -1776,6 +1974,9 @@ class SliceReview:
                 if self.registry.get('active_package') and self.registry['approval_id'] == self.active_approval:
                     self.check_package_consents(*self.package())
                 if self.registry.get('approval_id') == self.active_approval:
+                    current_map = self.current_map()
+                    if current_map and current_map.get('consent_id'):
+                        self.check_map_consent(current_map)
                     for origin in set(self.registry.get('continuing_releases', {}).values()):
                         self.check_package_consents(*self.package(key=origin))
                     self.check_selected_runtime()

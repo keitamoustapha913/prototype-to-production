@@ -33,6 +33,36 @@ class LivingReviewTests(unittest.TestCase):
         with History(self.root) as history:
             return history.sync(Documents(self.root))
 
+    def test_slice_map_is_visible_without_entering_blueprint_approval_bindings(self):
+        before = self.save()['visual_review']
+        path = 'slice-review/maps/slice-map-v1.md'
+        guide = 'slice-proposals/provider/revisions/1/implementation-guide.md'
+        self.write(path, '# Implementation slice map\n\nProvider → consumer\n')
+        self.write(guide, '# Provider guide')
+        self.write('slice-review/register.md', '# Register')
+        self.manifest['slice_review']['selected']['provider']['guide_path'] = guide
+        self.manifest['active_approval_id'] = 'blueprint-v1'
+        self.manifest['slice_review'].update(approval_id='blueprint-v1', slice_map={
+            'target': {'map_path': path},
+            'documents': {'provider': {'guide_path': guide, 'contract_path': 'provider.json'}},
+        })
+        self.write('manifest.json', self.manifest)
+        proposal = self.save()
+        self.assertEqual(proposal['sections']['implementation-slice-map']['source'], path)
+        self.assertTrue({guide, 'provider.json', 'slice-review/register.md'} <=
+                        {section['source'] for section in proposal['sections'].values()})
+        self.assertEqual(proposal['visual_review'], before)
+        self.manifest['slice_review']['slice_map']['consent_id'] = 'confirm-map'
+        self.write('manifest.json', self.manifest)
+        confirmed = self.save()
+        self.assertIn('confirmed', confirmed['sections']['implementation-slice-map']['title'])
+        self.assertEqual(confirmed['visual_review'], before)
+        self.manifest['active_approval_id'] = 'blueprint-v2'
+        self.write('manifest.json', self.manifest)
+        next_blueprint = self.save()
+        self.assertNotIn('implementation-slice-map', next_blueprint['sections'])
+        self.assertFalse(next_blueprint['removals'])
+
     def test_shared_section_keeps_each_slices_own_approval_history(self):
         first = self.save()['visual_review']
         owner_path = 'slice-proposals/provider/reviews/owner.json'

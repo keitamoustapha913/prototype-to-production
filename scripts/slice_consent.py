@@ -9,6 +9,8 @@ def review_target(key, entry):
 
 
 def confirmation_phrases(action, target):
+    if action == 'confirm_map':
+        return {f"{verb} {target['map_id']}" for verb in ('confirm', 'confirm slice map', 'approve slice map')}
     if action in {'approve', 'delegate'}:
         items = target['slices']
         if action == 'approve' and len(items) != 1:
@@ -35,6 +37,8 @@ def affirmative(action, target, response):
     text = re.sub(r'^(?:please |go ahead and )', '', text)
     if action in {'approve', 'delegate', 'lock'}:
         text = re.sub(r'^(?:i |we )(?=approve |delegate )', '', text)
+    elif action == 'confirm_map':
+        text = re.sub(r'^(?:i |we )(?=confirm |approve )', '', text)
     text = text.removesuffix(' now')
     return text in {phrase.casefold() for phrase in confirmation_phrases(action, target)}
 
