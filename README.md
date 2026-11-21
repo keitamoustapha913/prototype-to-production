@@ -89,6 +89,8 @@ python3 scripts/project_state.py validate \
   --project-root /path/to/app --initiative-id billing-redesign
 ```
 
+Conversational reviews resume with a briefing and pause for your instruction. Add `--format json` to inspect the saved question or reply, review position, decisions, document versions, and integrity issues. Separately authorized implementation resumes through its existing package and dependency checks. [Session recovery](references/continuity.md#recovery-on-a-fresh-session-or-after-compaction)
+
 Use the initiative directory printed by `init`. In every Git repository, new designs live under ignored `.artifacts/prototype-to-production/<id>/`. This includes design documents, plans, runnable prototype source, preview assets, screenshots, and evidence. Paths in the templates are relative to that initiative directory. Only the approved implementation goes into tracked app code. Every CLI command checks that existing initiative files are untracked and ignored; legacy locations remain supported under the same rule. Store project evidence in the app's initiative directory rather than the installed skill.
 
 When transferring a reviewed blueprint initiative to a Git checkout, configure its local Git exclude with `artifact-setup --project-root /path/to/app --initiative-id billing-redesign` before resuming. If a slice review amendment is in progress, use `resume --slice-id <id>` and `validate --slice-id <id>` to check a continuing assignment.

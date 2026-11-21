@@ -88,6 +88,12 @@ class InitialAlignmentTests(unittest.TestCase):
         receipt = json.loads((self.directory / "conversation/intake-v1-confirm.json").read_text())
         self.assertEqual(receipt["confirmation_origin"]["action"], "initial_alignment")
         self.assertEqual(receipt["confirmation_origin"]["scope"], ["intake", "intake-v1"])
+        packet = json.loads(self.cli("resume", "--format", "json"))
+        recovery = packet["conversation_recovery"]
+        self.assertIsNone(recovery["pending_question"])
+        self.assertEqual(recovery["answered_questions"]["intake-v1"], "intake-v1-confirm")
+        self.assertEqual(recovery["next_permitted_action"], "wait_for_user")
+        self.assertFalse(packet["safe_to_continue"])
 
     def test_blueprint_requires_confirmation_and_carries_the_current_map_into_the_plan(self):
         self.initialize("blueprint")

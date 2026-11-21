@@ -3046,10 +3046,13 @@ def build_resume_packet(directory: Path, project_root: Path, *, delivery_slice: 
     active_question_answer = None
     question_source_errors = []
     conversation_usage, coverage_with_slices, plan_review, blueprint_coverage = {}, [], None, None
+    superseded_decisions = set()
+    conversation_intact = True
     if initiative_mode(manifest) == "blueprint" or manifest.get("initial_alignment_required") or manifest.get("conversation"):
         state = blueprint_state(directory, manifest)
         try:
             conversation = state.conversations()
+            superseded_decisions = state.superseded_decisions(conversation)
             pending_questions = state.pending()
             if not independent_review_wait:
                 question_source_errors = state.check_question_sources(project_root, pending_questions)
@@ -3058,11 +3061,13 @@ def build_resume_packet(directory: Path, project_root: Path, *, delivery_slice: 
                 if active_question_answer and not independent_review_wait:
                     question_source_errors.extend(state.check_question_sources(project_root, [question_context]))
         except (StateError, OSError, ValueError, KeyError, TypeError) as error:
+            conversation_intact = False
             errors.append(f"Conversation recovery is blocked: {error}")
         if initiative_mode(manifest) == "blueprint":
             try:
                 conversation_usage, coverage_with_slices = state.traceability()
-                plan_review = state.plan_review_progress(conversation)
+                if conversation_intact:
+                    plan_review = state.plan_review_progress(conversation)
                 blueprints = manifest.get("blueprints", {})
                 if blueprints:
                     version = max(blueprints, key=lambda key: blueprints[key]["sequence"])
@@ -3076,8 +3081,9 @@ def build_resume_packet(directory: Path, project_root: Path, *, delivery_slice: 
                 errors.append(f"Traceability recovery is blocked: {error}")
     errors.extend(question_source_errors)
     controller = sibling_module("conversation_controller")
+    controller_required = controller.required(manifest)
     workflow_progress = None
-    if controller.required(manifest):
+    if conversation_intact and (controller_required or manifest.get("guided_design_review")):
         try:
             workflow_progress = controller.blueprint_progress(
                 blueprint_state(directory, manifest), conversation, pending_questions)
@@ -3098,7 +3104,7 @@ def build_resume_packet(directory: Path, project_root: Path, *, delivery_slice: 
             review and (walkthrough := review.get('walkthroughs', {}).get(review.get('current_slice_id')))
             and active_question_answer['exchange_id'] in walkthrough['discussion']):
         next_action = "Use the recorded answer and update the saved work cursor."
-    elif workflow_progress and (not work or work.get("status") == "in_progress"):
+    elif controller_required and workflow_progress and (not work or work.get("status") == "in_progress"):
         next_action = workflow_progress["next_action"]
     elif pending_guided_review and (not work or work.get("status") == "in_progress"):
         next_action = f"Wait for the user's reply on {pending_guided_review['review_target']}."
@@ -3185,7 +3191,7 @@ def build_resume_packet(directory: Path, project_root: Path, *, delivery_slice: 
                 next_action = "Resolve final audit blockers and continue eligible independent work."
         except module.EVIDENCE_ERRORS as error:
             errors.append(f"Visual Quality Report: {error}")
-    return {
+    packet = {
         "visual_quality": quality,
         "cross_screen_blockers": shared_holds,
         "visual_baselines": original_references,
@@ -3233,9 +3239,25 @@ def build_resume_packet(directory: Path, project_root: Path, *, delivery_slice: 
         and (delivery_slice is None or delivery.get(delivery_slice) not in {"paused", "blocked", "cancelled"}),
     }
 
+    def recovery_digest(path):
+        try:
+            return digest_of(artifact_file(directory, path))
+        except (StateError, OSError):
+            return None
+
+    recovery = sibling_module("conversation_recovery").checkpoint(
+        manifest, packet, superseded_decisions, recovery_digest)
+    packet["conversation_recovery"] = recovery
+    if recovery:
+        packet["safe_to_continue"] = False
+    return packet
+
 
 def print_resume(directory: Path, project_root: Path, *, delivery_slice: str | None = None) -> list[str]:
     packet = build_resume_packet(directory, project_root, delivery_slice=delivery_slice)
+    if packet["conversation_recovery"]:
+        print(sibling_module("conversation_recovery").briefing(packet))
+        return packet["validation_errors"] or packet["conversation_recovery"]["integrity_issues"]
     manifest = manifest_at(directory)
     answer = packet["active_question_answer"]
     quality = packet["visual_quality"]
@@ -3610,11 +3632,15 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "warning-decide":
             decide_warning(directory, args.warning_id, args.decision_file)
         elif args.command == "resume":
-            if args.format == "json":
-                packet = build_resume_packet(directory, project_root, delivery_slice=args.slice_id)
-                print(json.dumps(packet, indent=2, ensure_ascii=False, sort_keys=True))
-                return 2 if packet["validation_errors"] or (args.slice_id and not packet["safe_to_continue"]) else 0
-            return 2 if print_resume(directory, project_root, delivery_slice=args.slice_id) else 0
+            with coordinator_lock(directory):
+                if args.format == "json":
+                    packet = build_resume_packet(directory, project_root, delivery_slice=args.slice_id)
+                    print(json.dumps(packet, indent=2, ensure_ascii=False, sort_keys=True))
+                    recovery = packet["conversation_recovery"]
+                    blocked = (packet["validation_errors"] or (recovery and recovery["integrity_issues"])
+                               or (args.slice_id and not packet["safe_to_continue"]))
+                    return 2 if blocked else 0
+                return 2 if print_resume(directory, project_root, delivery_slice=args.slice_id) else 0
         elif args.command == "validate":
             manifest = manifest_at(directory)
             if initiative_mode(manifest) == "blueprint" or args.slice_id:

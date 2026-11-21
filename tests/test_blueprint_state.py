@@ -145,6 +145,10 @@ class BlueprintTests(unittest.TestCase):
         resumed = json.loads(self.cli('resume', '--format', 'json').stdout)
         progress = resumed['active_work']['slice_review']['walkthrough']
         self.assertEqual(progress['position'], walkthrough['position'])
+        recovery = resumed['conversation_recovery']
+        self.assertEqual(recovery['current_item'], {'kind': 'slice', 'name': 'items-slice', 'revision': 2})
+        self.assertEqual(recovery['coverage']['slice_walkthrough'], progress)
+        self.assertEqual(recovery['next_permitted_action'], 'wait_for_user')
         self.assertIn('open_decisions', progress['remaining_topics'])
         self.assertEqual(progress['topics']['verification']['presented_revision'], 1)
         self.assertIn('Still to discuss', self.cli('resume').stdout)
@@ -2396,6 +2400,8 @@ document.getElementById('observation').textContent = JSON.stringify({
         resumed = json.loads(self.cli('resume', '--format', 'json', ok=False).stdout)
         self.assertEqual(resumed['slice_review']['current_revision'], 1)
         self.assertEqual(resumed['slice_review']['pending_question_id'], 'retry-question')
+        self.assertEqual(resumed['conversation_recovery']['pending_question']['question'], question)
+        self.assertEqual(resumed['conversation_recovery']['next_permitted_action'], 'wait_for_user')
         self.assertEqual(resumed['pending_questions'][0]['question'], question)
         self.assertEqual(resumed['next_action'], question)
         self.assertEqual(resumed['slice_review']['reviews'], {})
@@ -2676,6 +2682,7 @@ document.getElementById('observation').textContent = JSON.stringify({
         scoped_resume = json.loads(self.cli(
             'resume', '--slice-id', 'items-slice', '--format', 'json').stdout)
         self.assertTrue(scoped_resume['safe_to_continue'])
+        self.assertIsNone(scoped_resume['conversation_recovery'])
         self.assertEqual(scoped_resume['slice_review']['pending_question_id'], 'adapter-question')
         self.cli('validate', '--slice-id', 'items-slice')
         self.cli('validate', '--slice-id', 'adapter-slice', ok=False)
@@ -4927,6 +4934,37 @@ print(json.dumps(output))
         next_prompt = workstream | {'exchange_id': 'next-workstream', 'review_target': next_name,
                                     'review_workstream': next_name}
         record(next_prompt)
+        durable_files = ('manifest.json', 'decisions.jsonl', 'CHECKPOINT.md')
+        saved = {path: (self.directory / path).read_bytes() for path in durable_files}
+        packet = json.loads(self.cli('resume', '--format', 'json').stdout)
+        recovery = packet['conversation_recovery']
+        self.assertFalse(packet['safe_to_continue'])
+        self.assertEqual(recovery['next_permitted_action'], 'wait_for_user')
+        self.assertEqual(recovery['current_item']['name'], next_name)
+        self.assertEqual(recovery['completed_items'], [name])
+        self.assertEqual(recovery['pending_question']['exchange_id'], 'next-workstream')
+        self.assertEqual(recovery['latest_presentation']['evidence_paths'], next_prompt['evidence_paths'])
+        self.assertIn('choose-layout', recovery['confirmed_decision_ids'])
+        self.assertEqual(recovery['versions']['blueprint']['version'], spec)
+        self.assertEqual(recovery['versions']['plan']['version'], 'plan-v1')
+        briefing = self.cli('resume').stdout
+        self.assertIn('Session Recovery', briefing)
+        self.assertIn('Wait for your instruction', briefing)
+        self.assertEqual(saved, {path: (self.directory / path).read_bytes() for path in durable_files})
+        presentation_file = self.directory / next_prompt['evidence_paths'][0]
+        original = presentation_file.read_bytes()
+        try:
+            presentation_file.write_text('Externally replaced explanation')
+            changed = json.loads(self.cli('resume', '--format', 'json', ok=False).stdout)
+            recovery = changed['conversation_recovery']
+            self.assertEqual(recovery['next_permitted_action'], 'reconcile')
+            self.assertIn(next_prompt['evidence_paths'][0], ' '.join(recovery['integrity_issues']))
+            impact = recovery['changed_documents'][next_prompt['evidence_paths'][0]]
+            self.assertIn('conversation next-workstream', [entry['review_evidence'] for entry in impact])
+            self.assertTrue(all(entry['saved_sha256'] != entry['current_sha256'] for entry in impact))
+            self.assertIsNone(recovery['pending_question'])
+        finally:
+            presentation_file.write_bytes(original)
         next_answer = next_prompt | {'exchange_id': 'next-workstream-revisit', 'status': 'decided',
                                      'responds_to': next_prompt['exchange_id'], 'review_action': 'revisit',
                                      'revisit_workstream': name, 'response': f'Revisit {name}'}

@@ -32,7 +32,7 @@ def latest_request(records, version):
                  if record['status'] == 'open'), None)
 
 
-def workstream_position(records, version, plan):
+def workstream_position(records, version, plan, *, allow_skips=False):
     completed = {}
     revisits = []
     for record in records:
@@ -45,7 +45,7 @@ def workstream_position(records, version, plan):
             revisits.append(record['revisit_workstream'])
         elif step == 'workstream':
             name = record['review_workstream']
-            if action == 'continue':
+            if action == 'continue' or (allow_skips and action == 'skip'):
                 completed[name] = record
                 if revisits and revisits[-1] == name:
                     revisits.pop()
@@ -161,7 +161,8 @@ def blueprint_progress(state, records, pending):
     version = max(versions, key=lambda key: versions[key]['sequence'])
     spec = state.load('blueprints', version)
     plan = state.load('blueprint_plans', spec['plan_version'])
-    completed, current, revisits = workstream_position(records, version, plan)
+    completed, current, revisits = workstream_position(
+        records, version, plan, allow_skips=not required(state.manifest))
     coverage = state.manifest.get('blueprint_coverage', {}).get(version)
     checkpoint = pending[0] if pending else None
     if checkpoint:
@@ -183,8 +184,16 @@ def blueprint_progress(state, records, pending):
             for record in records_for(later, 'blueprint_approval', version))
         action = (f'Record approval for blueprint {version} using the saved reply.' if confirmed else
                   f'Validate consistency and present the formal approval request for blueprint {version}.')
-    return {'stage': 'blueprint', 'version': version, 'completed': len(completed),
+    return {'stage': 'blueprint', 'version': version, 'plan_version': spec['plan_version'],
+            'completed': len(completed),
             'total': len(plan['workstreams']), 'current_item': current,
+            'current_number': plan['workstreams'].index(current) + 1 if current else None,
+            'completed_workstreams': [name for name in plan['workstreams']
+                                      if name in completed and completed[name]['review_action'] == 'continue'],
+            'skipped_workstreams': [name for name in plan['workstreams']
+                                    if name in completed and completed[name]['review_action'] == 'skip'],
+            'completed_exchange_ids': [record['exchange_id'] for record in completed.values()],
+            'revisits': revisits,
             'pending_question_id': checkpoint['exchange_id'] if checkpoint else None,
             'next_action': action}
 
