@@ -229,7 +229,8 @@ def record_blueprint_command(directory: Path, command: str, input_file: str, pro
             review = slice_review_state(directory, manifest)
             review.record_exchange(request, value)
         elif (command == "conversation-record" and value.get("record_type") == "review_checkpoint"
-              and value.get("review_step") == "blueprint_approval"):
+              and (value.get("review_step") == "blueprint_approval"
+                   or sibling_module("confirmation").enabled(manifest))):
             writes, events = {}, []
             state.conversation_record(dict(value), transition=(writes, events))
             save_workflow_state(directory, manifest, transition=(request, events, writes))
@@ -1401,7 +1402,7 @@ def initialize(directory: Path, scope: str, next_action: str | None, mode: str |
         if template["initiative_mode"] == "blueprint":
             template.update(schema_version=5, slice_review_required=True, slice_map_required=True,
                             adaptive_handoff_required=True, plan_review_required=True,
-                            conversation_controller_version=1,
+                            conversation_controller_version=1, confirmation_protocol_version=1,
                             requirement_traceability_required=True)
         if guided_design_review:
             template["guided_design_review"] = True

@@ -36,13 +36,13 @@ Answer questions and investigate evidence on request. Record the discussion and 
 
 Use a new plan version when the roadmap changes. Close the superseded checkpoint with the actual revision request, preserve prior evidence, and show the revised overview and workstreams in the new version. Cite earlier explanations when they still apply and call out the differences. If a correction changes the confirmed understanding before the first blueprint, return to initial alignment and save an audit tied to the new confirmation. For later amendments, use the existing blueprint change-control process.
 
-Close an open plan review checkpoint as `revise` before saving a replacement discovery audit. Record a material planning correction in phase `plan` even if the user has already authorized the blueprint handoff. Review the revised plan and ask for a new **Continue to blueprint**.
+Close an open plan review checkpoint as `revise` before saving a replacement discovery audit. Record a material planning correction in phase `plan` even if the user has already authorized the blueprint handoff. Review the revised plan and ask for fresh permission to draft the blueprint.
 
 ## Verify the plan and wait for the blueprint instruction
 
 After the last **Continue**, check that all workstreams were reviewed, every requirement and acceptance scenario maps to a workstream that actually addresses it, dependencies and build order agree, shared boundaries and preservation rules are consistent, and the latest applicable user decisions appear in the plan. Resolve discrepancies and review a new revision if the plan changes.
 
-Save the results with the cited requirement map, reviewed presentations and applicable decisions. In the terminal, summarize the counts of mapped requirements and reviewed workstreams, explain how any gaps or conflicts were resolved, and give the full map and verification paths. Show the precise plan version and ask the user to say **Continue to blueprint**. Wait for that reply. A standalone **Continue** closes only a workstream. Begin blueprint drafting after recording **Continue to blueprint** for the completed plan.
+Save the results with the cited requirement map, reviewed presentations and applicable decisions. In the terminal, summarize the counts of mapped requirements and reviewed workstreams, explain how any gaps or conflicts were resolved, and give the full map and verification paths. Show the precise plan version and ask the [scoped plan-handoff question](user-confirmation.md). A clear affirmative reply to that question authorizes blueprint drafting. Earlier initiatives require **Continue to blueprint**. A standalone **Continue** closes a workstream checkpoint. Begin blueprint drafting after recording the decision on the completed plan.
 
 ## Record progress and recover the review
 

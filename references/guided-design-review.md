@@ -13,7 +13,7 @@ For blueprint-first implementation slices, follow the [Guided Slice Walkthrough]
 Complete the separate [Initial Understanding and Alignment Checkpoint](initial-alignment.md#initial-understanding-and-alignment-checkpoint) first. Discovery and roadmap review follow the confirmed initial understanding.
 
 - **Discovery.** Show the audit that follows the confirmed understanding. Focus on the evidence for the observed baseline, what the proposed scope preserves and any remaining discovery decisions. Give the user a turn to correct the audit before freezing it. Revisit initial alignment if those corrections change the agreed understanding of the request.
-- **Implementation plan.** Follow [Complete Conversational Implementation-Plan Review](implementation-plan-review.md) from the roadmap overview through every workstream and the final plan verification. Draft the blueprint after the user explicitly says **Continue to blueprint**.
+- **Implementation plan.** Follow [Complete Conversational Implementation-Plan Review](implementation-plan-review.md) from the roadmap overview through every workstream and the final plan verification. Draft the blueprint after the user explicitly authorizes that handoff.
 
 Use the recorded decisions to revise the affected specifications. A brief confirmation can close a discovery or roadmap overview checkpoint. Plan and blueprint workstream reviews each have their own explicit navigation rules.
 

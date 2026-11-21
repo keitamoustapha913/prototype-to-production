@@ -1,10 +1,13 @@
 """Initial alignment through the public initiative CLI."""
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+
+from fixtures.confirmation_session import ConfirmationSession
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts/project_state.py"
@@ -15,11 +18,12 @@ class InitialAlignmentTests(unittest.TestCase):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         self.root = Path(temp.name)
+        self.env = os.environ.copy()
 
     def cli(self, command, *args, blocked=None):
         result = subprocess.run(
             [sys.executable, str(SCRIPT), command, "--project-root", str(self.root),
-             "--initiative-id", "intake", *map(str, args)], capture_output=True, text=True,
+             "--initiative-id", "intake", *map(str, args)], capture_output=True, text=True, env=self.env,
         )
         if blocked:
             self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
@@ -28,9 +32,14 @@ class InitialAlignmentTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return result.stdout
 
-    def initialize(self, mode):
+    def initialize(self, mode, *, legacy=True):
         output = self.cli("init", "--scope", "feature", "--mode", mode)
         self.directory = Path(output.strip().removeprefix("Initialized initiative: "))
+        if legacy:
+            manifest_path = self.directory / "manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest.pop("confirmation_protocol_version", None)
+            manifest_path.write_text(json.dumps(manifest))
         (self.directory / "presentation.md").write_text("# Intake\n\nThe empty app needs item listing.\n")
         (self.directory / "inspection.txt").write_text("Inspected the project tree and found no application source.\n")
 
@@ -65,6 +74,20 @@ class InitialAlignmentTests(unittest.TestCase):
         answer.update(exchange_id=presentation["exchange_id"] + "-" + action, status="decided",
                       responds_to=presentation["exchange_id"], review_action=action, response=response)
         self.exchange(answer, **expectation)
+
+    def test_new_intake_records_a_natural_user_confirmation(self):
+        self.initialize("blueprint", legacy=False)
+        with tempfile.TemporaryDirectory() as store:
+            session = ConfirmationSession(self.root, store, self.env)
+            first = self.presentation()
+            first["question"] = "Is my understanding correct?"
+            self.exchange(first)
+            session.prompt("Initiative intake / Initial understanding intake-v1\nIs my understanding correct?")
+            session.reply("That looks correct.")
+            self.reply(first, "confirm", "That looks correct.")
+        receipt = json.loads((self.directory / "conversation/intake-v1-confirm.json").read_text())
+        self.assertEqual(receipt["confirmation_origin"]["action"], "initial_alignment")
+        self.assertEqual(receipt["confirmation_origin"]["scope"], ["intake", "intake-v1"])
 
     def test_blueprint_requires_confirmation_and_carries_the_current_map_into_the_plan(self):
         self.initialize("blueprint")

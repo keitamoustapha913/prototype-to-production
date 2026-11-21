@@ -358,7 +358,7 @@ class BlueprintState:
             self.require(prior_ids <= set(ids),
                          'A correction must explicitly carry forward or revise each protected visual decision')
 
-    def conversation_record(self, value, *, transition=None):
+    def conversation_record(self, value, *, transition=None, confirmation_origin=None):
         key = value.get('exchange_id')
         self.require(self.identifier(key), 'Stable exchange_id is required')
         self.require(value.get('phase') in self.api.VALID_STAGES, 'Actual conversation phase required')
@@ -379,6 +379,9 @@ class BlueprintState:
         self.require(isinstance(value.get('options', []), list) and all(
             isinstance(x, dict) and self.text(x.get('label')) and self.text(x.get('tradeoff'))
             for x in value.get('options', [])), 'Options need exact labels and tradeoffs')
+        confirmation = self.api.sibling_module('confirmation')
+        self.require('confirmation_origin' not in value,
+                     'Confirmation provenance must be verified by the coordinator')
         record_type = value.get('record_type', 'decision')
         self.require(record_type in {'decision', 'recap', 'review_checkpoint', 'slice_detail', 'slice_consent'},
                      'Unknown conversation record type')
@@ -440,6 +443,10 @@ class BlueprintState:
             if source_errors and not value.get('source_reconciliation'):
                 raise self.api.StateError('Reconcile question source with fresh evidence before recording the answer: '
                                           + '; '.join(source_errors))
+        if confirmation_origin:
+            value['confirmation_origin'] = confirmation_origin
+        if record_type == 'review_checkpoint' and confirmation.enabled(self.manifest):
+            confirmation.record_review(self, value)
         if 'source_reconciliation' in value:
             self.require(value.get('responds_to') and self.text(value['source_reconciliation'])
                          and self.strings(value.get('evidence_paths')),
@@ -572,7 +579,8 @@ class BlueprintState:
             reply = ' '.join(value['response'].casefold().strip().rstrip('.!').split())
             self.require(reply not in {'correct', 'looks good', 'i understand', 'yes', 'ok', 'okay', 'agreed'},
                          'Acknowledgment leaves the workstream open; wait for explicit navigation or correction')
-            if enforced_workstream and action == 'continue':
+            if (enforced_workstream and action == 'continue'
+                    and not self.api.sibling_module('confirmation').enabled(self.manifest)):
                 self.require(reply in {'continue', 'next', 'move to the next workstream'},
                              'Wait for explicit navigation: Continue, Next, or Move to the next workstream')
             if action in {'continue', 'skip'}:
@@ -671,6 +679,8 @@ class BlueprintState:
         if value['review_action'] == 'continue':
             self.require(all(record['exchange_id'] == value['responds_to'] for record in pending),
                          'Resolve outstanding plan questions before continuing')
+            if self.api.sibling_module('confirmation').enabled(self.manifest):
+                return
             reply = ' '.join(value['response'].casefold().strip().rstrip('.!').split())
             if value['review_step'] == 'plan_completion':
                 self.require(reply == 'continue to blueprint', 'Wait for explicit “Continue to blueprint”')
@@ -760,10 +770,10 @@ class BlueprintState:
                      'Record a new presentation to change the requirement map')
         if action == 'confirm':
             response = ' '.join(value['response'].casefold().strip().rstrip('.!').split())
-            self.require(ALIGNMENT_CONFIRMATION.search(response)
-                         and not re.search(r'\b(?:you (?:missed|misunderstood|forgot)|not (?:correct|accurate)|'
+            self.require(self.api.sibling_module('confirmation').enabled(self.manifest) or (
+                         ALIGNMENT_CONFIRMATION.search(response) and not re.search(r'\b(?:you (?:missed|misunderstood|forgot)|not (?:correct|accurate)|'
                                            r'i (?:disagree|do not confirm)|(?:please )?skip (?:the |this )?(?:checkpoint|confirmation))\b',
-                                           response),
+                                           response)),
                          'Ask the user to explicitly confirm your understanding before planning')
             self.require(all(record['exchange_id'] == value['responds_to'] for record in self.pending()),
                          'Resolve outstanding consequential questions before confirming initial understanding')

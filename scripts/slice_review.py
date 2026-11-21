@@ -331,9 +331,10 @@ class SliceReview:
         if not (map_consent or legacy_answer):
             self.require_map_confirmed()
         reopen_topics = []
+        confirmation_origin = None
         if value.get('record_type') == 'slice_consent':
             self.require(not value.get('reopen_topics'), 'Record corrections separately from consent')
-            self.validate_consent(value)
+            confirmation_origin = self.validate_consent(value)
             if map_consent:
                 value['map_presentation'] = self.current_map()['presentation']
         else:
@@ -370,7 +371,8 @@ class SliceReview:
         if paths:
             self.api.sibling_module('slice_evidence').evidence_hashes(self, paths)
         new_exchange = value.get('exchange_id') not in self.manifest.get('conversation', {})
-        self.blueprint.conversation_record(value, transition=(self.files, self.events))
+        self.blueprint.conversation_record(value, transition=(self.files, self.events),
+                                           confirmation_origin=confirmation_origin)
         if (new_exchange and value.get('record_type') not in ('recap', 'slice_consent')
                 and key not in self.registry['reviews']):
             progress = self.registry.get('walkthroughs', {}).get(key, {})
@@ -465,6 +467,13 @@ class SliceReview:
         self.require(target == expected and self.blueprint.text(exchange.get('question'))
                      and all(value in exchange['question'] for value in service.displayed_values(expected)),
                      'The recorded prompt must display the exact scope and hashes before consent')
+        confirmation = self.api.sibling_module('confirmation')
+        if confirmation.enabled(self.manifest):
+            response, question = exchange.get('response'), exchange['question']
+            confirmation.clarify(self.blueprint, action, response, question,
+                                 explicit=service.confirmation_phrases(action, target))
+            return confirmation.bind(self.blueprint, question, response, service.displayed_values(expected),
+                                     action, single_question=action == 'start')
         self.require(service.affirmative(action, target, exchange.get('response')),
                      'Record the separate explicit user instruction naming the exact approved scope')
 
@@ -482,7 +491,15 @@ class SliceReview:
         else:
             self.require(actual == target, 'Consent must match the exact scope and hashes shown to the user')
         service = self.api.sibling_module('slice_consent')
-        self.require(service.affirmative(action, actual, response)
+        origin = exchange.get('confirmation_origin')
+        if origin:
+            self.require(origin.get('action') == action, 'The verified user reply authorizes a different action')
+            confirmation = self.api.sibling_module('confirmation')
+            affirmative = confirmation.accepts(action, response, exchange['question'],
+                                               explicit=service.confirmation_phrases(action, actual))
+        else:
+            affirmative = service.affirmative(action, actual, response)
+        self.require(affirmative
                      and all(value in exchange['question'] for value in service.displayed_values(actual)),
                      'Consent must be an affirmative instruction for the displayed scope and hashes')
 

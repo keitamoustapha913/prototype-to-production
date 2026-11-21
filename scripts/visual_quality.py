@@ -434,8 +434,12 @@ def accept(directory, payload):
         audit_record = current["audit"]
         controller = state.sibling_module("conversation_controller")
         fields = {"approval_id", "audit_id", "audit_sha256", "approved_by_user", "user_response"}
+        confirmation = state.sibling_module("confirmation")
+        contextual = confirmation.enabled(manifest)
         if controller.required(manifest):
             fields.add("presentation_path")
+        if contextual:
+            fields.add("question")
         if (not audit_record or not current["audit_current"] or audit_record["status"] not in COMPLETE
                 or not isinstance(payload, dict)
                 or set(payload) != fields
@@ -451,8 +455,21 @@ def accept(directory, payload):
             raise state.StateError("Resolve outstanding final review feedback or record the user's deferral or withdrawal before accepting")
         key = "accept-" + uuid.uuid4().hex
         record = {**payload, "acceptance_id": key, "accepted_at": state.utc_now()}
-        if controller.required(manifest):
-            record["presentation_hashes"] = controller.final_acceptance_evidence(
-                state.blueprint_state(directory, manifest), payload)
+        blueprint = state.blueprint_state(directory, manifest)
+        if contextual:
+            question = payload["question"]
+            blueprint.require(blueprint.text(question), "Record the exact final acceptance question")
+            confirmation.clarify(blueprint, "final_acceptance", payload["user_response"], question,
+                                 explicit=[f"Accept final audit {payload['audit_id']}"])
+            hashes, documents = blueprint.markdown([payload["presentation_path"]])
+            presentation = documents[payload["presentation_path"]]
+            blueprint.require(question in presentation and payload["audit_sha256"] in presentation,
+                              "Save the displayed final acceptance question and audit digest")
+            record["presentation_hashes"] = hashes
+            record["confirmation_origin"] = confirmation.bind(
+                blueprint, question, payload["user_response"], [payload["audit_id"], payload["audit_sha256"]],
+                "final_acceptance", not_before=audit_record["recorded_at"], single_question=True)
+        elif controller.required(manifest):
+            record["presentation_hashes"] = controller.final_acceptance_evidence(blueprint, payload)
         save(directory, manifest, "accept", key, record, request)
         return record

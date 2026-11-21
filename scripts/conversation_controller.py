@@ -84,7 +84,14 @@ def check_approval_checkpoint(state, value):
                       'Provide the exact blueprint approval presentation without any user decision')
         preview = approval_preview(state, draft)
         _, documents = state.markdown(value.get('evidence_paths'))
-        state.require(phrase in value['question'], f'Ask the user to say “{phrase}”')
+        confirmation = state.api.sibling_module('confirmation')
+        if confirmation.enabled(state.manifest):
+            question = normalized(value['question'].strip().splitlines()[-1])
+            state.require(question in {'do you approve this blueprint?', 'approve this blueprint?',
+                                        f'do you {phrase.casefold()}?', f'{phrase.casefold()}?'},
+                          'Ask a single approval question about the current blueprint version')
+        else:
+            state.require(phrase in value['question'], f'Ask the user to say “{phrase}”')
         require_presentation(state, documents, value['question'])
         value['approval_basis'] = preview['presentation_hashes']
         return
@@ -98,8 +105,9 @@ def check_approval_checkpoint(state, value):
         completed, _, revisits = workstream_position(state.conversations(), version, plan)
         check_revisit(state, value, completed, revisits)
     if action == 'confirm':
-        state.require(normalized(value['response']) == normalized(phrase),
-                      f'Wait for the explicit instruction “{phrase}”')
+        if not state.api.sibling_module('confirmation').enabled(state.manifest):
+            state.require(normalized(value['response']) == normalized(phrase),
+                          f'Wait for the explicit instruction “{phrase}”')
         state.require(all(record['exchange_id'] == value['responds_to'] for record in state.pending()),
                       'Resolve outstanding review questions before confirming blueprint approval')
 
@@ -108,7 +116,9 @@ def approval_preview(state, draft):
     state.require(state.manifest['stage'] == 'blueprint' and draft == request_fields(draft),
                   'Provide the current blueprint presentation with the approval fields omitted')
     preview = state.validate_approval(draft, requesting=True)
-    return {'approval_presentation': draft, 'instruction': approval_phrase(draft['approved_version']),
+    contextual = state.api.sibling_module('confirmation').enabled(state.manifest)
+    return {'approval_presentation': draft,
+            'instruction': 'Do you approve this blueprint?' if contextual else approval_phrase(draft['approved_version']),
             'presentation_hashes': preview['presentation_evidence_hashes']}
 
 
@@ -122,9 +132,17 @@ def approval_exchange_hashes(state, value, presentation_hashes, *, current):
                   and answer.get('review_step') == 'blueprint_approval'
                   and answer.get('review_version') == version
                   and answer.get('review_action') == 'confirm'
-                  and answer.get('response') == value['user_approval_note']
-                  and normalized(answer['response']) == normalized(approval_phrase(version)),
-                  f'Record the exact reply “{approval_phrase(version)}” before approving')
+                  and answer.get('response') == value['user_approval_note'],
+                  'Use the exact recorded user reply before approving')
+    confirmation = state.api.sibling_module('confirmation')
+    if (current and confirmation.enabled(state.manifest)) or answer.get('confirmation_origin'):
+        state.require(answer.get('confirmation_origin', {}).get('action') == 'blueprint_approval',
+                      'A verified user-originated blueprint approval reply is required')
+        confirmation.clarify(state, 'blueprint_approval', answer['response'], answer['question'],
+                             explicit=confirmation.blueprint_replies(version))
+    else:
+        state.require(normalized(answer['response']) == normalized(approval_phrase(version)),
+                      f'Record the exact reply “{approval_phrase(version)}” before approving')
     request = state.load('conversation', answer['responds_to'])
     state.require(request.get('approval_basis') == presentation_hashes,
                   'The reviewed evidence changed; present a fresh blueprint approval request')

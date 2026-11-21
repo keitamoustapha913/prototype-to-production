@@ -18,6 +18,7 @@ import unittest
 from unittest.mock import patch
 
 from fixtures.blueprint_browser_probe import ItemsHandler
+from fixtures.confirmation_session import ConfirmationSession
 from fixtures.mermaid_cache import mermaid_cache_environment
 from test_project_state import png
 from scripts import slice_evidence as SLICE_EVIDENCE_MODULE
@@ -52,6 +53,15 @@ class BlueprintTests(unittest.TestCase):
         self.directory = self.root / 'design/redesigns/sample-work'
         self.env = {**os.environ, 'GIT_CEILING_DIRECTORIES': str(self.root.parent)}
         self.env.pop('P2P_APP_URL', None)
+
+    def enable_contextual_confirmation(self):
+        manifest = self.manifest()
+        manifest['confirmation_protocol_version'] = 1
+        manifest['conversation_controller_version'] = 1
+        (self.directory / 'manifest.json').write_text(json.dumps(manifest))
+        store = tempfile.TemporaryDirectory(prefix='p2p-confirmation-fixture-')
+        self.addCleanup(store.cleanup)
+        return ConfirmationSession(self.root, store.name, self.env)
 
     def enable_slice_map(self):
         # The shared approved-blueprint fixture predates map confirmation.
@@ -1006,6 +1016,7 @@ document.getElementById('observation').textContent = JSON.stringify({
         self.assertEqual(self.manifest()['initiative_mode'], 'blueprint')
         self.assertTrue(self.manifest()['slice_map_required'])
         self.assertEqual(self.manifest()['conversation_controller_version'], 1)
+        self.assertEqual(self.manifest()['confirmation_protocol_version'], 1)
         self.cli('init', '--scope', 'feature', '--mode', 'prototype', ok=False)
         self.assertEqual(self.manifest()['initiative_mode'], 'blueprint')
 
@@ -1026,6 +1037,7 @@ document.getElementById('observation').textContent = JSON.stringify({
         manifest = self.manifest()
         # Existing workflow fixtures predate the separate intake checkpoint.
         manifest.pop('conversation_controller_version', None)
+        manifest.pop('confirmation_protocol_version', None)
         manifest.pop('initial_alignment_required', None)
         manifest.pop('requirement_traceability_required', None)
         manifest['slice_map_required'] = False
@@ -3335,7 +3347,13 @@ print(json.dumps(output))
         rejected = self.cli('visual-quality', '--action', 'accept',
                             '--input-file', self.payload('ambiguous-acceptance', decision), ok=False)
         self.assertIn(phrase, rejected.stderr)
-        decision['user_response'] = phrase
+        session = self.enable_contextual_confirmation()
+        question = 'Do you accept this final audit?'
+        decision.update(question=question, user_response='I accept this report.')
+        decision['presentation_path'] = self.artifact(
+            'review/natural-final-acceptance.md', f"Final audit {saved['audit_id']} / {current['audit_sha256']}\n{question}")
+        session.prompt(f"Initiative sample-work\n{(self.directory / decision['presentation_path']).read_text()}")
+        session.reply(decision['user_response'])
         decision_file = self.payload('final-decision', decision)
         self.cli('visual-quality', '--action', 'accept', '--input-file', decision_file)
         self.assertEqual(status()['status'], 'finally_accepted')
@@ -4749,6 +4767,111 @@ print(json.dumps(output))
         self.plan_reply(checkpoint, 'revise', 'Refresh the plan from the new audit.')
         self.record_baseline(audit)
         self.record_reviewed_plan(self.plan('plan-v3', 'audit-v2'))
+
+    def test_natural_handoff_and_blueprint_approval_require_distinct_user_messages(self):
+        self.start()
+        self.exchange()
+        self.record_baseline()
+        plan = self.plan()
+        overview = self.plan_checkpoint(plan, 'roadmap')
+        self.plan_reply(overview, 'confirm', 'The roadmap covers the scope.')
+        self.cli('plan-record', '--plan-file', self.payload('plan', plan))
+        name = plan['workstreams'][0]
+        workstream = self.plan_checkpoint(plan, 'plan_workstream', stream=name)
+        self.plan_reply(workstream, 'continue', 'Continue')
+        session = self.enable_contextual_confirmation()
+
+        def record(value, *, ok=True):
+            return self.cli('conversation-record', '--exchange-file', self.payload('contextual', value), ok=ok)
+
+        completion = {'exchange_id': 'plan-handoff', 'phase': 'plan', 'record_type': 'review_checkpoint',
+                      'review_step': 'plan_completion', 'review_target': 'Plan completion', 'review_version': plan['version'],
+                      'status': 'open', 'question': 'Would you like me to proceed to the detailed blueprint?',
+                      'scope_reason': 'The plan covers the audited item service.',
+                      'evidence_paths': [self.artifact('review/handoff.md', 'Reviewed the requirement mapping.')]}
+        record(completion)
+        handoff = completion | {'exchange_id': 'plan-handoff-reply', 'responds_to': completion['exchange_id'],
+                                'status': 'decided', 'review_action': 'continue', 'response': 'Yes, continue.'}
+        session.prompt(f"Initiative sample-work / Plan {plan['version']}\n{completion['question']}")
+        session.reply(handoff['response'], provenance='harness')
+        self.assertIn('user-originated', record(handoff, ok=False).stderr)
+        session.prompt(f"Initiative sample-work / Plan {plan['version']}\n{completion['question']}")
+        session.reply('Okay, I understand.')
+        self.assertIn('latest user exchange', record(handoff, ok=False).stderr)
+        record(handoff | {'response': 'Okay, I understand.'}, ok=False)
+        session.prompt(f"Initiative sample-work / Plan {plan['version']}\n{completion['question']}")
+        session.reply(handoff['response'])
+        record(handoff)
+        saved = json.loads((self.directory / 'conversation/plan-handoff-reply.json').read_text())
+        self.assertEqual(saved['confirmation_origin']['action'], 'plan_handoff')
+        self.cli('blueprint-record', '--blueprint-file', self.payload('spec', self.blueprint()))
+        self.cli('blueprint-coverage', '--coverage-file', self.payload('coverage', self.coverage()))
+
+        walkthrough = {'exchange_id': 'blueprint-workstream', 'phase': 'blueprint', 'record_type': 'review_checkpoint',
+                       'review_step': 'workstream', 'review_target': name, 'review_workstream': name,
+                       'review_version': 'spec-v1', 'status': 'open', 'feature_ids': ['items-feature'],
+                       'question': 'Continue?', 'evidence_paths': [
+                           self.artifact('review/blueprint-workstream.md', 'Preserve the access check. Continue?')]}
+        record(walkthrough)
+        session.prompt(f"Initiative sample-work / Blueprint spec-v1 / {name}\nContinue?")
+        session.reply('Yes, continue.')
+        record(walkthrough | {'exchange_id': 'blueprint-workstream-reply', 'responds_to': walkthrough['exchange_id'],
+                              'status': 'decided', 'review_action': 'continue', 'response': 'Yes, continue.'})
+
+        approval = self.approval()
+        report = self.artifact('review/consistency.md', 'The API and service share the same access policy.')
+        approval['workstream_consistency_path'] = report
+        approval['shown_paths'].append(report)
+        draft = {key: item for key, item in approval.items() if key not in {'approved_by_user', 'user_approval_note'}}
+        question = 'Do you approve this blueprint?'
+        prompt = {'exchange_id': 'natural-approval', 'phase': 'blueprint', 'record_type': 'review_checkpoint',
+                  'review_step': 'blueprint_approval', 'review_target': 'spec-v1', 'review_version': 'spec-v1',
+                  'status': 'open', 'question': question, 'feature_ids': ['items-feature'],
+                  'approval_presentation': draft,
+                  'evidence_paths': [self.artifact('review/natural-approval.md', f'Coverage passed.\n{question}')]}
+        record(prompt)
+        reply = {key: item for key, item in prompt.items() if key != 'approval_presentation'}
+        reply.update(exchange_id='natural-approval-reply', responds_to=prompt['exchange_id'],
+                     status='decided', review_action='confirm', response='I approve this blueprint.')
+        session.prompt(f'Initiative sample-work / Blueprint spec-v10\n{question}')
+        session.reply(reply['response'])
+        self.assertIn('exact review scope', record(reply, ok=False).stderr)
+        session.prompt(f'Initiative sample-work / Blueprint spec-v1\nShould I also start coding?\n{question}')
+        session.reply('Yes.')
+        self.assertIn('one specific confirmation question', record(reply | {'response': 'Yes.'}, ok=False).stderr)
+        session.prompt(f'Initiative sample-work / Blueprint spec-v1\n{question}')
+        session.reply(reply['response'])
+        record(reply)
+        self.cli('approve', '--approval-file', self.payload('approved', approval | {
+            'approval_exchange_id': reply['exchange_id'], 'user_approval_note': reply['response']}))
+        self.assertEqual(self.manifest()['stage'], 'approved')
+        self.assertNotIn('implementation_authorized', self.manifest())
+        self.cli('validate')
+
+    def test_natural_start_requires_user_reply_to_the_locked_package_prompt(self):
+        feature = self.reviewed_blueprint()
+        self.review_cli('slice-plan', {'slices': [self.guide_candidate(feature)]})
+        self.review_cli('slice-review-record', self.review_input())
+        package = self.lock_reviewed_package()
+        session = self.enable_contextual_confirmation()
+        question = f"Locked {package['package_id']} ({package['package_hash']}). This permits edits to source code.\nMay I start implementation of this locked package?"
+        exchange = {'exchange_id': 'contextual-start', 'phase': 'slice_review', 'record_type': 'slice_consent',
+                    'status': 'decided', 'consent_action': 'start', 'target': package,
+                    'question': question, 'response': 'Start implementation.'}
+
+        def record(*, ok=True):
+            return self.cli('conversation-record', '--exchange-file', self.payload('natural-start', exchange), ok=ok)
+
+        session.prompt(f"Initiative sample-work\n{question}")
+        session.reply('I approve this package.')
+        record(ok=False)
+        session.prompt(f"Initiative sample-work\n{question}")
+        session.reply(exchange['response'])
+        record()
+        summary = self.review_cli('implementation-authorize', package | {
+            'instruction': 'start implementation', 'authorized_by_user': True,
+            'consent_id': exchange['exchange_id'], 'user_response': exchange['response']})
+        self.assertTrue(summary['implementation_authorized'])
 
     def test_controller_blocks_blueprint_approval_until_the_exact_request_and_reply(self):
         self.start()
