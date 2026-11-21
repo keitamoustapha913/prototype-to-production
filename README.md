@@ -94,6 +94,8 @@ When transferring a reviewed blueprint initiative to a Git checkout, configure i
 
 Changes to shared UI components require targeted browser verification of the screens that use them. The cross-screen workflow records the original application before editing, preserves annotated comparisons and protects affected slices when verification is incomplete. The viewer groups both evidence and unresolved findings under the original change. [Cross-Screen Visual Regression Protection](references/cross-screen-regression.md)
 
+Existing UI receives an immutable visual baseline during discovery. Shared changes reuse compatible evidence and capture any missing affected states before editing. Slice handoffs and the viewer connect the original UI, approved design, and implementation captures. [Visual Baseline Capture and Design Reference Preservation](references/visual-baseline.md)
+
 Each implemented UI slice receives a [Visual Integrity Gate](references/visual-integrity.md). Codex chooses critical states and viewports for each changed component, exercises the UI in a browser, and checks rendered evidence against the approved blueprint and protected design decisions. The register preserves before-and-after evidence and distinguishes verified fixes, incomplete repairs and unresolved defects. Open the Visual Review Register in the browser viewer to inspect findings after a slice or at project handoff.
 
 Blueprint verification executes approved tests from the app root. UI verification uses Node.js 22 or later and Chrome or Chromium to capture the running app at `P2P_APP_URL`. Use an independent reviewer to inspect the assertions and captured results. See the [blueprint verification contract](references/blueprint-workflow.md#approval-implementation-and-verification).

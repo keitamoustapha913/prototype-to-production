@@ -175,6 +175,13 @@ async function capture({ browser, appUrl, renderCase, checks = [], build, intera
         }
         const { width, height } = renderCase.viewport;
         await send('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false });
+        const browserVersion = evidenceDirectory ? await send('Browser.getVersion') : undefined;
+        if (renderCase.color_scheme !== undefined) {
+            if (!['light', 'dark'].includes(renderCase.color_scheme)) throw new Error('Unknown color scheme');
+            await send('Emulation.setEmulatedMedia', {
+                features: [{name: 'prefers-color-scheme', value: renderCase.color_scheme}],
+            });
+        }
         async function navigate(destination) {
             if (destination.origin !== url.origin) throw new Error('Discovery navigation must stay on the application origin');
             const navigation = await send('Page.navigate', { url: destination.href });
@@ -295,6 +302,12 @@ async function capture({ browser, appUrl, renderCase, checks = [], build, intera
                 clientWidth: node.clientWidth, clientHeight: node.clientHeight,
                 scrollWidth: node.scrollWidth, scrollHeight: node.scrollHeight,
             });
+            const tokenNames = ${JSON.stringify(renderCase.design_tokens || [])};
+            const styles = (node, properties) => {
+                const computed = getComputedStyle(node);
+                return Object.fromEntries(properties.map(name => [name, computed.getPropertyValue(name).trim()]));
+            };
+            const descendants = visualEvidence ? ready?.getElementsByTagName('*') : null;
             const [state, targets, probes] = await Promise.all([
                 visible(ready),
                 Promise.all(criteria.map(rule =>
@@ -322,6 +335,21 @@ async function capture({ browser, appUrl, renderCase, checks = [], build, intera
                         prefersDark: matchMedia('(prefers-color-scheme: dark)').matches,
                         expandedControls: [...document.querySelectorAll('[aria-expanded="true"], details[open]')]
                             .filter(node => node.getClientRects().length > 0).map(describe),
+                    },
+                    structure: {
+                        component: describe(ready),
+                        descendants: Array.from({length: Math.min(descendants?.length || 0, 200)}, (_, index) => {
+                            const node = descendants[index];
+                            let depth = 1;
+                            for (let parent = node.parentElement; parent !== ready; parent = parent.parentElement) depth++;
+                            return {...describe(node), depth};
+                        }),
+                        truncated: (descendants?.length || 0) > 200,
+                    },
+                    designTokens: ready && {
+                        component: styles(ready, ['color', 'background-color', 'font-family', 'font-size', 'font-weight',
+                            'line-height', 'display', 'gap', 'padding', 'margin', 'border-radius', 'position', ...tokenNames]),
+                        root: styles(document.documentElement, tokenNames),
                     },
                     geometry: {
                         component: geometry(ready), page: geometry(document.documentElement),
@@ -394,7 +422,7 @@ with Image.open(sys.argv[1]) as page:
                 await rm(evidenceDirectory, { recursive: true, force: true });
                 throw error;
             }
-            return { ...measurements, buildEvidence, component: renderCase.ready_selector, closeup, full, detail };
+            return { ...measurements, buildEvidence, component: renderCase.ready_selector, browserVersion, closeup, full, detail };
         }
         return { ...measurements, stateVisible: true, ...(build ? { buildEvidence } : {}), screenshot };
     } finally {

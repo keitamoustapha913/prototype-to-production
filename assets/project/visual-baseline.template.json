@@ -1,0 +1,28 @@
+{
+  "baseline_id": "settings-menu-open-narrow",
+  "baseline_feature_ids": ["settings-menu"],
+  "reason": "The expanded menu sits next to the settings toolbar at narrow widths.",
+  "source_paths": ["src/settings.html", "src/shared/menu.css"],
+  "state": {
+    "route": "/settings",
+    "theme": "dark",
+    "data": "seeded settings account",
+    "interaction": "opened from the keyboard",
+    "active_control": "menu trigger",
+    "open_menus": ["settings menu"]
+  },
+  "renderCase": {
+    "route": "/settings",
+    "viewport": {"width": 390, "height": 844},
+    "ready_selector": "#settings-menu",
+    "color_scheme": "dark",
+    "design_tokens": ["--menu-surface", "--space-small"],
+    "setup": [{"action": "press", "key": "Tab"}, {"action": "press", "key": "Enter"}]
+  },
+  "interaction_assertions": [
+    {"selector": "#settings-menu", "probe": "visible", "expected": true}
+  ],
+  "checks": [],
+  "appUrl": "http://127.0.0.1:3000",
+  "browser": "google-chrome"
+}

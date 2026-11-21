@@ -255,3 +255,36 @@ test('cross-screen evidence is grouped by the change and searchable from a consu
   assert.match(attemptSummary.textContent,/2026-11-21 · verified/);
   vm.runInContext("registerMetadata = {}; $('register-status').value = '';",context);
 });
+
+test('baseline register shows the three design references and preserves unavailable originals', () => {
+  const document = dom.window.document;
+  const status = document.getElementById('register-status');
+  status.add(new dom.window.Option('Original UI baselines', 'baselines'));
+  context.baselineRows = [{
+    definition: {baseline_id:'open-menu', state:{route:'/settings'}, reason:'Narrow toolbar',
+      renderCase:{viewport:{width:390,height:844}},
+      baseline_feature_ids:['menu'], source_paths:['src/menu.js']},
+    slice_ids:['settings'], available:true, gap:null,
+    original:{case:{case_id:'menu', full_screenshot:'visual-integrity/discovery-baselines/evidence/aaa.png'},
+      revision:'original-source', captured_at:'original-time'},
+    approved:{'approval-1':{version:'blueprint-1', features:[{classification:'KEEP'}],
+      prototype_cases:[{case_id:'menu', reference_file:'references/approved.png', viewport:{width:390,height:844}}]}},
+    actual:[{slice_id:'settings', case:{case_id:'menu', full_screenshot:'visual-integrity/settings/evidence/bbb.png'},
+      revision:'implementation-source', captured_at:'updated-time'}],
+  }, {
+    definition: {baseline_id:'missing-menu', state:{route:'/projects'}, reason:'Project fixture',
+      baseline_feature_ids:['project-menu'], source_paths:['src/project.js']},
+    slice_ids:['projects'], available:false, gap:{reason:'Fixture unavailable'}, approved:{}, actual:[],
+  }];
+  vm.runInContext("registerMetadata = {visual_baselines: baselineRows}; $('register-slice').value = ''; $('register-status').value = 'baselines'; renderVisualRegister([]);", context);
+  const entries = document.getElementById('register-entries');
+  assert.match(entries.textContent, /Original UI.*original-source.*Approved design.*blueprint-1.*Implemented UI.*implementation-source/s);
+  assert.match(entries.textContent, /Original unavailable.*Fixture unavailable/);
+  assert.equal(entries.querySelectorAll('.register-comparison img').length, 2);
+  assert.ok(entries.querySelector('img[src="/visual-integrity/design/approval-1/menu"]'));
+  status.value = 'open';
+  vm.runInContext('renderVisualRegister([])', context);
+  assert.match(entries.textContent, /missing-menu/);
+  assert.doesNotMatch(entries.textContent, /open-menu/);
+  vm.runInContext("registerMetadata = {}; $('register-status').value = '';", context);
+});

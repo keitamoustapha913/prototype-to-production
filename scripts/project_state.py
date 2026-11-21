@@ -67,17 +67,21 @@ def require_visual_integrity(directory: Path, manifest: dict, slice_id: str, *, 
 
 
 def cross_screen_blockers(directory: Path, manifest: dict, slice_id: str | None = None) -> list[str]:
-    if not manifest.get("cross_screen_changes"):
-        return []
-    return sibling_module("cross_screen").blockers(directory, manifest, slice_id)
+    return [reason for slices, reason in visual_holds(directory, manifest) if slice_id is None or slice_id in slices]
+
+
+def visual_holds(directory: Path, manifest: dict):
+    if manifest.get("cross_screen_changes"):
+        yield from sibling_module("cross_screen").holds(directory, manifest)
+    if manifest.get("visual_baselines"):
+        yield from sibling_module("visual_baseline").holds(directory, manifest)
 
 
 def cross_screen_holds_by_slice(directory: Path, manifest: dict) -> dict:
     result = {}
-    if manifest.get("cross_screen_changes"):
-        for slice_ids, reason in sibling_module("cross_screen").holds(directory, manifest):
-            for slice_id in sorted(slice_ids):
-                result.setdefault(slice_id, []).append(reason)
+    for slice_ids, reason in visual_holds(directory, manifest):
+        for slice_id in sorted(slice_ids):
+            result.setdefault(slice_id, []).append(reason)
     return result
 
 
@@ -610,6 +614,11 @@ def record_discovery(directory: Path, project_root: Path, audit_file: str) -> No
         previous_id = manifest.get("active_discovery_id")
         previous = read_json(artifact_file(directory, audits[previous_id]["path"])) if previous_id else None
         evidence, sources, errors = validate_discovery_audit(directory, project_root, candidate, previous)
+        if not errors:
+            frozen = {**(audits[previous_id]["source_hashes_at_discovery"] if previous_id else {}), **sources}
+            errors.extend(sibling_module("visual_baseline").discovery_errors(
+                directory, manifest, candidate, frozen,
+                ui_features={feature["feature_id"]: feature["route"] for feature in candidate["features"]}))
         if candidate.get("scope") != manifest.get("scope"):
             errors.append("Discovery scope must match the redesign initiative")
         resolutions = candidate.get("missing_report_resolutions", [])
@@ -651,6 +660,9 @@ def record_discovery(directory: Path, project_root: Path, audit_file: str) -> No
             "evidence_hashes": evidence, "source_hashes_at_discovery": sources,
             "feature_ids": [item["feature_id"] for item in candidate["features"]],
         }
+        if not previous_id and (manifest.get("visual_baselines_required") or manifest.get("visual_baselines")):
+            state = blueprint_state(directory, manifest)
+            audits[audit_id]["visual_baseline_build"] = state.build_fingerprint(state.discovery_snapshot(sources))
         manifest["active_discovery_id"] = audit_id
         previous_ids = {item["feature_id"] for item in previous["features"]} if previous else set()
         newly_found = set(audits[audit_id]["feature_ids"]) - previous_ids
@@ -1274,12 +1286,14 @@ def render_checkpoint(manifest: dict, *, resume_action: str | None = None) -> st
         if item.get("superseded_by"):
             status += f", superseded by {item['superseded_by']}"
         lines.append(f"- {slice_id}: {status} ({item.get('owner', 'unassigned')})")
-    if manifest.get("cross_screen_changes") or any(
+    if manifest.get("visual_baselines") or manifest.get("cross_screen_changes") or any(
             item.get("visual_integrity_head") for item in manifest.get("slices", {}).values()):
         lines += ["", "## Visual Review Register", "",
                   "Open the register with review-viewer or list saved inspections with visual-integrity --action list."]
         lines.extend(f"- Shared change {key}: {item['status']}"
                      for key, item in sorted(manifest.get("cross_screen_changes", {}).items()))
+        lines.extend(f"- Original visual baseline {key}: {'captured' if item['original'] else 'unavailable'}"
+                     for key, item in sorted(manifest.get("visual_baselines", {}).items()))
     lines += ["", "## Functionality coverage", ""]
     lines.append(f"- Latest application-A audit: {manifest.get('active_discovery_id') or 'none'}")
     coverage_group = "blueprint_coverage" if mode == "blueprint" else "prototype_coverage"
@@ -1334,6 +1348,7 @@ def initialize(directory: Path, scope: str, next_action: str | None, mode: str |
             "initiative_mode": mode or "blueprint",
             "schema_version": 4,
             "visual_qa_version": 1,
+            "visual_baselines_required": True,
             "initiative_id": directory.name,
             "scope": scope,
             "stage": "discover",
@@ -2471,6 +2486,7 @@ def check_initiative(directory: Path, manifest: dict, *, allow_questions: bool =
     errors.extend(check_coverage_records(directory, manifest))
     errors.extend(check_work_state(directory, manifest))
     errors.extend(sibling_module("cross_screen").history_errors(directory, manifest))
+    errors.extend(sibling_module("visual_baseline").history_errors(directory, manifest))
     if initiative_mode(manifest) == "blueprint":
         state = blueprint_state(directory, manifest)
         errors.extend(state.check_records())
@@ -3035,8 +3051,15 @@ def build_resume_packet(directory: Path, project_root: Path, *, delivery_slice: 
     for key in shared_holds.keys() & delivery.keys():
         if delivery[key] != "cancelled":
             delivery[key] = "blocked"
+    baselines = sibling_module("visual_baseline")
+    original_references = (baselines.catalog(directory, manifest, delivery_slice)
+                           if manifest.get("visual_baselines") and not baselines.history_errors(directory, manifest)
+                           else [])
+    shared_changes = sibling_module("cross_screen").review_changes(directory, manifest, delivery_slice)
     return {
         "cross_screen_blockers": shared_holds,
+        "visual_baselines": original_references,
+        "cross_screen_changes": shared_changes,
         "initiative_id": manifest["initiative_id"], "initiative_directory": str(directory),
         "scope": manifest["scope"], "phase": manifest["stage"],
         "initiative_mode": initiative_mode(manifest),
@@ -3108,6 +3131,12 @@ def print_resume(directory: Path, project_root: Path, *, delivery_slice: str | N
     for slice_id, reasons in sorted(packet["cross_screen_blockers"].items()):
         for reason in reasons:
             print(f"- {slice_id}: {reason}")
+    for item in packet["visual_baselines"]:
+        key = item["definition"]["baseline_id"]
+        print(f"Original visual baseline {key}: "
+              + (item["original"]["case"]["full_screenshot"] if item["original"] else item["gap"]["reason"]))
+    for item in packet["cross_screen_changes"]:
+        print(f"Shared visual change {item['change_id']}: {item['current_status']}")
     print(f"Current Git HEAD: {packet['git_head'] or 'unavailable (inspect code manually)'}")
     print(f"Current Git status: {packet['git_worktree_status'] or ('clean' if packet['git_worktree_status'] is not None else 'unavailable')}")
     if packet["active_work"]:
@@ -3149,7 +3178,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     for name in (
-        "init", "artifact-setup", "review-viewer", "review-revision", "visual-integrity", "cross-screen", "event", "checkpoint", "conversation-record", "plan-record", "blueprint-record", "blueprint-coverage", "blueprint-index-rebuild", "work-update", "discovery-record", "discovery-capture", "browser-build-fingerprint", "missing-feature", "prototype-coverage", "approve", "revoke-approval", "slice-create", "slice-cancel",
+        "init", "artifact-setup", "review-viewer", "review-revision", "visual-integrity", "visual-baseline", "cross-screen", "event", "checkpoint", "conversation-record", "plan-record", "blueprint-record", "blueprint-coverage", "blueprint-index-rebuild", "work-update", "discovery-record", "discovery-capture", "browser-build-fingerprint", "missing-feature", "prototype-coverage", "approve", "revoke-approval", "slice-create", "slice-cancel",
         "slice-report", "reconcile", "warning-record", "warning-decide", "resume", "validate", *REVIEW_COMMANDS,
     ):
         sub = commands.add_parser(name)
@@ -3165,7 +3194,11 @@ def main(argv: list[str] | None = None) -> int:
             sub.add_argument("--attempt-file")
             sub.add_argument("--capture-file")
         if name == "cross-screen":
-            sub.add_argument("--action", choices=["plan", "extend", "capture", "record", "abandon", "list"], required=True)
+            sub.add_argument("--action", choices=["plan", "extend", "capture", "record", "abandon", "reuse", "ready", "list"], required=True)
+            sub.add_argument("--slice-id")
+            sub.add_argument("--input-file")
+        if name == "visual-baseline":
+            sub.add_argument("--action", choices=["capture", "gap", "list"], required=True)
             sub.add_argument("--slice-id")
             sub.add_argument("--input-file")
         if name == "browser-build-fingerprint":
@@ -3270,6 +3303,21 @@ def main(argv: list[str] | None = None) -> int:
                 manifest = manifest_at(directory)
                 require_cross_screen(directory, manifest, args.slice_id)
                 print(json.dumps(visual.require_verified(directory, manifest, args.slice_id), indent=2))
+        elif args.command == "visual-baseline":
+            baseline = sibling_module("visual_baseline")
+            try:
+                if args.action == "list":
+                    with coordinator_lock(directory):
+                        manifest = manifest_at(directory)
+                        baseline.require_history(directory, manifest)
+                        result = baseline.catalog(directory, manifest, args.slice_id)
+                else:
+                    if not args.input_file:
+                        raise StateError("visual-baseline capture and gap require --input-file")
+                    result = baseline.record(directory, args.action, read_json(Path(args.input_file)))
+            except baseline.project_state.StateError as error:
+                raise StateError(str(error)) from error
+            print(json.dumps(result, indent=2))
         elif args.command == "cross-screen":
             shared = sibling_module("cross_screen")
             try:
@@ -3279,7 +3327,8 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     if not args.slice_id or not args.input_file:
                         raise StateError("cross-screen requires --slice-id and --input-file for changes")
-                    result = shared.change(directory, args.slice_id, args.action, read_json(Path(args.input_file)))
+                    payload = read_json(Path(args.input_file))
+                    result = shared.change(directory, args.slice_id, args.action, payload)
             except shared.project_state.StateError as error:
                 raise StateError(str(error)) from error
             print(json.dumps(result, indent=2))

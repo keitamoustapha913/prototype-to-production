@@ -810,10 +810,11 @@ def serve(root, port):
                         data, kind = row[0], 'application/octet-stream'
                     elif route == '/visual-integrity':
                         try:
-                            from scripts import cross_screen, project_state, visual_integrity
+                            from scripts import cross_screen, project_state, visual_baseline, visual_integrity
                         except ModuleNotFoundError:
                             import cross_screen
                             import project_state
+                            import visual_baseline
                             import visual_integrity
                         warnings = []
                         with project_state.coordinator_lock(root):
@@ -821,6 +822,9 @@ def serve(root, port):
                             records = visual_integrity.list_attempts(root, manifest=manifest, warnings=warnings)
                             warnings.extend(cross_screen.history_errors(root, manifest))
                             cross_screen_changes = cross_screen.review_changes(root, manifest)
+                            baseline_errors = visual_baseline.history_errors(root, manifest)
+                            warnings.extend(baseline_errors)
+                            baselines = visual_baseline.catalog(root, manifest) if not baseline_errors else []
                         dispatchable = set()
                         next_action = manifest.get('next_action')
                         shared_blockers = {}
@@ -842,10 +846,19 @@ def serve(root, port):
                                 'dependencies': dependencies,
                                 'independent': slice_id in dispatchable,
                             }
-                        data, kind = encode({'attempts': records, 'cross_screen_changes': cross_screen_changes, 'project': {
+                        data, kind = encode({'attempts': records, 'cross_screen_changes': cross_screen_changes,
+                                             'visual_baselines': baselines, 'project': {
                             'next_action': next_action, 'stage': manifest.get('stage'), 'slices': slices,
                             'history_warnings': warnings,
                         }}), 'application/json'
+                    elif route.startswith('/visual-integrity/design/'):
+                        try:
+                            from scripts import visual_baseline
+                        except ModuleNotFoundError:
+                            import visual_baseline
+                        approval_id, case_id = map(unquote, route[len('/visual-integrity/design/'):].split('/'))
+                        manifest = json.loads(local(root, 'manifest.json').read_bytes())
+                        data, kind = visual_baseline.approved_image(root, manifest, approval_id, case_id), 'image/png'
                     elif route.startswith('/visual-integrity/evidence/'):
                         try:
                             from scripts import visual_integrity

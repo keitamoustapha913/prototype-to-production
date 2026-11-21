@@ -420,11 +420,13 @@ async function update() {
 
 function registerImage(path, alt, rect, captionText = alt) {
   if (typeof path !== 'string' || !path) return el('span', 'Screenshot unavailable');
+  return registerImageFromUrl(evidenceUrl(path), alt, rect, captionText);
+}
+function registerImageFromUrl(src, alt, rect, captionText = alt) {
   const figure = el('figure');
   figure.className = 'register-image';
   const stage = el('div'); stage.className = 'register-image-stage';
   const img = el('img');
-  const src = evidenceUrl(path);
   img.src = src;
   img.alt = alt;
   img.loading = 'lazy';
@@ -629,6 +631,12 @@ function crossScreenCard(change) {
       detail.append(el('summary', `${spec.case_id} · ${state} · ${width}×${height} · ${caseStatus.replaceAll('_', ' ')}`),
         el('p', spec.reason), el('p', spec.expectation));
       if (spec.approved_case) detail.append(el('p', 'Approved case · ' + spec.approved_case));
+      const original = change.baseline_context?.[spec.case_id];
+      if (original?.baseline_id) detail.append(el('p', 'Discovery baseline · ' + original.baseline_id));
+      if (original?.revision) detail.append(el('p', 'Original source revision · ' + original.revision));
+      if (spec.baseline_comparison_note) detail.append(el('p', spec.baseline_comparison_note));
+      const gap = change.baseline_readiness?.gaps[spec.case_id];
+      if (gap) detail.append(el('p', gap));
       for (const decision of spec.protections || []) {
         detail.append(el('p', [decision.decision_id, decision.requirement].filter(Boolean).join(' · ')));
       }
@@ -653,6 +661,11 @@ function crossScreenCard(change) {
 }
 function appendCrossScreenResult(holder, result, findings, retryPolicy) {
   if (result.unavailable_reason) holder.append(el('p', result.unavailable_reason));
+  const beforeBrowser = result.before?.browser_evidence?.browser_version?.product;
+  const afterBrowser = result.after?.browser_evidence?.browser_version?.product;
+  if (beforeBrowser && afterBrowser && beforeBrowser !== afterBrowser) {
+    holder.append(el('p', `Capture browser changed · ${beforeBrowser} → ${afterBrowser}`));
+  }
   const checks = el('ul');
   for (const [kind, check] of Object.entries(result.checks)) {
     checks.append(el('li', `${kind} · ${check.result.replaceAll('_', ' ')} · ${check.note}`));
@@ -684,13 +697,69 @@ function appendCrossScreenResult(holder, result, findings, retryPolicy) {
     holder.append(evidence);
   }
 }
+function visualBaselineCard(baseline) {
+  const {definition, original, gap, approved, actual} = baseline;
+  const card = el('article');
+  card.className = 'register-attempt' + (baseline.available ? '' : ' status-unresolved');
+  card.append(el('h2', `${definition.baseline_id} · ${definition.state.route}`),
+    el('p', definition.reason), el('p', `Discovery features · ${definition.baseline_feature_ids.join(', ')}`),
+    el('p', `Source · ${definition.source_paths.join(', ')}`));
+  if (baseline.slice_ids.length) card.append(el('p', `Slices · ${baseline.slice_ids.join(', ')}`));
+  const dependent = (baseline.affected_slice_ids || []).filter(slice => !baseline.slice_ids.includes(slice));
+  if (dependent.length) card.append(el('p', `Dependent slices · ${dependent.join(', ')}`));
+  if (gap) card.append(el('p', `${baseline.available ? 'Recovered gap' : 'Original unavailable'} · ${gap.reason}`));
+  if (baseline.evidence_error) card.append(el('p', baseline.evidence_error));
+
+  if (original && baseline.available) card.append(baselineCapture('Original UI', original));
+  for (const [id, reference] of Object.entries(approved)) {
+    const section = el('details');
+    section.append(el('summary', `Approved design · ${reference.version || id}`),
+      el('pre', JSON.stringify(reference, null, 2)));
+    const {width, height} = definition.renderCase?.viewport || {};
+    for (const design of reference.prototype_cases || []) {
+      if (design.reference_file && design.viewport?.width === width && design.viewport?.height === height) {
+        const url = '/visual-integrity/design/' + encodeURIComponent(id) + '/' + encodeURIComponent(design.case_id);
+        section.append(registerImageFromUrl(url, `Approved design · ${design.case_id}`));
+      }
+    }
+    card.append(section);
+  }
+  for (const capture of [...actual].reverse()) {
+    const section = baselineCapture(`Implemented UI · ${capture.slice_id}`, capture);
+    if (original && baseline.available) {
+      const shots = el('div');
+      shots.className = 'register-shot-grid register-comparison';
+      shots.append(registerImage(original.case.full_screenshot, 'Original UI'),
+        registerImage(capture.case.full_screenshot, 'Implemented UI'));
+      section.append(shots);
+    }
+    card.append(section);
+  }
+  return card;
+}
+function baselineCapture(label, receipt) {
+  const section = el('details');
+  section.append(el('summary', `${label} · ${receipt.captured_at}`));
+  if (receipt.revision) section.append(el('p', 'Source revision · ' + receipt.revision));
+  if (receipt.baseline_comparison_note) section.append(el('p', receipt.baseline_comparison_note));
+  section.append(registerCase(receipt.case));
+  const provenance = el('details');
+  provenance.append(el('summary', 'Served build and source'),
+    el('pre', JSON.stringify({build: receipt.build, approval: receipt.approval_id, sources: receipt.sources,
+      served: receipt.served, url: receipt.url}, null, 2)));
+  section.append(provenance);
+  return section;
+}
 function renderVisualRegister(attempts = registerAttempts) {
   const entries = $('register-entries');
   const statusFilter = $('register-status').value;
   const search = $('register-search').value.trim().toLowerCase();
   const changes = registerMetadata.cross_screen_changes || [];
+  const baselines = registerMetadata.visual_baselines || [];
   const slices = [...new Set([...attempts.map(a => a.slice_id),
-    ...changes.flatMap(change => change.affected_slices)].filter(x => typeof x === 'string'))].sort();
+    ...changes.flatMap(change => change.affected_slices),
+    ...baselines.flatMap(baseline => baseline.affected_slice_ids || baseline.slice_ids)]
+    .filter(x => typeof x === 'string'))].sort();
   const select = $('register-slice');
   const selectedSlice = select.value;
   const allSlices = el('option', 'All slices'); allSlices.value = '';
@@ -739,8 +808,16 @@ function renderVisualRegister(attempts = registerAttempts) {
       (statusFilter === 'improved' && latestFindings.some(finding => finding.status === 'improved')) ||
       (statusFilter === 'noted' && findings.some(finding => finding.status === 'noted'));
   });
+  const visibleBaselines = baselines.filter(baseline =>
+    (!select.value || (baseline.affected_slice_ids || baseline.slice_ids).includes(select.value)) &&
+    (!search || JSON.stringify(baseline).toLowerCase().includes(search)) &&
+    (!statusFilter || statusFilter === 'baselines' || (statusFilter === 'open' && !baseline.available)));
+  for (const baseline of visibleBaselines) entries.append(visualBaselineCard(baseline));
   for (const change of matches.reverse()) entries.append(crossScreenCard(change));
-  if (!visible.length && !matches.length) { entries.append(el('p', 'No current findings or clean evidence match these filters.')); return; }
+  if (!visible.length && !matches.length && !visibleBaselines.length) {
+    entries.append(el('p', 'No current findings or clean evidence match these filters.'));
+    return;
+  }
   for (const entry of visible) {
     if (entry.kind !== 'finding') {
       const attempt = entry.value;
@@ -810,7 +887,8 @@ async function loadVisualRegister() {
   const response = await read('/visual-integrity');
   const result = await response.json();
   registerAttempts = Array.isArray(result) ? result : result.attempts || [];
-  registerMetadata = {...result.project, cross_screen_changes: result.cross_screen_changes || []};
+  registerMetadata = {...result.project, cross_screen_changes: result.cross_screen_changes || [],
+    visual_baselines: result.visual_baselines || []};
   renderVisualRegister();
 }
 function mergeState(previous, delta) {

@@ -535,6 +535,12 @@ class BlueprintState:
                         source = self.api.project_source_file(project_root, anchor['path'])
                         self.require(anchor['contains'] in source.read_text(), 'Stale A source anchor before initial approval')
 
+        ui_features = {feature['feature_id']: feature['route'] for feature in candidate['features']
+                       if feature.get('surface', surface) in {'ui', 'fullstack'}}
+        visual_errors = self.api.sibling_module('visual_baseline').discovery_errors(
+            self.directory, self.manifest, candidate, sources, ui_features=ui_features)
+        self.require(not visual_errors, 'Visual baseline discovery BLOCKED: ' + '; '.join(visual_errors))
+
         for requirement in requirements:
             self.require(isinstance(requirement, dict) and self.identifier(requirement.get('requirement_id'))
                          and self.text(requirement.get('text')), 'Requirements need stable IDs and actual intent')
@@ -572,10 +578,15 @@ class BlueprintState:
                     'features', 'behavior_contracts', 'requirements', 'routes', 'retired_source_paths')) and (
                     sources == self.manifest['discovery_audits'][approved_audit_id]['source_hashes_at_discovery']):
                 equivalent_approval_id = active['decision_id']
+        visual_provenance = {}
+        if not previous_id and ui_features and (self.manifest.get('visual_baselines_required')
+                                                or self.manifest.get('visual_baselines')):
+            files = [path for path, digest in sources.items() if digest is not None]
+            visual_provenance['visual_baseline_build'] = self.build_fingerprint(self.discovery_snapshot(files))
         self.freeze('discovery_audits', audit_id, candidate, hashes,
                     source_hashes_at_discovery=sources,feature_ids=ids,baseline_kind=kind,surface=surface,
                     approved_before_discovery=bool(self.manifest.get('approvals')),
-                    equivalent_approval_id=equivalent_approval_id)
+                    equivalent_approval_id=equivalent_approval_id, **visual_provenance)
         self.manifest['active_discovery_id'] = audit_id
         for report_id in resolved:
             self.manifest['missing_reports'][report_id].update(status='dismissed', resolution_audit_id=audit_id)

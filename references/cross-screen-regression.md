@@ -7,7 +7,7 @@ Start this workflow before editing any shared UI component. It applies to routin
 ```mermaid
 flowchart TD
     Start["Shared UI change planned"] --> Scope["Identify affected screens and slices<br/>Select relevant states and viewports"]
-    Scope --> Before["Register the change and capture original states"]
+    Scope --> Before["Register the change, reuse valid baselines and capture missing original states"]
     Before --> Edit["Apply the authorized change"]
     Edit --> After["Capture updated states in the browser"]
     After --> Compare["Compare with original behavior, approved blueprints,<br/>and protected design decisions"]
@@ -45,9 +45,10 @@ Run the commands from the skill directory with the same project root and initiat
 ```sh
 python3 scripts/project_state.py cross-screen --project-root <app> --initiative-id <initiative> --slice-id <slice> --action plan --input-file <plan.json>
 python3 scripts/project_state.py cross-screen --project-root <app> --initiative-id <initiative> --slice-id <slice> --action capture --input-file <capture.json>
+python3 scripts/project_state.py cross-screen --project-root <app> --initiative-id <initiative> --slice-id <slice> --action ready --input-file <change-id.json>
 ```
 
-A capture request names one case. Start the existing application from the original source, use the original fixtures, and capture each planned case with `phase` set to `before`.
+The plan reuses compatible [discovery baselines](visual-baseline.md). For each remaining case, start the existing application from the original source and fixtures and capture with `phase` set to `before`. The readiness check takes a JSON object with `change_id`. Run it before editing.
 
 ```json
 {

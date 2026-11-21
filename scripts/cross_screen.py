@@ -95,7 +95,8 @@ def planned_case(value, route, approved):
         require(locked["route"] == route and all(state.get(field) == locked[field]
                 for field in ("state", "role", "fixture", "state_setup") if field in locked),
                 "Case state must match its approved route, state, role and fixture")
-        for key in ("route", "viewport", "ready_selector", "setup", "command", "observations", "interaction_assertions"):
+        for key in ("route", "viewport", "ready_selector", "setup", "command", "observations",
+                    "interaction_assertions", "color_scheme", "design_tokens"):
             if key in locked:
                 require(key not in render or render[key] == locked[key], f"Use the approved browser case {key}")
         render = {**locked, **render}
@@ -179,6 +180,8 @@ def make_plan(directory, manifest, slice_id, payload, *, existing=None):
     plan = {"change_id": change_id, "slice_id": slice_id, "summary": payload["summary"], "component_paths": paths,
             "approval_id": approval, "screens": saved, "created_at": now(), "status": "pending",
             "baselines": {}, "captures": {}, "attempts": []}
+    if manifest.get("visual_baselines_required"):
+        plan["pre_edit_check_required"] = True
     plan["original_sources"] = source_hashes(directory, scoped_paths(plan))
     for old in other_plans:
         overlap = set(paths).intersection(old["component_paths"])
@@ -202,12 +205,63 @@ def make_plan(directory, manifest, slice_id, payload, *, existing=None):
         require(all(new_cases.get(key) == spec for key, spec in old_cases.items()),
                 "Extensions retain the original case definitions")
         require(saved != existing["screens"], "An extension must add affected screens, cases or dependencies")
-        return {**existing, "screens": saved, "original_sources": plan["original_sources"], "updated_at": now()}
+        updated = {**existing, "screens": saved, "original_sources": plan["original_sources"], "updated_at": now()}
+        updated.pop("pre_edit_check", None)
+        return updated
     return plan
+
+
+def hydrate_baselines(directory, manifest, plan):
+    catalog = project_state.sibling_module("visual_baseline")
+    catalog.require_history(directory, manifest)
+    for screen in plan["screens"]:
+        paths = set(screen["source_paths"]) | set(plan["component_paths"])
+        for spec in screen["cases"]:
+            key = spec["case_id"]
+            if key in plan["baselines"]:
+                continue
+            receipt = catalog.reusable(directory, manifest, spec, paths, plan["original_sources"])
+            if receipt:
+                # One discovery capture can support multiple approved cases on the same screen.
+                capture_key = f"{receipt['case']['capture_id']}/{key}"
+                plan["baselines"][key] = capture_key
+                plan["captures"][capture_key] = receipt
+                plan.get("baseline_gaps", {}).pop(key, None)
+            elif spec.get("baseline_id"):
+                entry = manifest["visual_baselines"][spec["baseline_id"]]
+                gap = entry.get("gap") if not entry["original"] else None
+                plan.setdefault("baseline_gaps", {})[key] = (gap["reason"] if gap else
+                    "The saved original is unavailable or belongs to a different source version")
 
 
 def case_specs(plan):
     return {case["case_id"]: case for screen in plan["screens"] for case in screen["cases"]}
+
+
+def baseline_readiness(directory, plan):
+    gaps = {}
+    for key in case_specs(plan):
+        receipt = plan["captures"].get(plan["baselines"].get(key))
+        if not receipt:
+            gaps[key] = plan.get("baseline_gaps", {}).get(key, "Capture the original rendered state")
+            continue
+        try:
+            project_state.sibling_module("visual_baseline").verify_images(receipt["case"], directory)
+        except (OSError, ValueError) as error:
+            gaps[key] = str(error)
+    return {"ready": not gaps, "gaps": gaps}
+
+
+def require_ready(directory, manifest, slice_id, payload):
+    require(isinstance(payload, dict), "Supply the change ID")
+    require_history(directory, manifest)
+    plan = get_plan(manifest, slice_id, payload.get("change_id"))
+    require(source_hashes(directory, scoped_paths(plan)) == plan["original_sources"],
+            "Check original baseline readiness before modifying scoped source")
+    readiness = baseline_readiness(directory, plan)
+    require(readiness["ready"], "Original baseline gaps: " + "; ".join(
+        f"{key}: {reason}" for key, reason in readiness["gaps"].items()))
+    return readiness
 
 
 def save(directory, manifest, plan, action, request, **event):
@@ -254,10 +308,13 @@ def capture(directory, slice_id, payload):
     if phase == "before":
         require(sources == plan["original_sources"], "A before capture requires the original planned source bytes")
         require(case_id not in plan["baselines"], "Keep the first baseline capture")
+        require(spec.get("baseline_id") is None, "Restore or recover the explicitly linked original visual baseline")
     else:
         require_after_sources(plan, sources)
     require(visual._text(payload.get("appUrl")) and visual._text(payload.get("browser")),
             "Provide the running application URL and Chromium executable")
+    baseline = project_state.sibling_module("visual_baseline")
+    head = baseline.revision(directory)
     state = project_state.blueprint_state(directory, manifest)
     existing = [path for path, digest in sources.items() if digest is not None]
     snapshot = state.discovery_snapshot(existing)
@@ -275,6 +332,7 @@ def capture(directory, slice_id, payload):
         require_history(directory, current)
         original = get_plan(current, slice_id, plan["change_id"])
         require(original.get("updated_at", original["created_at"]) == plan.get("updated_at", plan["created_at"])
+                and baseline.revision(directory) == head
                 and source_hashes(directory, scoped_paths(plan)) == sources
                 and project_state.blueprint_state(directory, current).discovery_snapshot(existing) == snapshot,
                 "Plan or served workspace changed during capture")
@@ -284,7 +342,7 @@ def capture(directory, slice_id, payload):
         else:
             require_after_sources(original, sources)
         receipt = {"case": case, "sources": sources, "phase": phase, "build": build["fingerprint"],
-                   "captured_at": now(), "browser": payload["browser"], **evidence}
+                   "captured_at": now(), "browser": payload["browser"], "revision": head, **evidence}
         original["captures"][case["capture_id"]] = receipt
         save(directory, current, original, "capture", request, capture_id=case["capture_id"], phase=phase)
     return case
@@ -328,10 +386,16 @@ def review_case(directory, plan, spec, row, sources, since):
         require(receipt and receipt["case"]["case_id"] == key and receipt["phase"] == "after"
                 and receipt["captured_at"] > since and receipt["sources"] == sources,
                 "Use a fresh after capture for this case and current source")
-        require(not baseline or baseline["browser"] == receipt["browser"],
-                "Compare original and updated cases using the same browser")
         latest = receipt["case"]
+        prior_version = base.get("browser_evidence", {}).get("browser_version") if base else None
+        if baseline and not prior_version:
+            require(baseline["browser"] == receipt["browser"],
+                    "Compare original and updated UI using the same browser")
+    if base and project_state.sibling_module("visual_baseline").evidence_error(directory, baseline):
+        base = None
     pair = {**row, "before": base, "after": latest, "comparisons": [],
+            "baseline_id": baseline.get("baseline_id"),
+            "before_revision": baseline.get("revision"), "after_revision": receipt.get("revision"),
             "before_build": baseline.get("build"), "after_build": receipt.get("build")}
     if not base or not latest:
         require(visual._text(row.get("unavailable_reason")) and not all(
@@ -409,6 +473,7 @@ def record(directory, plan, payload):
     sources = source_hashes(directory, scoped_paths(plan))
     require_after_sources(plan, sources)
     since = max(plan.get("updated_at", plan["created_at"]),
+                plan.get("pre_edit_check", plan["created_at"]),
                 plan["attempts"][-1]["recorded_at"] if plan["attempts"] else plan["created_at"])
     cases = [review_case(directory, plan, specs[row["case_id"]], row, sources, since) for row in rows]
     findings = payload.get("findings", [])
@@ -416,6 +481,8 @@ def record(directory, plan, payload):
     verified = (all(row["status"] == "verified" for row in cases)
                 and not any(item["status"] in ("open", "improved") for item in findings))
     if verified:
+        require(not plan.get("pre_edit_check_required") or plan.get("pre_edit_check"),
+                "Run the original baseline readiness check before editing. Restore the original source to recover.")
         require(any(sources[path] != plan["original_sources"][path] for path in plan["component_paths"]),
                 "Record a verified shared change only after its source changes")
     status = "verified" if verified else "unresolved"
@@ -436,6 +503,13 @@ def change(directory, slice_id, action, payload):
         recovered = project_state.recover_workflow_transition(directory, request)
         manifest = project_state.manifest_at(directory)
         require_history(directory, manifest)
+        if action == "ready":
+            plan = get_plan(manifest, slice_id, payload.get("change_id"))
+            if not recovered:
+                require_ready(directory, manifest, slice_id, payload)
+                plan["pre_edit_check"] = now()
+                save(directory, manifest, plan, action, request)
+            return {"ready": True, "gaps": {}, "checked_at": plan["pre_edit_check"]}
         if recovered:
             return manifest["cross_screen_changes"][payload["change_id"]]
         if action == "plan":
@@ -444,17 +518,22 @@ def change(directory, slice_id, action, payload):
                 manifest["stage"] = "implement"
                 manifest["next_action"] = f"Verify cross-screen change {plan['change_id']} before integration"
         else:
-            require(action in ("record", "abandon", "extend"), "Unknown cross-screen action")
+            require(action in ("record", "abandon", "extend", "reuse"), "Unknown cross-screen action")
             plan = get_plan(manifest, slice_id, payload.get("change_id"))
             if action == "record":
                 record(directory, plan, payload)
             elif action == "extend":
                 plan = make_plan(directory, manifest, slice_id, payload, existing=plan)
+            elif action == "reuse":
+                require(source_hashes(directory, scoped_paths(plan)) == plan["original_sources"],
+                        "Restore original scoped source before resolving baseline gaps")
             else:
                 require(plan["status"] != "verified" and visual._text(payload.get("reason"))
                         and source_hashes(directory, scoped_paths(plan)) == plan["original_sources"],
                         "Abandonment requires a reason and restoration of all original source bytes")
                 plan.update(status="abandoned", abandonment_reason=payload["reason"])
+        if action in ("plan", "extend", "reuse"):
+            hydrate_baselines(directory, manifest, plan)
         save(directory, manifest, plan, action, request, status=plan["status"])
         return plan
 
@@ -534,19 +613,31 @@ def blockers(directory, manifest, slice_id=None):
     return [reason for _, reason in holds(directory, manifest, slice_id=slice_id)]
 
 
-def review_changes(directory, manifest):
+def review_changes(directory, manifest, slice_id=None):
     """Return original-change groups with historical attempts for the viewer."""
     if not manifest.get("cross_screen_changes"):
         return []
     current = {plan["change_id"] for plan in current_plans(manifest)}
     known = related_assignments(directory, manifest)
-    return [dict(deepcopy({key: value for key, value in plan.items() if key != "captures"}),
-                 affected_slices=sorted(affected_slices(manifest, plan, known=known)),
-                 current_status=(current_status(directory, plan) if plan["change_id"] in current
-                                 else "abandoned" if plan["status"] == "abandoned" else "historical"),
-                 baseline_cases={case_id: plan["captures"][capture_id]["case"]
-                                 for case_id, capture_id in plan["baselines"].items()})
-            for plan in manifest.get("cross_screen_changes", {}).values()]
+    result = []
+    for plan in manifest.get("cross_screen_changes", {}).values():
+        affected = affected_slices(manifest, plan, known=known)
+        if slice_id is not None and slice_id not in affected:
+            continue
+        status = plan["status"]
+        if plan["change_id"] in current:
+            status = current_status(directory, plan)
+        elif status != "abandoned":
+            status = "historical"
+        original = {case_id: plan["captures"][capture_id] for case_id, capture_id in plan["baselines"].items()}
+        result.append(dict(deepcopy({key: value for key, value in plan.items() if key != "captures"}),
+                           affected_slices=sorted(affected), current_status=status,
+                           baseline_readiness=baseline_readiness(directory, plan),
+                           baseline_context={case_id: {field: receipt.get(field) for field in (
+                               "build", "revision", "captured_at", "sources", "baseline_id")}
+                               for case_id, receipt in original.items()},
+                           baseline_cases={case_id: receipt["case"] for case_id, receipt in original.items()}))
+    return result
 
 
 def require_planned_paths(manifest, slice_id, paths, implemented):

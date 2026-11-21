@@ -1,6 +1,7 @@
 {
   "audit_id": "audit-v1",
   "scope": "page",
+  "visual_baseline_ids": ["record-search-default"],
   "routes": [
     "/replace-with-actual-route"
   ],

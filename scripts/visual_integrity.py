@@ -266,6 +266,8 @@ def capture_case(directory, slice_id, request):
     fingerprint = result_fingerprint(directory, manifest, slice_id)
     contract = _adaptive_contract(directory, manifest, slice_id)
     state = project_state.blueprint_state(directory, manifest)
+    baseline = project_state.sibling_module("visual_baseline")
+    head = baseline.revision(directory)
     sources = state.discovery_snapshot([])
     build = {"fingerprint": state.build_fingerprint(sources), "sources": sources}
     render = request.get("renderCase", {})
@@ -285,7 +287,8 @@ def capture_case(directory, slice_id, request):
         required_state = {k: approved[k] for k in ("route", "state", "role", "fixture", "state_setup") if k in approved}
         if any(observed_state.get(k) != v for k, v in required_state.items()):
             raise VisualIntegrityError("Capture the approved role, fixture and interaction state")
-        for key in ("ready_selector", "setup", "command", "observations", "interaction_assertions"):
+        for key in ("ready_selector", "setup", "command", "observations", "interaction_assertions",
+                    "color_scheme", "design_tokens"):
             if key in approved and key in render and render[key] != approved[key]:
                 raise VisualIntegrityError(f"Capture the locked browser case {key}")
         render = {**approved, **render}
@@ -293,6 +296,7 @@ def capture_case(directory, slice_id, request):
         raise VisualIntegrityError("Capture the approved viewport")
     if not render.get("ready_selector", "").strip():
         raise VisualIntegrityError("Supply a visible component selector")
+    baseline_id = baseline.link_actual(directory, manifest, slice_id, request, render)
     case, evidence = browser_case(directory, slice_id, state, request, render, observed_state,
                                   case_id, build, checks, locked_criteria)
     if case_id not in approved_cases:
@@ -302,8 +306,16 @@ def capture_case(directory, slice_id, request):
         project_state.visual_inspection_assignment(directory, current, slice_id)
         if result_fingerprint(directory, current, slice_id) != fingerprint:
             raise VisualIntegrityError("Implementation changed during browser capture")
+        if baseline_id and (baseline.revision(directory) != head or
+                project_state.blueprint_state(directory, current).discovery_snapshot([]) != sources):
+            raise VisualIntegrityError("Source revision changed during visual baseline comparison capture")
         receipt = {"case": case, "result_fingerprint": fingerprint, "build": build["fingerprint"],
+                   "revision": head, "approval_id": manifest.get("active_approval_id"),
                    **evidence, "captured_at": datetime.now(timezone.utc).isoformat()}
+        if baseline_id:
+            paths = manifest["visual_baselines"][baseline_id]["definition"]["source_paths"]
+            receipt.update(baseline_id=baseline_id, baseline_comparison_note=request.get("baseline_comparison_note"),
+                           sources={path: sources.get(path) for path in paths})
         current["slices"][slice_id].setdefault("visual_captures", {})[case["capture_id"]] = receipt
         project_state.atomic_json(directory / "manifest.json", current)
     return case
@@ -311,6 +323,9 @@ def capture_case(directory, slice_id, request):
 
 def browser_case(directory, slice_id, state, request, render, observed_state, case_id, build, checks, locked_criteria):
     """Capture a selected application state and return its browser receipt."""
+    tokens = render.get("design_tokens", [])
+    if not _ids(tokens) or any(not token.startswith("--") for token in tokens):
+        raise VisualIntegrityError("Design tokens must be distinct CSS custom properties")
     state.check_browser_setup(render.get("setup", []))
     if "command" in render:
         state.argv(render["command"])
@@ -356,6 +371,8 @@ def browser_case(directory, slice_id, state, request, render, observed_state, ca
         if "browserState" in measured:
             case["browser_evidence"] = {
                 "state": measured["browserState"], "geometry": measured.get("geometry"),
+                "structure": measured.get("structure"), "design_tokens": measured.get("designTokens"),
+                "browser_version": measured.get("browserVersion"),
                 "setup": render.get("setup", []), "measurements": actual,
                 "checks": checks, "identities": measured.get("identities", {}),
                 "blueprint_measurements": blueprint_measurements,

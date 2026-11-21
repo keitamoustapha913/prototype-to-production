@@ -553,6 +553,7 @@ document.getElementById('observation').textContent = JSON.stringify({
             # Reproduce a blueprint manifest written before conversational review existed.
             manifest = self.manifest()
             manifest.pop('slice_review_required', None)
+            manifest.pop('visual_baselines_required', None)
             manifest['schema_version'] = 4
             (self.directory / 'manifest.json').write_text(json.dumps(manifest))
 
@@ -610,6 +611,22 @@ document.getElementById('observation').textContent = JSON.stringify({
             if not registered.intersection(evidence):
                 for state in feature['states']:
                     evidence.append(self.fixture_browser_capture(feature, state))
+        if self.manifest().get('visual_baselines_required'):
+            features = [feature for feature in value.get('features', [])
+                        if feature.get('surface', value['surface']) in {'ui', 'fullstack'}]
+            if features:
+                feature = features[0]
+                baseline_id = 'fixture-original-' + value['audit_id']
+                route = feature['route']
+                gap = {'baseline_id': baseline_id, 'baseline_feature_ids': [feature['feature_id']],
+                       'reason': 'Exercise workflow with a fixture evidence gap', 'essential': False,
+                       'unavailable_reason': 'The full visual fixture is outside the scope of this test',
+                       'source_paths': [anchor['path'] for anchor in feature['source_anchors']],
+                       'state': {'route': route, 'theme': 'light', 'data': 'fixture', 'interaction': 'default',
+                                 'active_control': None, 'open_menus': []},
+                       'renderCase': {'route': route, 'viewport': FIXTURE_VIEWPORT, 'ready_selector': '#fixture'}}
+                self.cli('visual-baseline', '--action', 'gap', '--input-file', self.payload(baseline_id, gap))
+                value['visual_baseline_ids'] = [baseline_id]
         self.cli('discovery-record','--audit-file',self.payload('audit',value))
         return value
 

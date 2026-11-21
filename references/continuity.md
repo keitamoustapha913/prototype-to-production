@@ -10,6 +10,8 @@ For blueprint work, persist each exact material question/proposal, options, trad
 
 During slice review, preserve the current ID and revision, open A+ question, completed review IDs, impacted dependents, next action, and paths. Use `slice-review-record` alongside `work-update` with phase `slice_review`. For an open question, record the A+ exchange and attach its ID to the open slice. On return, run `validate` and read `resume --format json` for the original wording and recorded answer. Continue from the saved slice. Use the [review workflow](slice-review-workflow.md) for amendments, interrupted transactions and exact package transfer.
 
+For UI implementation, read the slice's `visual_baselines` and `cross_screen_changes` in the resume packet. They point to preserved images, approved references, capture conditions and outstanding gaps. Follow [Visual Baseline Capture](visual-baseline.md) before editing affected UI.
+
 Use immutable versioned plan, blueprint and coverage records; approval hashes protect those files plus their baseline and recorded decisions. A new version cannot silently rewrite an old approval. Missing-feature recovery requires a fresh audit, coverage and explicit reapproval in the initiative's own mode.
 
 ## Git ignore and portability

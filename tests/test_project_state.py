@@ -74,8 +74,16 @@ class ProjectStateTests(unittest.TestCase):
         }
         return self.cli("work-update", "--work-file", self.write_input("work.json", payload))
 
-    def init(self):
-        self.cli("init", "--scope", "page", "--next-action", "Map billing states")
+    def init(self, *, legacy=True, scope="page"):
+        self.cli("init", "--scope", scope, "--next-action", "Map billing states")
+        if legacy:
+            # Compatibility fixtures predate the visual baseline requirement.
+            if not self.initiative.exists():
+                self.initiative = self.root / ".artifacts/prototype-to-production/billing-refresh"
+            path = self.initiative / "manifest.json"
+            manifest = self.manifest()
+            manifest.pop("visual_baselines_required", None)
+            path.write_text(json.dumps(manifest), encoding="utf-8")
 
     def write_input(self, name, data):
         path = self.root / name
@@ -742,6 +750,25 @@ class ProjectStateTests(unittest.TestCase):
         self.assertEqual(blocked.returncode, 2)
         self.assertIn("zero new", blocked.stderr.lower())
 
+    def test_new_ui_discovery_requires_a_preserved_original_or_an_explicit_gap(self):
+        self.init(legacy=False)
+        audit = self.discovery_audit()
+        rejected = self.cli("discovery-record", "--audit-file", self.write_input("audit.json", audit), success=False)
+        self.assertIn("Record the selected original visual baseline IDs", rejected.stderr)
+        route = "/invoices"
+        gap = {"baseline_id": "invoices-original", "baseline_feature_ids": ["invoice-search"],
+               "source_paths": ["src/invoices.ts"], "reason": "Invoice search default",
+               "essential": True, "unavailable_reason": "The original data fixture is unavailable",
+               "state": {"route": route, "theme": "light", "data": "invoice fixture",
+                         "interaction": "default", "active_control": None, "open_menus": []},
+               "renderCase": {"route": route, "viewport": {"width": 390, "height": 844},
+                              "ready_selector": "#invoices"}}
+        self.cli("visual-baseline", "--action", "gap", "--input-file", self.write_input("gap.json", gap))
+        audit["visual_baseline_ids"] = ["invoices-original"]
+        self.discovery_record(audit)
+        self.assertEqual(self.manifest()["active_discovery_id"], "audit-v1")
+        self.assertIn("visual_baseline_build", self.manifest()["discovery_audits"]["audit-v1"])
+
     def test_discovery_record_is_durable_and_hash_protected(self):
         self.init()
         self.discovery_record(self.discovery_audit())
@@ -1051,7 +1078,7 @@ class ProjectStateTests(unittest.TestCase):
         self.assertEqual(self.manifest()["slices"]["invoice-list"]["owner"], "agent-1")
 
     def test_whole_app_redesign_allows_narrower_page_or_feature_slices(self):
-        self.cli("init", "--scope", "app")
+        self.init(scope="app")
         approval = self.approval()
         approval["scope"] = "app"
         self.approve(approval)
