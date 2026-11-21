@@ -1388,7 +1388,7 @@ def initialize(directory: Path, scope: str, next_action: str | None, mode: str |
             "next_action": next_action or template["next_action"],
         })
         if template["initiative_mode"] == "blueprint":
-            template.update(schema_version=5, slice_review_required=True)
+            template.update(schema_version=5, slice_review_required=True, plan_review_required=True)
         if guided_design_review:
             template["guided_design_review"] = True
         template["provenance"]["created_at"] = utc_now()
@@ -3028,7 +3028,7 @@ def build_resume_packet(directory: Path, project_root: Path, *, delivery_slice: 
     conversation, pending_questions = [], []
     active_question_answer = None
     question_source_errors = []
-    conversation_usage, coverage_with_slices = {}, []
+    conversation_usage, coverage_with_slices, plan_review = {}, [], None
     if initiative_mode(manifest) == "blueprint" or manifest.get("initial_alignment_required") or manifest.get("conversation"):
         state = blueprint_state(directory, manifest)
         try:
@@ -3045,6 +3045,7 @@ def build_resume_packet(directory: Path, project_root: Path, *, delivery_slice: 
         if initiative_mode(manifest) == "blueprint":
             try:
                 conversation_usage, coverage_with_slices = state.traceability()
+                plan_review = state.plan_review_progress(conversation)
             except (StateError, OSError, ValueError, KeyError, TypeError) as error:
                 errors.append(f"Traceability recovery is blocked: {error}")
     errors.extend(question_source_errors)
@@ -3063,6 +3064,17 @@ def build_resume_packet(directory: Path, project_root: Path, *, delivery_slice: 
         next_action = "Use the recorded answer and update the saved work cursor."
     elif pending_guided_review and (not work or work.get("status") == "in_progress"):
         next_action = f"Wait for the user's reply on {pending_guided_review['review_target']}."
+    elif (plan_review and manifest["stage"] in {"plan", "blueprint"} and not work
+          and plan_review["baseline_id"] == manifest.get("active_discovery_id")):
+        if plan_review["revision_required"]:
+            next_action = "Present a revised implementation plan and review its workstreams."
+        elif not plan_review["authorization_id"]:
+            if not plan_review["overview_confirmed"]:
+                next_action = "Present the proposed implementation plan overview."
+            elif current_workstream := plan_review["current_workstream"]:
+                next_action = f"Present implementation-plan workstream {current_workstream}."
+            else:
+                next_action = "Verify the complete plan and ask for “Continue to blueprint”."
     delivery = {key: item.get("status") for key, item in manifest.get("slices", {}).items()
                 if not item.get("superseded_by")}
     delivery_handoff = None
@@ -3158,6 +3170,7 @@ def build_resume_packet(directory: Path, project_root: Path, *, delivery_slice: 
         "active_work": work,
         "conversation": conversation,
         "pending_questions": pending_questions,
+        "plan_review": plan_review,
         "slice_review": review,
         "active_question_answer": active_question_answer,
         "conversation_usage": conversation_usage,
@@ -3228,6 +3241,9 @@ def print_resume(directory: Path, project_root: Path, *, delivery_slice: str | N
     if packet["active_work"]:
         status = "answer recorded" if answer else packet["active_work"]["status"]
         print(f"RESUME TASK: {packet['active_work']['task_id']} ({status})")
+        print(f"NEXT: {packet['next_action']}")
+    elif (packet["plan_review"] and not packet["plan_review"]["authorization_id"]
+          and packet["phase"] in {"plan", "blueprint"}):
         print(f"NEXT: {packet['next_action']}")
     if answer:
         if answer.get("record_type") == "review_checkpoint":

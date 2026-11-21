@@ -11,9 +11,9 @@ The checkpoints below apply to blueprint initiatives. Use `init --guided-design-
 Complete the separate [Initial Understanding and Alignment Checkpoint](initial-alignment.md#initial-understanding-and-alignment-checkpoint) first. Discovery and roadmap review follow the confirmed initial understanding.
 
 - **Discovery.** Show the audit that follows the confirmed understanding. Focus on the evidence for the observed baseline, what the proposed scope preserves and any remaining discovery decisions. Give the user a turn to correct the audit before freezing it. Revisit initial alignment if those corrections change the agreed understanding of the request.
-- **Roadmap.** Present each proposed workstream by name, its purpose and boundary, dependencies, the order of work and the reason for that order. A short flow such as `Discovery audit -> API contract -> UI integration` can carry the structure. Invite feedback before freezing the roadmap with `plan-record`. Apply corrections and summarize the resulting scope. Save a draft while discussion is open.
+- **Implementation plan.** Follow [Complete Conversational Implementation-Plan Review](implementation-plan-review.md) from the roadmap overview through every workstream and the final plan verification. Draft the blueprint after the user explicitly says **Continue to blueprint**.
 
-Use the recorded decisions to revise the affected specifications. A brief confirmation can close a discovery or roadmap checkpoint. The separate explicit navigation rule below applies to blueprint workstreams.
+Use the recorded decisions to revise the affected specifications. A brief confirmation can close a discovery or roadmap overview checkpoint. Plan and blueprint workstream reviews each have their own explicit navigation rules.
 
 ## Blueprint walkthrough
 

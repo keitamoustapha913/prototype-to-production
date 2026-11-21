@@ -1,7 +1,7 @@
 interface:
   display_name: "Prototype to Production"
   short_description: "Approve precise blueprints and resume faithful implementation"
-  default_prompt: "Use $prototype-to-production to investigate this task and the repository, discuss what you found, and wait for me to confirm your understanding before planning. Resume existing saved work from its recorded checkpoint."
+  default_prompt: "Use $prototype-to-production to investigate this task and the repository. Wait for me to confirm your understanding, review the plan with me one workstream at a time, and wait for me to say Continue to blueprint. Resume existing saved work from its recorded checkpoint."
   icon_small: "assets/icon.svg"
   icon_large: "assets/icon.svg"
 policy:

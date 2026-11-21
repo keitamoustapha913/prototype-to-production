@@ -17,7 +17,7 @@ class SliceAssignmentRemediationTests(unittest.TestCase):
         fixture.start(review=True)
         fixture.exchange()
         fixture.record_baseline(fixture.baseline('ui'))
-        fixture.cli('plan-record', '--plan-file', fixture.payload('plan', fixture.plan()))
+        fixture.record_reviewed_plan(fixture.plan())
         blueprint = fixture.blueprint(surface='ui')
         feature = blueprint['features'][0]
         feature['implementation_paths'] += ['src/adapter.py']

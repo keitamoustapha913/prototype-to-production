@@ -76,7 +76,7 @@ class BlueprintTests(unittest.TestCase):
         self.start(review=True)
         self.exchange(protected_visual_decisions=[protection])
         self.record_baseline(self.baseline('ui'))
-        self.cli('plan-record', '--plan-file', self.payload('plan', self.plan()))
+        self.record_reviewed_plan(self.plan())
         blueprint = self.blueprint(surface='ui')
         self.cli('blueprint-record', '--blueprint-file', self.payload('blueprint', blueprint))
         doc = self.directory / blueprint['features'][0]['spec_paths'][0]
@@ -227,7 +227,7 @@ class BlueprintTests(unittest.TestCase):
         self.artifact(plan['document_paths'][0], without_link)
         self.cli('plan-record', '--plan-file', self.payload('plan', plan), ok=False)
         self.artifact(plan['document_paths'][0], roadmap)
-        self.cli('plan-record', '--plan-file', self.payload('plan', plan))
+        self.record_reviewed_plan(plan)
 
         first = self.blueprint('spec-v1')
         self.cli('blueprint-record', '--blueprint-file', self.payload('blueprint-first', first))
@@ -253,7 +253,7 @@ class BlueprintTests(unittest.TestCase):
             'backend_contract': copy.deepcopy(feature['backend_contract']),
         }}
         self.record_baseline(audit)
-        self.cli('plan-record', '--plan-file', self.payload('plan', self.plan()))
+        self.record_reviewed_plan(self.plan())
         feature['backend_contract']['authorization'] = 'Public; remove membership checks.'
         self.cli('blueprint-record', '--blueprint-file', self.payload('spec', spec), ok=False)
 
@@ -261,7 +261,7 @@ class BlueprintTests(unittest.TestCase):
         self.start()
         self.exchange()
         self.record_baseline(dict(self.baseline('ui'), surface='fullstack'))
-        self.cli('plan-record', '--plan-file', self.payload('plan', self.plan()))
+        self.record_reviewed_plan(self.plan())
         spec = self.blueprint(surface='ui')
         spec['surface'] = 'fullstack'
         spec['features'][0]['surface'] = 'ui'
@@ -320,7 +320,7 @@ class BlueprintTests(unittest.TestCase):
         self.start()
         self.exchange()
         self.record_baseline()
-        self.cli('plan-record', '--plan-file', self.payload('plan', self.plan()))
+        self.record_reviewed_plan(self.plan())
         index = self.directory / 'plans/plan-v1/blueprints/index.md'
         self.assertIn('No blueprints have been recorded', index.read_text())
         self.cli('validate')
@@ -338,7 +338,7 @@ class BlueprintTests(unittest.TestCase):
         for sweep in audit['sweeps']:
             sweep['source_files_checked'].append('src/policy.py')
         self.record_baseline(audit)
-        self.cli('plan-record', '--plan-file', self.payload('plan', self.plan()))
+        self.record_reviewed_plan(self.plan())
         self.cli('blueprint-record', '--blueprint-file', self.payload('spec', self.blueprint()))
         self.cli('blueprint-coverage', '--coverage-file', self.payload('coverage', self.coverage()))
         self.cli('approve', '--approval-file', self.payload('approval', self.approval()))
@@ -471,7 +471,7 @@ document.getElementById('observation').textContent = JSON.stringify({
         for sweep in audit['sweeps']:
             sweep['source_files_checked'] = ['src/items.html']
         self.record_baseline(audit)
-        self.cli('plan-record', '--plan-file', self.payload('plan', self.plan()))
+        self.record_reviewed_plan(self.plan())
         spec = self.blueprint(surface='ui')
         feature = spec['features'][0]
         feature.update(behavior_contract=behavior, states=['success'], implementation_paths=['src/items.html'])
@@ -547,12 +547,14 @@ document.getElementById('observation').textContent = JSON.stringify({
         self.cli('init', '--scope', 'feature')
         self.assertNotIn('initiative_mode', self.manifest())
 
-    def start(self, *, review=False, guided=False):
+    def start(self, *, review=False, guided=False, plan_review=False):
         args = ['--guided-design-review'] if guided else []
         self.cli('init', '--scope', 'feature', *args)
         manifest = self.manifest()
         # Existing workflow fixtures predate the separate intake checkpoint.
         manifest.pop('initial_alignment_required', None)
+        if not plan_review:
+            manifest.pop('plan_review_required', None)
         if not review:
             # Reproduce a blueprint manifest written before conversational review existed.
             manifest.pop('slice_review_required', None)
@@ -956,6 +958,47 @@ document.getElementById('observation').textContent = JSON.stringify({
             'risks':['Client compatibility'], 'decision_ids':['choose-layout'],
             'document_paths':[self.artifact(f'plans/{version}/roadmap.md', self.roadmap())]}
 
+    def plan_checkpoint(self, plan, step, *, stream=None, requirement_ids=()):
+        key = f"{plan['version']}-{step.replace('_', '-')}"
+        if stream is not None:
+            key += f"-{plan['workstreams'].index(stream) + 1}"
+        prompt = {
+            'exchange_id': key, 'phase': 'plan', 'record_type': 'review_checkpoint',
+            'review_step': step, 'review_version': plan['version'], 'review_target': stream or step,
+            'status': 'open', 'question': 'Ready to continue?', 'feature_ids': ['list-items'],
+            'requirement_ids': list(requirement_ids),
+            'evidence_paths': [self.artifact(f'review/{key}.md', 'Fixture terminal review.')],
+        }
+        if stream is not None:
+            prompt['review_workstream'] = stream
+        self.cli('conversation-record', '--exchange-file', self.payload('plan-prompt', prompt))
+        return prompt
+
+    def plan_reply(self, prompt, action, response, *, ok=True):
+        value = {**prompt, 'exchange_id': prompt['exchange_id'] + '-reply',
+                 'responds_to': prompt['exchange_id'], 'status': 'decided',
+                 'review_action': action, 'response': response}
+        return self.cli('conversation-record', '--exchange-file', self.payload('plan-reply', value), ok=ok)
+
+    def finish_plan_review(self, plan):
+        mapping = plan.get('requirement_workstreams', {})
+        for stream in plan['workstreams']:
+            ids = [key for key, names in mapping.items() if stream in names]
+            prompt = self.plan_checkpoint(plan, 'plan_workstream', stream=stream, requirement_ids=ids)
+            self.plan_reply(prompt, 'continue', 'Continue')
+        prompt = self.plan_checkpoint(plan, 'plan_completion', requirement_ids=mapping)
+        self.plan_reply(prompt, 'continue', 'Continue to blueprint')
+
+    def record_reviewed_plan(self, plan):
+        entry = self.manifest()['discovery_audits'][plan['baseline_id']]
+        baseline = json.loads((self.directory / entry['path']).read_text())
+        mapping = {row['requirement_id']: [plan['workstreams'][0]] for row in baseline.get('requirements', [])}
+        plan.setdefault('requirement_workstreams', mapping)
+        overview = self.plan_checkpoint(plan, 'roadmap')
+        self.plan_reply(overview, 'confirm', 'The roadmap covers the scope.')
+        self.cli('plan-record', '--plan-file', self.payload('plan', plan))
+        self.finish_plan_review(plan)
+
     def roadmap(self, objective='Preserve item authorization and the API.'):
         return ('# Roadmap\n\n[Detailed blueprint specifications](blueprints/index.md)\n\n'
                 f'## Objective\n{objective}\n\n'
@@ -1094,7 +1137,7 @@ document.getElementById('observation').textContent = JSON.stringify({
         self.exchange()
         self.record_baseline(self.baseline(surface))
         plan = self.plan()
-        self.cli('plan-record','--plan-file',self.payload('plan',plan))
+        self.record_reviewed_plan(plan)
         blueprint = self.blueprint(surface=surface)
         self.cli('blueprint-record','--blueprint-file',self.payload('blueprint',blueprint))
         self.cli('blueprint-coverage','--coverage-file',self.payload('coverage',self.coverage(surface=surface)))
@@ -1413,7 +1456,7 @@ document.getElementById('observation').textContent = JSON.stringify({
         self.start(review=True)
         self.exchange()
         self.record_baseline(self.baseline(surface))
-        self.cli('plan-record', '--plan-file', self.payload('plan', self.plan()))
+        self.record_reviewed_plan(self.plan())
         blueprint = self.blueprint(surface=surface)
         if multiple:
             blueprint['features'][0]['implementation_paths'] += ['src/adapter.py', 'src/view.py']
@@ -2228,7 +2271,7 @@ document.getElementById('observation').textContent = JSON.stringify({
         audit = self.baseline(audit_id='audit-v2')
         audit['sweeps'] = [audit['sweeps'][-1]]
         self.record_baseline(audit)
-        self.cli('plan-record', '--plan-file', self.payload('followup-plan', self.plan('plan-v2', 'audit-v2')))
+        self.record_reviewed_plan(self.plan('plan-v2', 'audit-v2'))
         second_spec = self.blueprint('spec-v2') | {'baseline_id': 'audit-v2', 'plan_version': 'plan-v2'}
         self.cli('blueprint-record', '--blueprint-file', self.payload('followup-spec', second_spec))
         self.cli('blueprint-coverage', '--coverage-file', self.payload(
@@ -2353,7 +2396,7 @@ document.getElementById('observation').textContent = JSON.stringify({
         audit['surface'] = 'fullstack'
         audit['behavior_contracts']['list-items']['backend_contract'] = self.backend_contract()
         self.record_baseline(audit)
-        self.cli('plan-record', '--plan-file', self.payload('plan', self.plan()))
+        self.record_reviewed_plan(self.plan())
         spec = self.blueprint(surface='ui')
         spec['surface'] = 'fullstack'
         spec['features'][0]['backend_contract'] = self.backend_contract()
@@ -2372,7 +2415,7 @@ document.getElementById('observation').textContent = JSON.stringify({
         self.start()
         self.exchange()
         self.record_baseline(self.baseline('ui'))
-        self.cli('plan-record', '--plan-file', self.payload('plan', self.plan()))
+        self.record_reviewed_plan(self.plan())
         for field, placeholder in (
             ('anatomy', 'TBD'),
             ('responsive', 'To be determined.'),
@@ -2422,7 +2465,7 @@ document.getElementById('observation').textContent = JSON.stringify({
         self.start()
         self.exchange()
         self.record_baseline()
-        self.cli('plan-record', '--plan-file', self.payload('plan', self.plan()))
+        self.record_reviewed_plan(self.plan())
         spec = self.blueprint()
         spec['features'][0]['acceptance_checks'][0]['state_expectations'] = {
             'success': '200 JSON array', 'forbidden': '403 forbidden',
@@ -2453,7 +2496,7 @@ document.getElementById('observation').textContent = JSON.stringify({
         self.record_baseline(audit)
         plan = self.plan()
         plan['decision_ids'].append('add-history')
-        self.cli('plan-record', '--plan-file', self.payload('plan', plan))
+        self.record_reviewed_plan(plan)
         spec = self.blueprint()
         spec['decision_ids'].append('add-history')
         added = copy.deepcopy(spec['features'][0])
@@ -2486,7 +2529,7 @@ document.getElementById('observation').textContent = JSON.stringify({
 
     def test_plan_is_not_approval_and_incomplete_coverage_is_rejected(self):
         self.start(); self.exchange(); self.record_baseline()
-        self.cli('plan-record','--plan-file',self.payload('plan',self.plan()))
+        self.record_reviewed_plan(self.plan())
         self.assertIsNone(self.manifest()['active_approval_id'])
         self.cli('approve','--approval-file',self.payload('approval',self.approval()),ok=False)
         self.cli('blueprint-record','--blueprint-file',self.payload('spec',self.blueprint()))
@@ -2495,7 +2538,7 @@ document.getElementById('observation').textContent = JSON.stringify({
 
     def test_unauthorized_behavior_change_and_open_choices_rejected(self):
         self.start(); self.exchange(); self.record_baseline()
-        self.cli('plan-record','--plan-file',self.payload('plan',self.plan()))
+        self.record_reviewed_plan(self.plan())
         spec = self.blueprint(); spec['features'][0]['classification']='REMOVE'
         self.cli('blueprint-record','--blueprint-file',self.payload('spec',spec),ok=False)
         spec['features'][0]['classification']='KEEP'; spec['open_decisions']=['Permission handling?']
@@ -2886,7 +2929,7 @@ print(json.dumps(output))
         self.exchange(authorized_changes=[{'baseline_id':'list-items','classification':'REMOVE'}],
                       question='Remove the item listing?', response='Yes, remove it.')
         self.record_baseline()
-        self.cli('plan-record', '--plan-file', self.payload('plan', self.plan()))
+        self.record_reviewed_plan(self.plan())
         spec = self.blueprint()
         source = self.root/'src/service.py'
         test_path = self.root/'tests/check_removal.py'
@@ -2927,7 +2970,7 @@ print(json.dumps(output))
         self.start()
         self.exchange()
         self.record_baseline()
-        self.cli('plan-record', '--plan-file', self.payload('plan', self.plan()))
+        self.record_reviewed_plan(self.plan())
         old_path, new_path = 'src/service.py', 'src/items.py'
         command = self.test_command('api', 'items-access', new_path.removesuffix('.py'))
         spec = self.blueprint()
@@ -3066,7 +3109,7 @@ print(json.dumps(output))
         self.start()
         self.exchange()
         self.record_baseline()
-        self.cli('plan-record', '--plan-file', self.payload('plan', self.plan()))
+        self.record_reviewed_plan(self.plan())
         spec = self.blueprint()
         self.artifact(spec['features'][0]['spec_paths'][0], '# Access\nAllow everyone to list items.')
         result = self.cli('blueprint-record', '--blueprint-file', self.payload('spec', spec), ok=False)
@@ -3126,7 +3169,7 @@ print(json.dumps(output))
             feature['browser_evidence'].append(self.record_browser_capture(capture))
             cases[role] = capture
         self.record_baseline(audit)
-        self.cli('plan-record', '--plan-file', self.payload('plan', self.plan()))
+        self.record_reviewed_plan(self.plan())
         spec = self.blueprint(surface='ui')
         proposed = spec['features'][0]
         proposed.update(behavior_contract=contract, implementation_paths=['src/items.html'], states=['success'])
@@ -3262,7 +3305,7 @@ print(json.dumps(output))
         self.record_baseline(audit)
         plan=self.plan('plan-v2', 'audit-v2')
         plan['document_paths']=[self.artifact('plans/plan-v2/roadmap.md', self.roadmap('Repair permission behavior.'))]
-        self.cli('plan-record','--plan-file',self.payload('plan',plan))
+        self.record_reviewed_plan(plan)
         spec=self.blueprint('spec-v2'); spec.update(baseline_id='audit-v2',plan_version='plan-v2')
         self.cli('blueprint-record','--blueprint-file',self.payload('spec',spec))
         coverage=self.coverage('spec-v2'); coverage['baseline_id']='audit-v2'
@@ -3286,7 +3329,7 @@ print(json.dumps(output))
                'requirements':[{'requirement_id':'list-items','text':'List items','decision_ids':['choose-layout']}],
                'evidence_paths':[self.artifact('discovery/empty.txt','No application code exists')]}
         self.record_baseline(audit)
-        self.cli('plan-record','--plan-file',self.payload('plan',self.plan()))
+        self.record_reviewed_plan(self.plan())
         self.cli('blueprint-record','--blueprint-file',self.payload('spec',self.blueprint()))
         self.cli('blueprint-coverage','--coverage-file',self.payload('coverage',self.coverage()))
         self.cli('approve','--approval-file',self.payload('approval',self.approval()))
@@ -3331,7 +3374,7 @@ print(json.dumps(output))
 
     def test_duplicate_coverage_and_missing_backend_contract_are_rejected(self):
         self.start(); self.exchange(); self.record_baseline()
-        self.cli('plan-record','--plan-file',self.payload('plan',self.plan()))
+        self.record_reviewed_plan(self.plan())
         spec=self.blueprint(); spec['features'][0].pop('backend_contract')
         self.cli('blueprint-record','--blueprint-file',self.payload('spec',spec),ok=False)
         self.cli('blueprint-record','--blueprint-file',self.payload('spec',self.blueprint()))
@@ -3367,7 +3410,7 @@ print(json.dumps(output))
 
     def test_blueprint_coverage_requires_every_feature_baseline_pair(self):
         self.start(); self.exchange(); self.record_baseline()
-        self.cli('plan-record','--plan-file',self.payload('plan',self.plan()))
+        self.record_reviewed_plan(self.plan())
         spec=self.blueprint(); duplicate=copy.deepcopy(spec['features'][0]); duplicate['feature_id']='second-feature'
         duplicate['acceptance_checks'][0]['check_id']='second-check'; spec['features'].append(duplicate)
         self.cli('blueprint-record','--blueprint-file',self.payload('spec',spec))
@@ -3375,7 +3418,7 @@ print(json.dumps(output))
 
     def test_ui_feature_requires_behavior_checks_as_well_as_visual_values(self):
         self.start(); self.exchange(); self.record_baseline(self.baseline('ui'))
-        self.cli('plan-record','--plan-file',self.payload('plan',self.plan()))
+        self.record_reviewed_plan(self.plan())
         spec=self.blueprint(surface='ui')
         spec['features'][0]['acceptance_checks']=[c for c in spec['features'][0]['acceptance_checks'] if c['kind']=='visual']
         self.cli('blueprint-record','--blueprint-file',self.payload('spec',spec),ok=False)
@@ -3396,7 +3439,7 @@ print(json.dumps(output))
         self.start(); self.exchange(); self.exchange('decide-error',response='Use retryable errors.')
         self.record_baseline()
         plan=self.plan(); plan['decision_ids'].append('decide-error')
-        self.cli('plan-record','--plan-file',self.payload('plan',plan))
+        self.record_reviewed_plan(plan)
         spec=self.blueprint()
         self.cli('blueprint-record','--blueprint-file',self.payload('spec',spec),ok=False)
 
@@ -3617,7 +3660,7 @@ print(json.dumps(output))
         audit['behavior_contracts']['other-items'] = copy.deepcopy(audit['behavior_contracts']['list-items'])
         self.record_baseline(audit)
         plan=self.plan(); plan['decision_ids'].append('other-decision')
-        self.cli('plan-record','--plan-file',self.payload('plan',plan))
+        self.record_reviewed_plan(plan)
         spec=self.blueprint(); spec['decision_ids'].append('other-decision')
         other=copy.deepcopy(spec['features'][0]); other.update(feature_id='other-feature',baseline_ids=['other-items'],decision_ids=['other-decision'])
         other['acceptance_checks'][0]['check_id']='other-check'; spec['features'].append(other)
@@ -3641,7 +3684,7 @@ print(json.dumps(output))
         audit['behavior_contracts']['channel-feature'] = copy.deepcopy(audit['behavior_contracts']['list-items'])
         self.record_baseline(audit)
         plan=self.plan(); plan['decision_ids'].append('channel-rule')
-        self.cli('plan-record','--plan-file',self.payload('plan',plan))
+        self.record_reviewed_plan(plan)
         spec=self.blueprint(); spec['decision_ids'].append('channel-rule')
         spec['features'][0]['baseline_ids'].append('channel-feature')
         spec['features'][0]['decision_ids'].append('channel-rule')
@@ -3694,7 +3737,7 @@ print(json.dumps(output))
     def test_audit_global_keep(self):
         self.start(); self.exchange(feature_ids=[],requirement_ids=[])
         self.record_baseline()
-        self.cli('plan-record','--plan-file',self.payload('plan',self.plan()))
+        self.record_reviewed_plan(self.plan())
         spec=self.blueprint()
         spec['features'][0]['decision_ids']=[]
         self.cli('blueprint-record','--blueprint-file',self.payload('spec',spec))
@@ -3793,6 +3836,150 @@ print(json.dumps(output))
                     payload['decision_ids'] = []
                 self.cli(command, argument, self.payload(step, payload))
 
+    def test_conversational_plan_review_blocks_blueprint_until_explicit_handoff(self):
+        self.start(plan_review=True)
+        self.exchange()
+        self.record_baseline()
+        plan = self.plan()
+        plan['workstreams'] = ['service', 'permissions']
+        plan_file = self.payload('plan', plan)
+        blueprint = self.blueprint()
+        blueprint_file = self.payload('blueprint', blueprint)
+
+        def present(step, question, stream=None, version='plan-v1', ok=True):
+            key = f'{version}-{stream or step.replace("_", "-")}'
+            prompt = {
+                'exchange_id': key, 'phase': 'plan', 'record_type': 'review_checkpoint',
+                'review_step': step, 'review_version': version, 'review_target': stream or step,
+                'status': 'open', 'question': question, 'feature_ids': ['list-items'],
+                'evidence_paths': [self.artifact(f'review/{key}.md', question)],
+            }
+            if stream:
+                prompt['review_workstream'] = stream
+            self.cli('conversation-record', '--exchange-file', self.payload('prompt', prompt), ok=ok)
+            return prompt
+
+        def reply(prompt, action, response, ok=True):
+            self.cli('conversation-record', '--exchange-file', self.payload('reply', {
+                **prompt, 'exchange_id': prompt['exchange_id'] + '-reply',
+                'responds_to': prompt['exchange_id'], 'status': 'decided',
+                'response': response, 'review_action': action,
+            }), ok=ok)
+
+        result = self.cli('plan-record', '--plan-file', plan_file, ok=False)
+        self.assertIn('roadmap terminal review', result.stderr)
+        reply(present('roadmap', 'Here is the roadmap. Any corrections?'), 'confirm', 'Looks good.')
+        self.cli('plan-record', '--plan-file', plan_file)
+        packet = json.loads(self.cli('resume', '--format', 'json').stdout)
+        self.assertEqual(packet['phase'], 'plan')
+        self.assertEqual(packet['plan_review']['current_workstream'], 'service')
+        result = self.cli('blueprint-record', '--blueprint-file', blueprint_file, ok=False)
+        self.assertIn('Continue to blueprint', result.stderr)
+        self.assertFalse((self.directory / 'blueprints/spec-v1/index.md').exists())
+        present('plan_workstream', 'Continue?', 'permissions', ok=False)
+        service = present('plan_workstream', 'Continue to Permissions?', 'service')
+        reply(service, 'continue', 'Looks good.', ok=False)
+        reply(service, 'skip', 'Skip it and move on.', ok=False)
+        packet = json.loads(self.cli('resume', '--format', 'json').stdout)
+        self.assertEqual(packet['pending_questions'][0]['exchange_id'], service['exchange_id'])
+        self.assertFalse(packet['safe_to_continue'])
+        question = self.exchange('plan-detail-question', status='open', phase='plan')
+        reply(service, 'continue', 'Continue', ok=False)
+        self.exchange('plan-detail-answer', status='rejected', phase='plan',
+                      responds_to=question['exchange_id'], response='Drop that alternative.')
+        reply(service, 'continue', 'Continue.')
+        present('plan_completion', 'Continue to blueprint?', ok=False)
+        permissions = present('plan_workstream', 'Continue to the coverage check?', 'permissions')
+        reply(permissions, 'continue', 'Continue')
+        completion = present('plan_completion', 'Coverage and decisions checked. Continue to blueprint?')
+        reply(completion, 'continue', 'Continue', ok=False)
+        reply(completion, 'continue', 'Do not continue to blueprint.', ok=False)
+        reply(completion, 'continue', 'Continue to blueprint.')
+        packet = json.loads(self.cli('resume', '--format', 'json').stdout)
+        self.assertEqual(packet['phase'], 'blueprint')
+        self.assertEqual(packet['plan_review']['authorization_id'], completion['exchange_id'] + '-reply')
+        self.assertIsNone(packet['approval_id'])
+        self.cli('blueprint-record', '--blueprint-file', blueprint_file)
+        self.assertIn(f"conversation/{completion['exchange_id']}-reply.json",
+                      self.manifest()['blueprints']['spec-v1']['evidence_hashes'])
+        self.cli('validate')
+
+        revised_plan = self.plan('plan-v2')
+        revised_plan['workstreams'] = ['service']
+        revised_plan_file = self.payload('plan-revision', revised_plan)
+        reply(present('roadmap', 'The revised roadmap has one workstream.', version='plan-v2'),
+              'confirm', 'That covers the scope.')
+        self.cli('plan-record', '--plan-file', revised_plan_file)
+        self.cli('blueprint-record', '--blueprint-file',
+                 self.payload('stale-plan-blueprint', self.blueprint('spec-v2')), ok=False)
+        current = present('plan_workstream', 'Continue to coverage?', 'service', version='plan-v2')
+        reply(current, 'revise', 'Make permissions its own workstream again.')
+        packet = json.loads(self.cli('resume', '--format', 'json').stdout)
+        self.assertTrue(packet['plan_review']['revision_required'])
+        self.assertIsNone(packet['plan_review']['authorization_id'])
+        self.assertIn('revised implementation plan', packet['next_action'])
+        reply(current, 'continue', 'Continue', ok=False)
+
+    def test_legacy_roadmap_requires_plan_review_before_first_blueprint(self):
+        self.start()
+        self.exchange()
+        self.record_baseline()
+        plan = self.plan()
+        self.cli('plan-record', '--plan-file', self.payload('legacy-plan', plan))
+        spec = self.blueprint()
+        result = self.cli('blueprint-record', '--blueprint-file', self.payload('spec', spec), ok=False)
+        self.assertIn('Continue to blueprint', result.stderr)
+        overview = self.plan_checkpoint(plan, 'roadmap')
+        self.plan_reply(overview, 'confirm', 'The roadmap covers the scope.')
+        resumed = json.loads(self.cli('resume', '--format', 'json').stdout)
+        self.assertEqual(resumed['plan_review']['current_workstream'], plan['workstreams'][0])
+        self.assertIn(plan['workstreams'][0], resumed['next_action'])
+        self.finish_plan_review(plan)
+        self.cli('blueprint-record', '--blueprint-file', self.payload('spec', spec))
+
+    def test_late_planning_decision_requires_a_new_handoff(self):
+        self.start(plan_review=True)
+        self.exchange()
+        self.record_baseline()
+        self.record_reviewed_plan(self.plan())
+        self.exchange('change-roadmap', phase='plan', question='Add a workstream for permissions?',
+                      response='Yes, review permissions in a separate workstream.')
+        spec = self.blueprint()
+        spec['decision_ids'].append('change-roadmap')
+        result = self.cli('blueprint-record', '--blueprint-file', self.payload('spec', spec), ok=False)
+        self.assertIn('Continue to blueprint', result.stderr)
+        self.assertFalse((self.directory / 'blueprints/spec-v1/index.md').exists())
+        resumed = json.loads(self.cli('resume', '--format', 'json').stdout)
+        self.assertEqual(resumed['phase'], 'plan')
+        progress = resumed['plan_review']
+        self.assertTrue(progress['revision_required'])
+        self.assertIsNone(progress['authorization_id'])
+        revised = self.plan('plan-v2')
+        revised['decision_ids'].append('change-roadmap')
+        revised['workstreams'].append('Permissions')
+        self.record_reviewed_plan(revised)
+        spec['plan_version'] = 'plan-v2'
+        self.cli('blueprint-record', '--blueprint-file', self.payload('spec', spec))
+
+    def test_followup_audit_cannot_strand_an_open_plan_checkpoint(self):
+        self.start(plan_review=True)
+        self.exchange()
+        self.record_baseline()
+        self.record_reviewed_plan(self.plan())
+        self.cli('blueprint-record', '--blueprint-file', self.payload('spec', self.blueprint()))
+        plan = self.plan('plan-v2')
+        overview = self.plan_checkpoint(plan, 'roadmap')
+        self.plan_reply(overview, 'confirm', 'The roadmap covers the scope.')
+        self.cli('plan-record', '--plan-file', self.payload('plan', plan))
+        checkpoint = self.plan_checkpoint(plan, 'plan_workstream', stream=plan['workstreams'][0])
+        audit = self.baseline(audit_id='audit-v2')
+        audit['sweeps'] = audit['sweeps'][-1:]
+        result = self.cli('discovery-record', '--audit-file', self.payload('audit', audit), ok=False)
+        self.assertIn('Resolve the current plan checkpoint', result.stderr)
+        self.plan_reply(checkpoint, 'revise', 'Refresh the plan from the new audit.')
+        self.record_baseline(audit)
+        self.record_reviewed_plan(self.plan('plan-v3', 'audit-v2'))
+
     def test_guided_approval_requires_all_workstreams_and_consistency_evidence(self):
         self.start(review=True, guided=True)
         self.exchange()
@@ -3832,6 +4019,7 @@ print(json.dumps(output))
         self.assertIn('roadmap terminal review', result.stderr)
         checkpoint('roadmap', 'plan', 'plan-v1')
         self.cli('plan-record', '--plan-file', self.payload('plan', plan))
+        self.finish_plan_review(plan)
         blueprint = self.blueprint()
         self.cli('blueprint-record', '--blueprint-file', self.payload('blueprint', blueprint))
         self.cli('blueprint-coverage', '--coverage-file', self.payload('coverage', self.coverage()))
@@ -3876,7 +4064,7 @@ print(json.dumps(output))
         self.start(); self.exchange()
         audit=self.baseline('ui'); audit['surface']='fullstack'
         self.record_baseline(audit)
-        self.cli('plan-record','--plan-file',self.payload('plan',self.plan()))
+        self.record_reviewed_plan(self.plan())
         spec=self.blueprint(surface='ui'); spec['surface']='fullstack'
         spec['features'][0]['surface']='ui'
         backend=self.blueprint(surface='backend')['features'][0]
@@ -3928,7 +4116,7 @@ print(json.dumps(output))
     def test_audit_state_specific_visual(self):
         self.serve_fixture_states()
         self.start(); self.exchange(); self.record_baseline(self.baseline('ui'))
-        self.cli('plan-record','--plan-file',self.payload('plan',self.plan()))
+        self.record_reviewed_plan(self.plan())
         spec=self.blueprint(surface='ui')
         check={'check_id':'success-visibility','kind':'visual','expected':'visible',
                'command':self.test_command('visual','success-visibility'),'case_ids':['success-case'],
@@ -3977,7 +4165,7 @@ print(json.dumps(output))
         self.record_baseline()
         plan = self.plan()
         plan['decision_ids'] = ['modify-access']
-        self.cli('plan-record', '--plan-file', self.payload('plan', plan))
+        self.record_reviewed_plan(plan)
         self.exchange('remove-access', authorized_changes=[{'baseline_id':'list-items','classification':'REMOVE'}])
         spec = self.blueprint()
         spec['decision_ids'] = ['modify-access', 'remove-access']
@@ -3991,7 +4179,7 @@ print(json.dumps(output))
         audit['sweeps'] = [audit['sweeps'][-1]]
         self.record_baseline(audit)
         plan = self.plan('plan-v2', 'audit-v2')
-        self.cli('plan-record', '--plan-file', self.payload('plan', plan))
+        self.record_reviewed_plan(plan)
         spec = self.blueprint('spec-v2')
         spec.update(plan_version='plan-v2', baseline_id='audit-v2')
         self.cli('blueprint-record', '--blueprint-file', self.payload('spec', spec))
@@ -4055,7 +4243,7 @@ print(json.dumps(output))
         self.start()
         self.exchange()
         self.record_baseline()
-        self.cli('plan-record', '--plan-file', self.payload('plan', self.plan()))
+        self.record_reviewed_plan(self.plan())
         spec = self.blueprint()
         self.artifact(spec['document_paths'][0], '# Blueprint\n')
         self.cli('blueprint-record', '--blueprint-file', self.payload('spec', spec), ok=False)
@@ -4077,7 +4265,7 @@ print(json.dumps(output))
         self.start()
         self.exchange()
         self.record_baseline()
-        self.cli('plan-record', '--plan-file', self.payload('plan', self.plan()))
+        self.record_reviewed_plan(self.plan())
         spec = self.blueprint()
         foundation = copy.deepcopy(spec['features'][0])
         foundation['feature_id'] = 'foundation'
@@ -4113,7 +4301,7 @@ print(json.dumps(output))
             spec = self.blueprint(f'spec-v{version}')
             spec.update(plan_version=plan['version'], baseline_id=audit_id)
             coverage = dict(self.coverage(spec['version']), baseline_id=audit_id)
-            self.cli('plan-record', '--plan-file', self.payload('plan', plan))
+            self.record_reviewed_plan(plan)
             self.cli('blueprint-record', '--blueprint-file', self.payload('spec', spec))
             self.cli('blueprint-coverage', '--coverage-file', self.payload('coverage', coverage))
             self.cli('approve', '--approval-file', self.payload('approval', self.approval(spec['version'])))

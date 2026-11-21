@@ -1,6 +1,6 @@
 # Blueprint-first contracts
 
-Follow the [terminal-first guided review](guided-design-review.md) for discovery, roadmap and the one-workstream-at-a-time blueprint walkthrough. Use the [living review viewer](living-review.md) for deeper inspection and focused before-and-after comparisons.
+Follow the [terminal-first guided review](guided-design-review.md) for discovery and the one-workstream-at-a-time blueprint walkthrough. Complete [Conversational Implementation-Plan Review](implementation-plan-review.md) before drafting the blueprint. Use the [living review viewer](living-review.md) for deeper inspection and focused before-and-after comparisons.
 
 Use this route for new substantial implementation, redesign or greenfield requests, and proportionally for every explicit skill invocation. A small uninvolved fix can use the ordinary workflow. Initialize new blueprint initiatives with `init --guided-design-review`. An absent mode in an old manifest means prototype. Preserve prior approvals and apply the guided conversation to unfinished design reviews.
 
@@ -42,7 +42,7 @@ Browser captures check the build served over HTTP. The browser bypasses its loca
 
 Unavailable environments or unresolved behavior are blockers. Hashes protect retained files, not the truth or completeness of observations: actually inspect and test.
 
-Discuss the roadmap before deep specification. Include nonempty Markdown sections named **Objective**, **User journeys**, **Scope boundary**, **Preservation constraints**, **Workstreams**, **Dependencies**, **Risks**, and **Build order**. For backend work, describe callers or service flows under **User journeys**. Explain when a section has no applicable items. For a roadmap saved under `plans/<plan-version>/`, add `[Detailed blueprint specifications](blueprints/index.md)`. `plan-record` validates the link, creates a placeholder index, and freezes the roadmap. `blueprint-record` updates the navigation index and adds each immutable blueprint version recorded against that plan. Previously frozen roadmaps stay readable. Invite feedback and wait whenever a consequential answer is pending. Follow the separate blueprint, slice package and implementation authorization checkpoints.
+Show the proposed roadmap overview before saving the revision under review. Include nonempty Markdown sections named **Objective**, **User journeys**, **Scope boundary**, **Preservation constraints**, **Workstreams**, **Dependencies**, **Risks**, and **Build order**. For backend work, describe callers or service flows under **User journeys**. Explain when a section has no applicable items. For a roadmap saved under `plans/<plan-version>/`, add `[Detailed blueprint specifications](blueprints/index.md)`. `plan-record` validates the link, creates a placeholder index, and freezes the roadmap. `blueprint-record` updates the navigation index and adds each immutable blueprint version recorded against that plan. Previously frozen roadmaps stay readable. Review every workstream in the saved plan and obtain **Continue to blueprint** after the coverage and consistency check. Follow the separate blueprint, slice package and implementation authorization checkpoints.
 
 ## Detailed blueprint and coverage
 

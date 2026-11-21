@@ -461,13 +461,26 @@ class BlueprintState:
                     'source_hashes_at_record':sources}, hashes, transition=transition)
         if record_type == 'review_checkpoint' and value.get('review_step') == 'initial_alignment' and value['status'] == 'open':
             self.manifest['stage'] = 'discover'
+        if record_type == 'review_checkpoint' and value.get('review_step') in {'plan_workstream', 'plan_completion'}:
+            if value.get('review_step') == 'plan_completion' and value.get('review_action') == 'continue':
+                self.manifest['stage'] = 'blueprint'
+                self.manifest['next_action'] = 'Prepare the detailed blueprint for the reviewed plan'
+            else:
+                self.manifest['stage'] = 'plan'
         if transition is None:
+            if (self.manifest['stage'] == 'blueprint' and record_type == 'decision'
+                    and (value['phase'] == 'plan' or value.get('plan_ids'))):
+                progress = self.plan_review_progress(self.conversations())
+                if progress and progress['revision_required']:
+                    self.manifest['stage'] = 'plan'
+                    self.manifest['next_action'] = 'Present a revised implementation plan and review its workstreams.'
             self.persist()
 
     def check_review_checkpoint(self, value):
         step = value.get('review_step')
         self.require((step, value['phase']) in (('initial_alignment', 'discover'),
                                                 ('discovery', 'discover'), ('roadmap', 'plan'),
+                                                ('plan_workstream', 'plan'), ('plan_completion', 'plan'),
                                                 ('workstream', 'blueprint'))
                      and self.text(value.get('review_target')),
                      'Review checkpoint needs the displayed stage and review target')
@@ -477,6 +490,15 @@ class BlueprintState:
         if step == 'initial_alignment':
             self.check_initial_alignment(value)
             return
+        if step in {'plan_workstream', 'plan_completion'}:
+            self.check_plan_review_checkpoint(value)
+            return
+        if step == 'roadmap' and self.manifest.get('plan_review_required'):
+            self.require(self.identifier(value.get('review_version')),
+                         'Roadmap checkpoint needs the exact proposed plan version')
+            self.require(value.get('review_action') != 'skip', 'The plan overview cannot be waived')
+            self.require(value['review_version'] not in self.manifest.get('blueprint_plans', {}),
+                         'Use a new plan version to revise the roadmap overview')
         if self.manifest.get('guided_design_review'):
             version = value.get('review_version')
             self.require(self.identifier(version), 'Review checkpoint needs the exact audit, roadmap or blueprint version')
@@ -516,9 +538,103 @@ class BlueprintState:
                 if record.get('record_type') == 'review_checkpoint'
                 and record.get('review_step') == step and record['status'] == 'decided']
 
+    def plan_review_required(self, records):
+        return self.manifest.get('plan_review_required') or any(
+            record.get('record_type') == 'review_checkpoint'
+            and record.get('review_step') in {'plan_workstream', 'plan_completion'} for record in records)
+
+    def plan_review_progress(self, records, *, include_legacy=False):
+        plans = self.manifest.get('blueprint_plans', {})
+        if not plans:
+            return None
+        version = max(plans, key=lambda key: plans[key]['sequence'])
+        plan = self.load('blueprint_plans', version)
+        if not include_legacy and not self.plan_review_required(records):
+            if (self.manifest['stage'] not in {'plan', 'blueprint'}
+                    or plan['baseline_id'] != self.manifest.get('active_discovery_id')
+                    or any(self.load('blueprints', key)['plan_version'] == version
+                           for key in self.manifest.get('blueprints', {}))):
+                return None
+        overview = next((record for record in reversed(records)
+                         if record.get('record_type') == 'review_checkpoint' and record['status'] == 'decided'
+                         and record.get('review_version') == version and record.get('review_step') == 'roadmap'), {})
+        reviews = [record for record in records
+                   if record.get('record_type') == 'review_checkpoint' and record.get('review_version') == version
+                   and record.get('review_step') in {'plan_workstream', 'plan_completion'}]
+        continued = [record for record in reviews if record.get('review_action') == 'continue']
+        completed = [record['review_workstream'] for record in continued if record['review_step'] == 'plan_workstream']
+        authorization = next((record['exchange_id'] for record in continued if record['review_step'] == 'plan_completion'), None)
+        revision_required = any(record.get('review_action') == 'revise' for record in reviews)
+        if authorization:
+            plan_decisions = set(plan['decision_ids'])
+            applicable = self.applicable_decision_records(plan['baseline_id'], [], records)
+            revision_required |= any(
+                (record['phase'] == 'plan' or
+                 (self.strings(record.get('plan_ids'), False) and version in record['plan_ids']))
+                and record['exchange_id'] not in plan_decisions for record in applicable
+            )
+            revision_required |= bool(plan_decisions & self.superseded_decisions(records))
+        return {
+            'plan_version': version, 'document_paths': plan['document_paths'],
+            'baseline_id': plan['baseline_id'],
+            'overview_confirmed': overview.get('review_action') == 'confirm',
+            'requirement_map_path': plan.get('requirement_map_path'),
+            'workstreams': plan['workstreams'], 'completed_workstreams': completed,
+            'current_workstream': next((name for name in plan['workstreams'] if name not in completed), None),
+            'revision_required': revision_required,
+            'authorization_id': authorization if not revision_required else None,
+            'continuation_ids': [record['exchange_id'] for record in continued],
+        }
+
+    def check_plan_review_checkpoint(self, value):
+        records = self.conversations()
+        progress = self.plan_review_progress(records, include_legacy=True)
+        version = value.get('review_version')
+        self.require(progress and version == progress['plan_version'], 'Review the current saved plan version')
+        self.require(self.manifest['stage'] == 'plan' or (
+            self.manifest['stage'] == 'blueprint' and not self.plan_review_required(records)
+        ), 'Complete discovery and save the current implementation plan before reviewing it')
+        self.require(not progress['revision_required'] and not progress['authorization_id'],
+                     'Use a new plan version for a revised or already authorized plan review')
+        plan = self.load('blueprint_plans', version)
+        baseline = self.baseline(plan['baseline_id'])
+        mapping = self.plan_requirement_mapping(plan, baseline)
+        self.stage_review_hashes('roadmap', version, required=True)
+        workstream = progress['current_workstream']
+        if value['review_step'] == 'plan_workstream':
+            self.require(workstream is not None and value.get('review_workstream') == workstream,
+                         f'Review the next workstream in plan order: {workstream}')
+            expected_ids = {key for key, names in mapping.items() if workstream in names}
+        else:
+            self.require(workstream is None and not value.get('review_workstream'),
+                         'Review every plan workstream before presenting plan completion')
+            if value['status'] == 'open' or value.get('review_action') == 'continue':
+                self.require_applicable_decisions({**plan, 'features': []})
+            expected_ids = mapping.keys()
+        self.require(set(value.get('requirement_ids', [])) == expected_ids,
+                     'The review must carry every requirement ID mapped to this scope')
+        pending = self.pending()
+        if value['status'] == 'open':
+            self.require(not pending and not value.get('review_action') and not value.get('responds_to'),
+                         'Resolve pending questions before opening the next plan review checkpoint')
+            self.markdown(value.get('evidence_paths'))
+            return
+        self.require(value['status'] == 'decided' and value.get('responds_to')
+                     and value.get('review_action') in {'continue', 'revise'},
+                     'Plan review requires the actual reply to its checkpoint and cannot be waived')
+        if value['review_action'] == 'continue':
+            self.require(all(record['exchange_id'] == value['responds_to'] for record in pending),
+                         'Resolve outstanding plan questions before continuing')
+            reply = ' '.join(value['response'].casefold().strip().rstrip('.!').split())
+            if value['review_step'] == 'plan_completion':
+                self.require(reply == 'continue to blueprint', 'Wait for explicit “Continue to blueprint”')
+            else:
+                self.require(reply in {'continue', 'next', 'move to the next workstream'},
+                             'Wait for explicit “Continue” on the current plan workstream')
+
     def check_initial_alignment(self, value):
-        self.require(not any(self.manifest.get(field) for field in
-                             ('blueprint_plans', 'prototype_coverage', 'approvals')),
+        self.require(not any(self.manifest.get(field) for field in ('blueprints', 'prototype_coverage', 'approvals'))
+                     and (not self.manifest.get('blueprint_plans') or self.plan_review_required(self.conversations())),
                      'Initial understanding is scoped to intake; use the design amendment workflow after planning')
         self.require(self.identifier(value.get('review_version')), 'Initial alignment needs a stable review version')
         records = self.initial_alignment_records()
@@ -528,6 +644,9 @@ class BlueprintState:
             self.markdown(value.get('evidence_paths'))
             self.require(not any(record.get('review_step') == 'initial_alignment' for record in self.pending()),
                          'Resolve the current initial alignment presentation first')
+            self.require(not any(record.get('review_step') in {'roadmap', 'plan_workstream', 'plan_completion'}
+                                 for record in self.pending()),
+                         'Resolve the current plan checkpoint as a revision before reopening initial alignment')
             prior = [record for record in records if record['status'] == 'open']
             self.require(all(record['review_version'] != value['review_version'] for record in prior),
                          'Present revised understanding under a fresh review version')
@@ -630,12 +749,12 @@ class BlueprintState:
             hashes.update(self.bound_hashes('conversation', answer['exchange_id']))
         return hashes
 
-    def stage_review_hashes(self, step, version):
-        if not self.manifest.get('guided_design_review'):
+    def stage_review_hashes(self, step, version, *, required=False):
+        if not required and not self.manifest.get('guided_design_review'):
             return {}
         answer = next((record for record in reversed(self.review_answers(step))
                        if record['review_version'] == version), None)
-        self.require(answer and answer['review_action'] in {'confirm', 'skip'},
+        self.require(answer and answer['review_action'] in ({'confirm'} if required else {'confirm', 'skip'}),
                      f'Complete the {step} terminal review for {version} before freezing it')
         return self.review_exchange_hashes([answer])
 
@@ -665,14 +784,19 @@ class BlueprintState:
         return usage, [{**row, 'slice_ids': feature_slices.get(row['feature_id'], [])} for row in coverage]
 
     def record_discovery(self, project_root, candidate):
-        self.require(not any(record.get('review_step') == 'discovery'
-                             and record.get('record_type') == 'review_checkpoint' for record in self.pending()),
+        open_reviews = {record['review_step'] for record in self.pending()
+                        if record.get('record_type') == 'review_checkpoint'}
+        self.require('discovery' not in open_reviews,
                      'Resolve the discovery review checkpoint before freezing the baseline')
+        self.require(not open_reviews & {'plan_workstream', 'plan_completion'},
+                     'Resolve the current plan checkpoint as a revision before freezing a new baseline')
         self.require(candidate.get('scope') == self.manifest['scope'], 'Discovery scope must match initiative')
         self.require(self.identifier(candidate.get('audit_id')), 'Stable audit ID required')
         audit_id = candidate['audit_id']
         alignment_hashes, alignment = {}, {}
-        if not self.manifest.get('blueprint_plans'):
+        if not self.manifest.get('blueprint_plans') or (
+            not self.manifest.get('blueprints') and self.plan_review_required(self.conversations())
+        ):
             alignment_hashes, alignment = self.confirmed_alignment(check_sources=True)
         confirmed_requirements = {row['requirement_id']: row['text'] for row in alignment.get('requirement_mappings', [])}
         review_hashes = {**alignment_hashes, **self.stage_review_hashes('discovery', audit_id)}
@@ -1097,6 +1221,34 @@ class BlueprintState:
         entry = self.manifest['discovery_audits'][key]
         return {entry['path']:entry['sha256'], **entry['evidence_hashes']}
 
+    def plan_requirement_mapping(self, plan, baseline, required_ids=None):
+        baseline_ids = {row['requirement_id'] for row in baseline.get('requirements', [])}
+        expected = baseline_ids if required_ids is None else required_ids
+        mapping = plan.get('requirement_workstreams', {})
+        self.require(isinstance(mapping, dict) and expected <= mapping.keys() <= baseline_ids
+                     and all(self.strings(names) and set(names) <= set(plan['workstreams'])
+                             for names in mapping.values()),
+                     'Map every confirmed requirement ID and applicable baseline requirement to the roadmap workstreams')
+        return mapping
+
+    def write_plan_requirement_map(self, plan, baseline, mapping):
+        relative = f"plans/{plan['version']}/requirements.md"
+        path = self.directory / relative
+        self.require(path.resolve().is_relative_to(self.directory.resolve()),
+                     'Roadmap requirement map must stay inside the initiative')
+        lines = ['# Roadmap requirement coverage', '', f'{len(mapping)} requirements mapped.']
+        for row in baseline.get('requirements', []):
+            key = row['requirement_id']
+            lines.extend(['', f'## {key}', '', row['text'], '',
+                          'Workstreams — ' + ', '.join(mapping[key])])
+        content = '\n'.join(lines) + '\n'
+        if path.exists():
+            self.require(path.read_text(encoding='utf-8') == content,
+                         'Use a new version for a changed roadmap requirement map')
+        else:
+            self.api.atomic_text(path, content)
+        return relative
+
     def plan_record(self, value):
         self.require_ready()
         self.require(not self.pending(), "Roadmap is waiting on a consequential question")
@@ -1106,22 +1258,20 @@ class BlueprintState:
         for field in ('workstreams','dependencies','risks'):
             self.require(self.strings(value.get(field), nonempty=field == 'workstreams'), f'Plan requires concrete {field}')
         hashes = self.baseline_hashes(value.get('baseline_id'))
-        first_plan = not self.manifest.get('blueprint_plans')
-        alignment_hashes, alignment = self.confirmed_alignment(check_sources=first_plan)
+        reviewed = self.plan_review_required(self.conversations())
+        bind_alignment = not self.manifest.get('blueprint_plans') or (
+            reviewed and not self.manifest.get('blueprints')
+        )
+        alignment_hashes, alignment = self.confirmed_alignment(check_sources=bind_alignment)
         alignment_ids = set(alignment.get('requirement_ids', []))
-        if first_plan:
+        if bind_alignment:
             self.require(alignment_hashes.items() <= hashes.items(),
                          'Freeze discovery against the current initial understanding before recording the roadmap')
-        if alignment_ids:
-            workstreams = value.get('requirement_workstreams')
-            self.require(isinstance(workstreams, dict) and alignment_ids <= workstreams.keys()
-                         and workstreams.keys() <= {row['requirement_id']
-                                                    for row in self.baseline(value['baseline_id']).get('requirements', [])}
-                         and all(self.strings(names) and set(names) <= set(value['workstreams'])
-                                 for names in workstreams.values()),
-                         'Map every confirmed requirement ID to the applicable roadmap workstreams')
+        baseline = self.baseline(value['baseline_id'])
+        if alignment_ids or reviewed:
+            mapping = self.plan_requirement_mapping(value, baseline, None if reviewed else alignment_ids)
         hashes.update(alignment_hashes)
-        hashes.update(self.stage_review_hashes('roadmap', value['version']))
+        hashes.update(self.stage_review_hashes('roadmap', value['version'], required=reviewed))
         hashes.update(self.decisions(value.get('decision_ids'), allow_empty=True))
         self.require_applicable_decisions({**value, 'features': []})
         markdown_hashes, documents = self.markdown(value.get('document_paths'))
@@ -1135,11 +1285,16 @@ class BlueprintState:
             for path, content in documents.items())
         self.require(linked_path, 'Roadmap must link to its generated blueprint index')
         hashes.update(markdown_hashes)
+        if reviewed:
+            relative = self.write_plan_requirement_map(value, baseline, mapping)
+            hashes.update(self.hashes([relative]))
+            value = {**value, 'requirement_map_path': relative}
         self.freeze('blueprint_plans', value['version'],
                     {**value, 'blueprint_index_path': navigation, 'index_from_plan': True}, hashes)
         self.write_plan_blueprint_index(value['version'])
-        self.manifest['stage'] = 'blueprint'
-        self.manifest['next_action'] = 'Prepare the blueprint, then guide the terminal review one workstream at a time'
+        self.manifest['stage'] = 'plan' if reviewed else 'blueprint'
+        self.manifest['next_action'] = ('Present the first implementation-plan workstream' if reviewed else
+                                        'Prepare the blueprint, then guide the terminal review one workstream at a time')
         self.persist()
 
     def check_roadmap(self, documents):
@@ -1261,6 +1416,11 @@ class BlueprintState:
 
     def blueprint_record(self, value):
         self.require_ready()
+        records = self.conversations()
+        progress = self.plan_review_progress(records, include_legacy=True)
+        self.require(progress and self.manifest['stage'] != 'discover'
+                     and value.get('plan_version') == progress['plan_version'] and progress['authorization_id'],
+                     'Finish the current plan review and record explicit “Continue to blueprint”')
         surface_contracts = self.api.sibling_module('surface_contracts')
         if self.api.requires_slice_review(self.manifest):
             self.require(value.get('surface_contract_version') == surface_contracts.SURFACE_CONTRACT_VERSION,
@@ -1274,6 +1434,10 @@ class BlueprintState:
                      'Blueprint cannot omit roadmap decisions; record an amendment or include them')
         self.require(value.get('open_decisions') == [] and not self.pending(), 'Unresolved consequential questions block blueprint')
         hashes = self.bound_hashes('blueprint_plans', value['plan_version'])
+        hashes.update(self.stage_review_hashes('roadmap', plan['version'], required=True))
+        continuation_ids = set(progress['continuation_ids'])
+        hashes.update(self.review_exchange_hashes([record for record in records
+                                                   if record['exchange_id'] in continuation_ids]))
         hashes.update(self.decisions(value.get('decision_ids'), allow_empty=True))
         features = value.get('features')
         self.require(isinstance(features, list) and features, 'Concrete blueprint features required')
@@ -2144,26 +2308,30 @@ class BlueprintState:
                           else None if not (root / path).exists() else 'present')
                 self.require(actual == expected, f'A source changed since discovery: {path}')
 
-    def require_applicable_decisions(self, spec):
-        baseline_ids = set(self.manifest['discovery_audits'][spec['baseline_id']]['feature_ids'])
-        scope = baseline_ids | {f['feature_id'] for f in spec['features']}
-        records = self.conversations()
+    def applicable_decision_records(self, baseline_id, feature_ids, records):
+        scope = set(self.manifest['discovery_audits'][baseline_id]['feature_ids']) | set(feature_ids)
         superseded = self.superseded_decisions(records)
-        applicable = set()
-        authorizations = {}
         for record in records:
             if (record['status'] != 'decided' or record['exchange_id'] in superseded
                     or record.get('report_id') or record.get('record_type', 'decision') != 'decision'):
                 continue
             ids = set(record.get('feature_ids', []) + record.get('requirement_ids', []))
             if not ids or ids & scope:
-                applicable.add(record['exchange_id'])
-                for change in record.get('authorized_changes', []):
-                    baseline_id = change['baseline_id']
-                    classification = change['classification']
-                    existing = authorizations.setdefault(baseline_id, classification)
-                    self.require(existing == classification,
-                                 f'Conflicting decisions for {baseline_id}; record an explicit correction')
+                yield record
+
+    def require_applicable_decisions(self, spec):
+        records = self.applicable_decision_records(
+            spec['baseline_id'], [feature['feature_id'] for feature in spec['features']], self.conversations())
+        applicable = set()
+        authorizations = {}
+        for record in records:
+            applicable.add(record['exchange_id'])
+            for change in record.get('authorized_changes', []):
+                baseline_id = change['baseline_id']
+                classification = change['classification']
+                existing = authorizations.setdefault(baseline_id, classification)
+                self.require(existing == classification,
+                             f'Conflicting decisions for {baseline_id}; record an explicit correction')
         bound = set(spec['decision_ids']) | {d for f in spec['features'] for d in f['decision_ids']}
         for feature in spec['features']:
             for baseline_id in feature['baseline_ids']:

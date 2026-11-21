@@ -116,10 +116,39 @@ class InitialAlignmentTests(unittest.TestCase):
                 "document_paths": ["plans/plan-v1/roadmap.md"]}
         self.record("plan-record", "--plan-file", plan, blocked="Map every confirmed requirement")
         plan["requirement_workstreams"] = {"items": ["Item listing"]}
+        overview = {
+            "exchange_id": "plan-overview", "phase": "plan", "record_type": "review_checkpoint",
+            "review_step": "roadmap", "review_version": "plan-v1", "review_target": "Item listing roadmap",
+            "status": "open", "question": "Does this roadmap capture the direction?",
+            "requirement_ids": ["items"], "evidence_paths": plan["document_paths"],
+        }
+        self.exchange(overview)
+        self.reply(overview, "confirm", "The roadmap matches the scope.")
         self.record("plan-record", "--plan-file", plan)
         saved = json.loads((plan_folder.with_suffix(".json")).read_text())
         self.assertIn("alignment/intake-v2.md", saved["_frozen_evidence"])
         self.assertNotIn("alignment/intake-v1.md", saved["_frozen_evidence"])
+        requirement_map = self.directory / saved["requirement_map_path"]
+        self.assertIn("List and filter items.", requirement_map.read_text())
+        self.assertIn("Workstreams — Item listing", requirement_map.read_text())
+
+        workstream = {**overview, "exchange_id": "listing-review", "review_step": "plan_workstream",
+                      "review_workstream": "Item listing", "question": "Continue after reviewing the listing?",
+                      "feature_ids": ["items"]}
+        self.exchange({**workstream, "requirement_ids": []}, blocked="every requirement ID mapped")
+        self.exchange(workstream)
+        self.reply(workstream, "revise", "Filtering also needs an empty-state message.")
+        adjusted = self.presentation("intake-v3")
+        adjusted["evidence_paths"] = ["adjusted.md"]
+        adjusted["requirement_mappings"][0]["text"] = "List and filter items with an empty-state message."
+        (self.directory / "adjusted.md").write_text("# Intake adjusted\n\nExplain when filters return no items.\n")
+        self.exchange(adjusted)
+        self.reply(adjusted, "confirm", "Confirm understanding")
+        self.record("plan-record", "--plan-file", {**plan, "version": "plan-v2"},
+                    blocked="current initial understanding")
+        audit["audit_id"] = "audit-v2"
+        audit["requirements"][0]["text"] = adjusted["requirement_mappings"][0]["text"]
+        self.record("discovery-record", "--audit-file", audit)
 
     def test_revision_cannot_silently_drop_a_requirement(self):
         self.initialize("blueprint")
