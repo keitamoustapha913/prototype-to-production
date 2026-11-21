@@ -54,9 +54,9 @@ The agent discovers the relevant app, scope, and initiative from the repository 
 New initiatives default to **blueprint-first**:
 
 1. Inspect actual source and behavior, or verify an empty baseline for a new project.
-2. Explain findings and discuss one consequential question at a time, using diagrams or tables when useful. Preserve exact questions, options and actual answers.
-3. Draft a concise roadmap, then indexed Markdown/Mermaid feature specifications with behavior, state, UI or API contracts and acceptance checks.
-4. Prove every source feature or user requirement is covered and wait for approval of the exact blueprint.
+2. Explain the discovery findings in the terminal and invite corrections. Discuss one consequential question at a time and preserve exact questions and actual answers.
+3. Review the proposed roadmap in the terminal before freezing it. Draft indexed Markdown/Mermaid feature specifications with behavior, state, UI or API contracts and acceptance checks.
+4. Walk through one blueprint workstream at a time using compact terminal illustrations. Say **Continue** or **Next** when ready to advance. The current position and pending discussion survive a fresh session. After the last workstream, Codex checks consistency and coverage, then asks for formal approval of the exact blueprint. Detailed documents and the browser viewer are available throughout. [Guided design review](references/guided-design-review.md)
 5. Draft the complete slice inventory and an illustrated implementation guide for each slice. Review the slices one at a time by default.
 6. Revalidate and lock the reviewed package with the user's approval. Ask separately for permission to start the exact package.
 7. Release slices in dependency order. Verify actual behavior, tests and rendered UI where relevant.
@@ -71,7 +71,7 @@ Complete raw chat transcript capture is optional and requires an explicit reques
 
 ## Project state CLI
 
-The Python utility records approvals, slice contracts, reports, blockers, warnings, journal events, and checkpoints. Run it from the installed skill or this checkout:
+The Python utility records approvals, slice contracts, reports, blockers, warnings, journal events, and checkpoints. For a new blueprint initiative started directly from the CLI, pass `--guided-design-review` to `init` to require recorded terminal review evidence. Run the utility from the installed skill or this checkout:
 
 ```bash
 python3 scripts/project_state.py --help
@@ -107,6 +107,7 @@ Blueprint verification executes approved tests from the app root. UI verificatio
 | Path | Purpose |
 | --- | --- |
 | [references/blueprint-workflow.md](references/blueprint-workflow.md) | Default blueprint workflow, conversation, coverage, approval and verification contracts. |
+| [references/guided-design-review.md](references/guided-design-review.md) | Terminal walkthroughs, explicit continuation and saved review evidence. |
 | [SKILL.md](SKILL.md) | Agent entry point, stage routing, and quality gates. |
 | [references/workflow.md](references/workflow.md) | Detailed workflow and command reference. |
 | [references/continuity.md](references/continuity.md) | Checkpoints, evidence preservation, and session recovery. |

@@ -1334,10 +1334,13 @@ def note_progress(manifest: dict, summary: str, completed: str | None = None) ->
     }
 
 
-def initialize(directory: Path, scope: str, next_action: str | None, mode: str | None = None) -> None:
+def initialize(directory: Path, scope: str, next_action: str | None, mode: str | None = None,
+               *, guided_design_review: bool = False) -> None:
     errors = validate_scope(scope)
     if errors:
         raise StateError("; ".join(errors))
+    if guided_design_review and mode == "prototype":
+        raise StateError("Guided review checkpoints require blueprint mode")
     with coordinator_lock(directory):
         if (directory / "manifest.json").exists():
             manifest = manifest_at(directory)
@@ -1361,6 +1364,8 @@ def initialize(directory: Path, scope: str, next_action: str | None, mode: str |
         })
         if template["initiative_mode"] == "blueprint":
             template.update(schema_version=5, slice_review_required=True)
+        if guided_design_review:
+            template["guided_design_review"] = True
         template["provenance"]["created_at"] = utc_now()
         folders = ("plans", "blueprints", "conversation", "slices") if template["initiative_mode"] == "blueprint" else ("prototype/versions", "references", "fixtures", "slices")
         for subdirectory in folders:
@@ -3010,10 +3015,14 @@ def build_resume_packet(directory: Path, project_root: Path, *, delivery_slice: 
             (answer for answer in reversed(conversation)
              if answer.get("responds_to") == review["pending_question_id"]), None)
     next_action = work.get("next_action") if work else manifest.get("next_action")
+    pending_guided_review = next((question for question in pending_questions
+                                  if question.get("record_type") == "review_checkpoint"), None)
     if question_source_errors:
         next_action = "Reconcile the changed question source before continuing."
     elif active_question_answer:
         next_action = "Use the recorded answer and update the saved work cursor."
+    elif pending_guided_review and (not work or work.get("status") == "in_progress"):
+        next_action = f"Wait for the user's reply on {pending_guided_review['review_target']}."
     delivery = {key: item.get("status") for key, item in manifest.get("slices", {}).items()
                 if not item.get("superseded_by")}
     delivery_handoff = None
@@ -3094,6 +3103,7 @@ def build_resume_packet(directory: Path, project_root: Path, *, delivery_slice: 
         "initiative_id": manifest["initiative_id"], "initiative_directory": str(directory),
         "scope": manifest["scope"], "phase": manifest["stage"],
         "initiative_mode": initiative_mode(manifest),
+        "guided_design_review": manifest.get("guided_design_review", False),
         "approved_version": manifest.get("approved_version"),
         "approval_id": manifest.get("active_approval_id"),
         "approved_source_paths": active.get("source_paths", []) if active else [],
@@ -3180,9 +3190,13 @@ def print_resume(directory: Path, project_root: Path, *, delivery_slice: str | N
         print(f"RESUME TASK: {packet['active_work']['task_id']} ({status})")
         print(f"NEXT: {packet['next_action']}")
     if answer:
+        if answer.get("record_type") == "review_checkpoint":
+            print(f"REVIEW CHECKPOINT {answer['review_target']}: {answer['review_action']}")
         print(f"RECORDED QUESTION {answer['responds_to']}: {answer['question']}")
         print(f"RECORDED ANSWER {answer['exchange_id']}: {answer['response']}")
     for question in packet["pending_questions"]:
+        if question.get("record_type") == "review_checkpoint":
+            print(f"REVIEW CHECKPOINT {question['review_target']}: waiting for reply")
         print(f"PENDING QUESTION {question['exchange_id']}: {question['question']}")
         for option in question.get("options", []):
             print(f"- {option['label']}: {option['tradeoff']}")
@@ -3246,6 +3260,8 @@ def main(argv: list[str] | None = None) -> int:
             sub.add_argument("--scope", choices=sorted(VALID_SCOPES), required=True)
             sub.add_argument("--next-action")
             sub.add_argument("--mode", choices=["blueprint", "prototype"])
+            sub.add_argument("--guided-design-review", action="store_true",
+                             help="Require guided terminal review evidence before freezing design approvals")
         if name == "event":
             sub.add_argument("--event-file", required=True)
         if name == "checkpoint":
@@ -3305,7 +3321,8 @@ def main(argv: list[str] | None = None) -> int:
             manifest_file.is_file() and requires_slice_review(read_json(manifest_file)))
         ensure_local_git_ignore(project_root, directory, configure=explicit_setup or not review_workflow)
         if args.command == "init":
-            initialize(directory, args.scope, args.next_action, args.mode)
+            initialize(directory, args.scope, args.next_action, args.mode,
+                       guided_design_review=args.guided_design_review)
         elif args.command in {"review-viewer", "review-revision"}:
             viewer = sibling_module("living_review")
             if args.command == "review-viewer":

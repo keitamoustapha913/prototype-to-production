@@ -3702,6 +3702,172 @@ print(json.dumps(output))
         self.exchange('recap-confirmation',response='Yes, your decision recap is accurate.',record_type='recap')
         self.cli('approve','--approval-file',self.payload('approval',self.approval()))
 
+    def test_workstream_checkpoint_survives_resume_and_keeps_approval_separate(self):
+        self.prepared()
+        presentation = self.artifact('review/items-v1.md', 'Saved items workstream terminal presentation.')
+        prompt = {
+            'exchange_id': 'items-checkpoint', 'phase': 'blueprint', 'record_type': 'review_checkpoint',
+            'review_step': 'workstream', 'review_target': 'spec-v1 / Service and API (1 of 1)',
+            'status': 'open', 'question': 'Say Continue when ready for the consistency check.',
+            'feature_ids': ['list-items'], 'evidence_paths': [presentation],
+        }
+        self.cli('conversation-record', '--exchange-file', self.payload('checkpoint', prompt))
+        packet = json.loads(self.cli('resume', '--format', 'json').stdout)
+        self.assertFalse(packet['safe_to_continue'])
+        self.assertIn(prompt['review_target'], packet['next_action'])
+        cursor = {
+            'task_id': 'review-workstreams', 'phase': 'blueprint', 'status': 'waiting_user',
+            'summary': prompt['review_target'], 'next_action': 'Wait for Continue',
+            'completed_steps': [], 'pending_steps': ['Review Service and API', 'Check blueprint consistency'],
+            'blockers': [], 'code_paths': [], 'artifact_paths': [presentation],
+            'pending_question_id': prompt['exchange_id'],
+        }
+        self.cli('work-update', '--work-file', self.payload('cursor', cursor))
+        answer = {**prompt, 'exchange_id': 'items-continue', 'status': 'decided',
+                  'responds_to': prompt['exchange_id'], 'review_action': 'continue'}
+        for reply in ('Correct', 'Looks good!', 'I understand.'):
+            result = self.cli('conversation-record', '--exchange-file',
+                              self.payload('answer', {**answer, 'response': reply}), ok=False)
+            self.assertIn('explicit navigation', result.stderr)
+        result = self.cli('conversation-record', '--exchange-file', self.payload('wrong-type', {
+            **answer, 'record_type': 'decision', 'response': 'Continue',
+        }), ok=False)
+        self.assertIn('same review checkpoint', result.stderr)
+        packet = json.loads(self.cli('resume', '--format', 'json').stdout)
+        self.assertFalse(packet['safe_to_continue'])
+        self.assertEqual(packet['pending_questions'][0]['review_target'], prompt['review_target'])
+        self.assertEqual(packet['next_action'], 'Wait for Continue')
+        self.assertIn(f"REVIEW CHECKPOINT {prompt['review_target']}: waiting for reply", self.cli('resume').stdout)
+        approval = self.approval()
+        self.cli('approve', '--approval-file', self.payload('approval', approval), ok=False)
+        question = self.exchange('items-open', status='open')
+        result = self.cli('conversation-record', '--exchange-file',
+                          self.payload('answer', {**answer, 'response': 'Next'}), ok=False)
+        self.assertIn('Resolve outstanding design questions', result.stderr)
+        self.exchange('items-answered', status='rejected', responds_to=question['exchange_id'],
+                      response='Drop this question. Keep the confirmed blueprint behavior.')
+        self.cli('conversation-record', '--exchange-file', self.payload('answer', {**answer, 'response': 'Next'}))
+        packet = json.loads(self.cli('resume', '--format', 'json').stdout)
+        self.assertEqual(packet['active_question_answer']['response'], 'Next')
+        self.assertIsNone(packet['approval_id'])
+        self.assertIn(f"REVIEW CHECKPOINT {prompt['review_target']}: continue", self.cli('resume').stdout)
+        cursor.pop('pending_question_id')
+        consistency = self.artifact('review/spec-v1-consistency.md',
+                                    'Service and API covers list-items. Items and membership contracts agree.')
+        cursor['artifact_paths'].append(consistency)
+        cursor.update(status='done', next_action='Present exact blueprint for approval',
+                      completed_steps=cursor['pending_steps'], pending_steps=[])
+        self.cli('work-update', '--work-file', self.payload('cursor', cursor))
+        approval['shown_paths'].append(consistency)
+        self.cli('approve', '--approval-file', self.payload('approval', approval))
+        saved = self.manifest()['approvals'][approval['decision_id']]
+        self.assertIn(consistency, saved['presentation_evidence_hashes'])
+
+    def test_discovery_and_roadmap_finalization_wait_for_their_presentations(self):
+        self.start()
+        audit = self.baseline()
+        plan = self.plan()
+        for step, phase, target, command, argument, payload in (
+            ('discovery', 'discover', 'Items audit draft', 'discovery-record', '--audit-file', audit),
+            ('roadmap', 'plan', 'Items roadmap draft', 'plan-record', '--plan-file', plan),
+        ):
+            with self.subTest(step=step):
+                prompt = {
+                    'exchange_id': f'{step}-prompt', 'phase': phase, 'record_type': 'review_checkpoint',
+                    'review_step': step, 'review_target': target, 'status': 'open',
+                    'question': 'Does this reflect the intended behavior?',
+                    'feature_ids': ['list-items'],
+                    'evidence_paths': [self.artifact(f'review/{step}.md', f'Actual {step} presentation.')],
+                }
+                self.cli('conversation-record', '--exchange-file', self.payload('prompt', prompt))
+                self.cli(command, argument, self.payload(step, payload), ok=False)
+                answer = {
+                    **prompt, 'exchange_id': f'{step}-confirmed', 'responds_to': prompt['exchange_id'],
+                    'status': 'decided', 'response': 'Correct', 'review_action': 'confirm',
+                }
+                self.cli('conversation-record', '--exchange-file', self.payload('answer', answer))
+                if step == 'roadmap':
+                    payload['decision_ids'] = []
+                self.cli(command, argument, self.payload(step, payload))
+
+    def test_guided_approval_requires_all_workstreams_and_consistency_evidence(self):
+        self.cli('init', '--scope', 'feature', '--guided-design-review')
+        self.exchange()
+
+        def checkpoint(step, phase, version, name=None, *, skip=False):
+            key = name or step
+            prompt = {
+                'exchange_id': f'{key}-prompt', 'phase': phase, 'record_type': 'review_checkpoint',
+                'review_step': step, 'review_version': version, 'review_target': key,
+                'status': 'open', 'question': 'Ready to continue?',
+                'feature_ids': ['items-feature' if name else 'list-items'],
+                'evidence_paths': [self.artifact(f'review/{key}.md', f'Terminal walkthrough for {key}.')],
+            }
+            if name:
+                prompt['review_workstream'] = name
+            if skip:
+                self.cli('conversation-record', '--exchange-file', self.payload('waiver', {
+                    **prompt, 'exchange_id': f'{key}-waiver', 'status': 'decided',
+                    'response': f'Skip {name} and move on', 'review_action': 'skip',
+                }))
+                return
+            self.cli('conversation-record', '--exchange-file', self.payload('prompt', prompt))
+            self.cli('conversation-record', '--exchange-file', self.payload('response', {
+                **prompt, 'exchange_id': f'{key}-reply', 'status': 'decided',
+                'responds_to': prompt['exchange_id'], 'response': 'Next' if name else 'Correct',
+                'review_action': 'continue' if name else 'confirm',
+            }))
+
+        audit = self.baseline()
+        result = self.cli('discovery-record', '--audit-file', self.payload('audit', audit), ok=False)
+        self.assertIn('discovery terminal review', result.stderr)
+        checkpoint('discovery', 'discover', 'audit-v1')
+        self.record_baseline(audit)
+        plan = self.plan()
+        plan['workstreams'] = ['service', 'permissions']
+        result = self.cli('plan-record', '--plan-file', self.payload('plan', plan), ok=False)
+        self.assertIn('roadmap terminal review', result.stderr)
+        checkpoint('roadmap', 'plan', 'plan-v1')
+        self.cli('plan-record', '--plan-file', self.payload('plan', plan))
+        blueprint = self.blueprint()
+        self.cli('blueprint-record', '--blueprint-file', self.payload('blueprint', blueprint))
+        self.cli('blueprint-coverage', '--coverage-file', self.payload('coverage', self.coverage()))
+        approval = self.approval()
+        checkpoint('workstream', 'blueprint', 'spec-v1', 'service')
+        result = self.cli('approve', '--approval-file', self.payload('approval', approval), ok=False)
+        self.assertIn('permissions', result.stderr)
+        checkpoint('workstream', 'blueprint', 'spec-v1', 'permissions', skip=True)
+        result = self.cli('approve', '--approval-file', self.payload('approval', approval), ok=False)
+        self.assertIn('consistency report', result.stderr)
+        report = self.artifact('review/spec-v1-consistency.md',
+                               'Service and permissions agree on membership policy and 403 behavior.')
+        approval['workstream_consistency_path'] = report
+        approval['shown_paths'].append(report)
+        self.cli('approve', '--approval-file', self.payload('approval', approval))
+        receipt = self.manifest()['approvals'][approval['decision_id']]
+        self.assertIn(report, receipt['presentation_evidence_hashes'])
+        self.assertIn('conversation/permissions-waiver.json', receipt['artifact_hashes'])
+        self.cli('validate')
+
+        unchanged = self.blueprint('spec-v2')
+        self.cli('blueprint-record', '--blueprint-file', self.payload('blueprint', unchanged))
+        self.cli('blueprint-coverage', '--coverage-file', self.payload('coverage', self.coverage('spec-v2')))
+        approval = self.approval('spec-v2')
+        report = self.artifact('review/spec-v2-consistency.md',
+                               'Both workstream contracts match the reviews on spec-v1.')
+        approval['workstream_consistency_path'] = report
+        approval['shown_paths'].append(report)
+        self.cli('approve', '--approval-file', self.payload('approval', approval))
+        self.cli('validate')
+
+        changed = self.blueprint('spec-v3')
+        changed['features'][0]['anatomy'] += ' through an item repository interface'
+        self.cli('blueprint-record', '--blueprint-file', self.payload('blueprint', changed))
+        self.cli('blueprint-coverage', '--coverage-file', self.payload('coverage', self.coverage('spec-v3')))
+        result = self.cli('approve', '--approval-file', self.payload('approval', self.approval('spec-v3')), ok=False)
+        self.assertIn('Workstream service changed; review it against spec-v3', result.stderr)
+        self.assertEqual(self.manifest()['active_approval_id'], 'approve-spec-v2')
+
 
     def test_audit_mixed_fullstack(self):
         self.start(); self.exchange()

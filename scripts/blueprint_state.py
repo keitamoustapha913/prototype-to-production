@@ -359,7 +359,10 @@ class BlueprintState:
             isinstance(x, dict) and self.text(x.get('label')) and self.text(x.get('tradeoff'))
             for x in value.get('options', [])), 'Options need exact labels and tradeoffs')
         record_type = value.get('record_type', 'decision')
-        self.require(record_type in {'decision', 'recap', 'slice_detail', 'slice_consent'}, 'Unknown conversation record type')
+        self.require(record_type in {'decision', 'recap', 'review_checkpoint', 'slice_detail', 'slice_consent'},
+                     'Unknown conversation record type')
+        if record_type == 'review_checkpoint':
+            self.check_review_checkpoint(value)
         if record_type == 'slice_consent':
             self.require(transition is not None and value['phase'] == 'slice_review' and value['status'] == 'decided'
                          and not any(value.get(field) for field in ('responds_to', 'supersedes', 'report_id', 'authorized_changes')),
@@ -383,6 +386,12 @@ class BlueprintState:
             if value.get(field):
                 earlier = self.load('conversation', value[field])
                 if field == 'responds_to':
+                    if 'review_checkpoint' in {record_type, earlier.get('record_type')}:
+                        self.require(record_type == earlier.get('record_type')
+                                     and all(value.get(key) == earlier.get(key)
+                                             for key in ('review_step', 'review_target', 'review_version',
+                                                         'review_workstream', 'phase')),
+                                     'Answer must address the same review checkpoint')
                     self.require(earlier['status'] in {'open', 'proposed'}
                                  and value['status'] in {'decided', 'rejected'},
                                  'An answer must link an open question and contain the actual response')
@@ -434,6 +443,71 @@ class BlueprintState:
         if transition is None:
             self.persist()
 
+    def check_review_checkpoint(self, value):
+        step = value.get('review_step')
+        self.require((step, value['phase']) in (('discovery', 'discover'), ('roadmap', 'plan'),
+                                                ('workstream', 'blueprint'))
+                     and self.text(value.get('review_target')),
+                     'Review checkpoint needs the displayed stage and review target')
+        self.require(not any(key in value for key in ('authorized_changes', 'protected_visual_decisions',
+                                                     'report_id', 'supersedes')),
+                     'Review checkpoints record presentation and pacing only; record design decisions separately')
+        if self.manifest.get('guided_design_review'):
+            version = value.get('review_version')
+            self.require(self.identifier(version), 'Review checkpoint needs the exact audit, roadmap or blueprint version')
+            if step == 'workstream':
+                spec = self.load('blueprints', version)
+                plan = self.load('blueprint_plans', spec['plan_version'])
+                self.require(value.get('review_workstream') in plan['workstreams'],
+                             'Review checkpoint must name an exact roadmap workstream')
+                feature_ids = {feature['feature_id'] for feature in spec['features']}
+                self.require(value.get('feature_ids') and set(value['feature_ids']) <= feature_ids,
+                             'Workstream checkpoint needs the blueprint feature IDs shown or waived')
+        action = value.get('review_action')
+        if value['status'] == 'open':
+            self.require(not action and not value.get('responds_to') and self.strings(value.get('evidence_paths')),
+                         'Open review checkpoint needs the actual terminal presentation as evidence')
+            self.markdown(value['evidence_paths'])
+            if step == 'workstream':
+                self.require(not any(record.get('review_step') == 'workstream' for record in self.pending()),
+                             'Resolve the current workstream before opening another walkthrough')
+            return
+        actions = ('continue', 'skip', 'revisit', 'revise') if step == 'workstream' else ('confirm', 'skip', 'revise')
+        self.require(value['status'] == 'decided' and action in actions,
+                     'Record the actual reply and an applicable review action')
+        if not value.get('responds_to'):
+            self.require(action == 'skip', 'Only an explicit scoped waiver can be recorded without an open checkpoint')
+            self.markdown(value.get('evidence_paths'))
+        if step == 'workstream':
+            reply = ' '.join(value['response'].casefold().strip().rstrip('.!').split())
+            self.require(reply not in {'correct', 'looks good', 'i understand', 'yes', 'ok', 'okay', 'agreed'},
+                         'Acknowledgment leaves the workstream open; wait for explicit navigation or correction')
+            if action in {'continue', 'skip'}:
+                self.require(all(record['exchange_id'] == value.get('responds_to') for record in self.pending()),
+                             'Resolve outstanding design questions before advancing the workstream review')
+
+    def review_answers(self, step):
+        return [record for record in self.conversations()
+                if record.get('record_type') == 'review_checkpoint'
+                and record.get('review_step') == step and record['status'] == 'decided']
+
+    def review_exchange_hashes(self, answers):
+        hashes = {}
+        for answer in answers:
+            if answer.get('responds_to'):
+                hashes.update(self.bound_hashes('conversation', answer['responds_to']))
+            hashes.update(self.bound_hashes('conversation', answer['exchange_id']))
+        return hashes
+
+    def stage_review_hashes(self, step, version):
+        if not self.manifest.get('guided_design_review'):
+            return {}
+        answer = next((record for record in reversed(self.review_answers(step))
+                       if record['review_version'] == version), None)
+        self.require(answer and answer['review_action'] in {'confirm', 'skip'},
+                     f'Complete the {step} terminal review for {version} before freezing it')
+        return self.review_exchange_hashes([answer])
+
     def traceability(self):
         usage = {key: {'plan_ids': [], 'blueprint_ids': [], 'slice_ids': []}
                  for key in self.manifest.get('conversation', {})}
@@ -460,7 +534,13 @@ class BlueprintState:
         return usage, [{**row, 'slice_ids': feature_slices.get(row['feature_id'], [])} for row in coverage]
 
     def record_discovery(self, project_root, candidate):
+        self.require(not any(record.get('review_step') == 'discovery'
+                             and record.get('record_type') == 'review_checkpoint' for record in self.pending()),
+                     'Resolve the discovery review checkpoint before freezing the baseline')
         self.require(candidate.get('scope') == self.manifest['scope'], 'Discovery scope must match initiative')
+        self.require(self.identifier(candidate.get('audit_id')), 'Stable audit ID required')
+        audit_id = candidate['audit_id']
+        review_hashes = self.stage_review_hashes('discovery', audit_id)
         kind, surface = candidate.get('baseline_kind'), candidate.get('surface')
         self.require(kind in {'existing','greenfield'} and surface in {'ui','backend','fullstack'},
                      'Blueprint discovery requires baseline_kind and surface')
@@ -550,8 +630,7 @@ class BlueprintState:
                                          historical=requirement in prior_requirements))
             ids.append(key)
 
-        self.require(self.identifier(candidate.get('audit_id')), 'Stable audit ID required')
-        audit_id = candidate['audit_id']
+        hashes.update(review_hashes)
         registry = self.manifest.setdefault('discovery_audits', {})
         relative = f'discovery/audits/{audit_id}.json'
         self.require(audit_id not in registry, 'Discovery already exists')
@@ -598,7 +677,7 @@ class BlueprintState:
                 self.manifest['blockers'] = [b for b in self.manifest.get('blockers', [])
                     if not b.startswith('Missing application-A functionality reported:')]
         self.manifest['stage'] = 'plan'
-        self.manifest['next_action'] = 'Discuss the roadmap, then record a new blueprint; preserve prior approvals'
+        self.manifest['next_action'] = 'Present and discuss the proposed roadmap in the terminal before freezing it'
         self.persist()
 
     def check_browser_setup(self, setup):
@@ -868,14 +947,15 @@ class BlueprintState:
         self.require(not self.pending(), "Roadmap is waiting on a consequential question")
         self.require(value.get('scope') == self.manifest['scope'] and self.text(value.get('objective')),
                      'Plan requires initiative scope and objective')
+        self.require(self.identifier(value.get('version')), 'Roadmap requires a stable version')
         for field in ('workstreams','dependencies','risks'):
             self.require(self.strings(value.get(field), nonempty=field == 'workstreams'), f'Plan requires concrete {field}')
         hashes = self.baseline_hashes(value.get('baseline_id'))
+        hashes.update(self.stage_review_hashes('roadmap', value['version']))
         hashes.update(self.decisions(value.get('decision_ids'), allow_empty=True))
         self.require_applicable_decisions({**value, 'features': []})
         markdown_hashes, documents = self.markdown(value.get('document_paths'))
         self.check_roadmap(documents)
-        self.require(self.identifier(value.get('version')), 'Roadmap requires a stable version')
         expected_navigation = f"plans/{value['version']}/blueprints/index.md"
         navigation = value.get('blueprint_index_path', expected_navigation)
         self.require(navigation == expected_navigation and navigation not in documents,
@@ -889,7 +969,7 @@ class BlueprintState:
                     {**value, 'blueprint_index_path': navigation, 'index_from_plan': True}, hashes)
         self.write_plan_blueprint_index(value['version'])
         self.manifest['stage'] = 'blueprint'
-        self.manifest['next_action'] = 'Discuss detailed anatomy, state and API contracts; freeze a complete blueprint'
+        self.manifest['next_action'] = 'Prepare the blueprint, then guide the terminal review one workstream at a time'
         self.persist()
 
     def check_roadmap(self, documents):
@@ -1213,8 +1293,39 @@ class BlueprintState:
         self.require(pairs == {(baseline_id, f['feature_id']) for f in features.values() for baseline_id in f['baseline_ids']},
                      'Every blueprint feature/baseline pair needs coverage')
         self.freeze('blueprint_coverage', value['version'], value, hashes)
-        self.manifest['next_action'] = 'Show exact blueprint, decision recap and coverage; wait for explicit user approval'
+        self.manifest['next_action'] = ('Finish the workstream walkthrough and consistency check before showing the '
+                                        'exact blueprint, decision recap and coverage for formal approval')
         self.persist()
+
+    def completed_workstream_reviews(self, spec, plan):
+        versions = self.manifest['blueprints']
+        current_sequence = versions[spec['version']]['sequence']
+        features = {feature['feature_id']: feature for feature in spec['features']}
+        latest = {}
+        for answer in self.review_answers('workstream'):
+            version = answer['review_version']
+            if versions[version]['sequence'] > current_sequence:
+                continue
+            earlier = self.load('blueprints', version)
+            if earlier['baseline_id'] == spec['baseline_id'] and answer['review_workstream'] in plan['workstreams']:
+                latest[answer['review_workstream']] = (answer, earlier)
+        completed, covered = [], set()
+        for name in plan['workstreams']:
+            self.require(name in latest, f'Finish the terminal walkthrough or record an explicit skip for {name}')
+            answer, earlier = latest[name]
+            self.require(answer['review_action'] in {'continue', 'skip'},
+                         f'Finish the terminal walkthrough or record an explicit skip for {name}')
+            scope = set(answer['feature_ids'])
+            # Generated document paths move with the version. The reviewed feature contracts must still match.
+            prior = {feature['feature_id']: {k: v for k, v in feature.items() if k != 'spec_paths'}
+                     for feature in earlier['features'] if feature['feature_id'] in scope}
+            current = {key: {k: v for k, v in features[key].items() if k != 'spec_paths'}
+                       for key in scope & features.keys()}
+            self.require(current == prior, f'Workstream {name} changed; review it against {spec["version"]}')
+            covered.update(scope)
+            completed.append(answer)
+        self.require(covered == features.keys(), 'Workstream reviews must cover every blueprint feature')
+        return completed
 
     def approval_presentation_hashes(self, value, spec):
         recap = value.get('decision_recap_path')
@@ -1228,7 +1339,15 @@ class BlueprintState:
         shown = value.get('shown_paths')
         self.require(self.strings(shown) and required | {coverage, recap} <= set(shown),
                      'Approval must name the displayed index, feature specs, exact coverage record and decision recap')
-        return self.hashes(shown)
+        hashes = self.hashes(shown)
+        if 'workstream_review_ids' in value:
+            report = value.get('workstream_consistency_path')
+            self.require(self.text(report) and report in shown and report not in required | {coverage, recap},
+                         'Approval must include the displayed cross-workstream consistency report')
+            self.markdown([report])
+            answers = [self.load('conversation', key) for key in value['workstream_review_ids']]
+            hashes.update(self.review_exchange_hashes(answers))
+        return hashes
 
     def validate_approval(self, value):
         self.require_ready()
@@ -1260,6 +1379,11 @@ class BlueprintState:
         for feature in spec['features']:
             self.check_test_sources(feature, feature['implementation_paths'])
         plan = self.load('blueprint_plans', spec['plan_version'])
+        if self.manifest.get('guided_design_review'):
+            answers = self.completed_workstream_reviews(spec, plan)
+            value = {**value, 'workstream_review_ids': [answer['exchange_id'] for answer in answers]}
+        else:
+            value = {key: item for key, item in value.items() if key != 'workstream_review_ids'}
         _, documents = self.markdown(plan['document_paths'])
         self.check_roadmap(documents)
         self.check_baseline_before_delivery()
@@ -1859,7 +1983,7 @@ class BlueprintState:
         authorizations = {}
         for record in records:
             if (record['status'] != 'decided' or record['exchange_id'] in superseded
-                    or record.get('report_id') or record.get('record_type') in {'recap', 'slice_detail', 'slice_consent'}):
+                    or record.get('report_id') or record.get('record_type', 'decision') != 'decision'):
                 continue
             ids = set(record.get('feature_ids', []) + record.get('requirement_ids', []))
             if not ids or ids & scope:
