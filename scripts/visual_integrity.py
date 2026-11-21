@@ -293,6 +293,24 @@ def capture_case(directory, slice_id, request):
         raise VisualIntegrityError("Capture the approved viewport")
     if not render.get("ready_selector", "").strip():
         raise VisualIntegrityError("Supply a visible component selector")
+    case, evidence = browser_case(directory, slice_id, state, request, render, observed_state,
+                                  case_id, build, checks, locked_criteria)
+    if case_id not in approved_cases:
+        case["based_on"] = request["based_on"]
+    with project_state.coordinator_lock(directory):
+        current = project_state.manifest_at(directory)
+        project_state.visual_inspection_assignment(directory, current, slice_id)
+        if result_fingerprint(directory, current, slice_id) != fingerprint:
+            raise VisualIntegrityError("Implementation changed during browser capture")
+        receipt = {"case": case, "result_fingerprint": fingerprint, "build": build["fingerprint"],
+                   **evidence, "captured_at": datetime.now(timezone.utc).isoformat()}
+        current["slices"][slice_id].setdefault("visual_captures", {})[case["capture_id"]] = receipt
+        project_state.atomic_json(directory / "manifest.json", current)
+    return case
+
+
+def browser_case(directory, slice_id, state, request, render, observed_state, case_id, build, checks, locked_criteria):
+    """Capture a selected application state and return its browser receipt."""
     state.check_browser_setup(render.get("setup", []))
     if "command" in render:
         state.argv(render["command"])
@@ -343,22 +361,10 @@ def capture_case(directory, slice_id, request):
                 "blueprint_measurements": blueprint_measurements,
                 "harness": render.get("command"), "interaction_assertions": outcomes,
             }
-        if case_id not in approved_cases:
-            case["based_on"] = request["based_on"]
     _check_closeup(directory, case)
-    with project_state.coordinator_lock(directory):
-        current = project_state.manifest_at(directory)
-        project_state.visual_inspection_assignment(directory, current, slice_id)
-        if result_fingerprint(directory, current, slice_id) != fingerprint:
-            raise VisualIntegrityError("Implementation changed during browser capture")
-        receipt = {"case": case, "result_fingerprint": fingerprint, "build": build["fingerprint"],
-                   "served": measured["buildEvidence"], "url": measured["url"], "component": measured["component"],
-                   "identities": measured.get("identities", {}), "setup": render.get("setup", []),
-                   "checks": checks, "measurements": actual,
-                   "harness": render.get("command"), "captured_at": datetime.now(timezone.utc).isoformat()}
-        current["slices"][slice_id].setdefault("visual_captures", {})[capture_id] = receipt
-        project_state.atomic_json(directory / "manifest.json", current)
-    return case
+    return case, {"served": measured["buildEvidence"], "url": measured["url"], "component": measured["component"],
+                  "identities": measured.get("identities", {}), "setup": render.get("setup", []),
+                  "checks": checks, "measurements": actual, "harness": render.get("command")}
 
 
 def _require_capture(manifest, slice_id, fingerprint, case):

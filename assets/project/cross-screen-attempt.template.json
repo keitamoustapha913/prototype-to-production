@@ -1,0 +1,16 @@
+{
+  "change_id": "dropdown-layout",
+  "cases": [
+    {
+      "case_id": "settings-keyboard-narrow",
+      "capture_id": "<after capture ID>",
+      "protected_decision_ids": [],
+      "checks": {
+        "visual": {"result": "pass", "note": "The full screen and close-up show the dropdown fits without covering the adjacent control"},
+        "interaction": {"result": "pass", "note": "Tab and Enter opened the dropdown and the selected option received focus"},
+        "blueprint": {"result": "pass", "note": "The existing spacing and interaction match the approved requirements"}
+      }
+    }
+  ],
+  "findings": []
+}

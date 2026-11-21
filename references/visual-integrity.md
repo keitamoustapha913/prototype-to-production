@@ -2,6 +2,8 @@
 
 Run this gate after implementing each UI-changing slice and before accepting it. During blueprint and slice discussions, edit the illustration in the living viewer. Start the application and collect screenshot evidence when verifying the implemented UI.
 
+For shared UI changes, begin [Cross-Screen Visual Regression Protection](cross-screen-regression.md) before editing. Its original-change group contains the affected routes, baseline captures, comparisons and results. It also applies when a slice-local correction changes shared source.
+
 ## Choose adaptive coverage
 
 1. Read the locked blueprint, slice guide, relevant A+ history and protected decisions. Inventory the changed component types and map each to its relevant states, interactions and widths. Include every approved render case, assigned UI acceptance check and protected decision. Use existing application tokens and neighboring components as defaults for unspecified properties.

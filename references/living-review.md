@@ -11,6 +11,8 @@ python3 scripts/project_state.py review-revision --project-root /path/to/app --i
 
 Open the loopback URL printed by the first command. Each initiative uses a stable default port so reopening the URL restores the browser position. Supply a consistent alternate `--port` if the default is occupied. Install the local rendering libraries once with `npm ci`. Raster approval checks use Pillow from `python3 -m pip install -r requirements.txt`. The second command saves the current revision even when the browser is closed and prints full source-root and section information, exact approval hashes and the consolidated impact. Give the user the absolute paths to the edited documents.
 
+Cross-screen inspections appear in **Visual Review Register** grouped by the original shared-component change. Filter by an affected slice or search by route, change ID or finding. Expand each state for original and updated captures, marked image regions, browser results and outstanding warnings. [Cross-Screen Visual Regression Protection](cross-screen-regression.md)
+
 For implemented slices, open **Visual Review Register** in this same viewer. Filter by slice or status and inspect the saved screenshots and repair history. The register is available when you reopen the initiative after delivery. Its [implementation verification workflow](visual-integrity.md) runs on the actual application.
 
 ## Register the review material

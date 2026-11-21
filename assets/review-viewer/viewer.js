@@ -606,11 +606,91 @@ function latestFindingComparison(item) {
   }
   return null;
 }
+function crossScreenCard(change) {
+  const card = el('article');
+  const status = change.current_status || change.status;
+  card.className = 'register-attempt status-' + ({verified:'clean', historical:'historical', abandoned:'historical'}[status] || 'unresolved');
+  card.append(el('h2', `${change.summary} · ${status.replaceAll('_', ' ')}`),
+    el('p', `Cross-screen change ${change.change_id} · Originating slice ${change.slice_id}`),
+    el('p', `Shared source · ${change.component_paths.join(', ')}`),
+    el('p', `Affected and dependent slices · ${change.affected_slices.join(', ')}`));
+  if (change.abandonment_reason) card.append(el('p', change.abandonment_reason));
+  const latest = change.attempts.at(-1);
+  for (const screen of change.screens) {
+    const section = el('section'); section.className = 'register-case';
+    section.append(el('h3', screen.route), el('p', screen.reason),
+      el('p', screen.slice_ids.join(', ') || 'Existing unassigned screen'));
+    for (const spec of screen.cases) {
+      const row = latest?.cases.find(item => item.case_id === spec.case_id);
+      const state = spec.state.interaction;
+      const {width, height} = spec.renderCase.viewport;
+      const detail = el('details');
+      const caseStatus = ['stale', 'evidence unavailable'].includes(status) ? 'not_verified' : row?.status || 'not_verified';
+      detail.append(el('summary', `${spec.case_id} · ${state} · ${width}×${height} · ${caseStatus.replaceAll('_', ' ')}`),
+        el('p', spec.reason), el('p', spec.expectation));
+      if (spec.approved_case) detail.append(el('p', 'Approved case · ' + spec.approved_case));
+      for (const decision of spec.protections || []) {
+        detail.append(el('p', [decision.decision_id, decision.requirement].filter(Boolean).join(' · ')));
+      }
+      const history = [...change.attempts].reverse();
+      if (!history.length && change.baseline_cases[spec.case_id]) {
+        detail.append(registerCase(change.baseline_cases[spec.case_id]));
+      }
+      for (const attempt of history) {
+        const result = attempt.cases.find(item => item.case_id === spec.case_id);
+        if (!result) continue;
+        const evidence = el('details');
+        evidence.open = attempt === latest;
+        evidence.append(el('summary', `${attempt.recorded_at} · ${result.status.replaceAll('_', ' ')}`));
+        appendCrossScreenResult(evidence, result, attempt.findings, attempt.retry_policy);
+        detail.append(evidence);
+      }
+      section.append(detail);
+    }
+    card.append(section);
+  }
+  return card;
+}
+function appendCrossScreenResult(holder, result, findings, retryPolicy) {
+  if (result.unavailable_reason) holder.append(el('p', result.unavailable_reason));
+  const checks = el('ul');
+  for (const [kind, check] of Object.entries(result.checks)) {
+    checks.append(el('li', `${kind} · ${check.result.replaceAll('_', ' ')} · ${check.note}`));
+  }
+  holder.append(checks);
+  for (const finding of findings.filter(item => item.case_id === result.case_id)) {
+    holder.append(el('h4', `${finding.finding_id} · ${finding.severity} · ${finding.status}`), el('p', finding.description));
+    appendFindingNotes(holder, finding);
+    if (retryPolicy?.automatic_repair_stopped?.includes(finding.finding_id)) {
+      holder.append(el('p', 'Automatic retries stopped. Record a new diagnosis to resume repair.'));
+    }
+  }
+  for (const [index, comparison] of result.comparisons.entries()) {
+    holder.append(el('h4', `${index === 0 ? 'Full screen' : 'Component'} · ${comparison.pixels_changed ? 'Changed pixels marked' : 'Identical pixels'}`));
+    const grid = el('div'); grid.className = 'register-shot-grid register-comparison';
+    grid.append(registerImage(comparison.before, 'Original', comparison.normalized_rect),
+      registerImage(comparison.latest, 'Updated', comparison.normalized_rect));
+    holder.append(grid);
+    if (comparison.annotated_before) holder.append(annotatedEvidenceLinks(comparison));
+  }
+  for (const [label, capture, build] of [['Original capture', result.before, result.before_build],
+    ['Updated capture', result.after, result.after_build]]) {
+    if (!capture) continue;
+    const evidence = el('details');
+    evidence.append(el('summary', label));
+    if (build) evidence.append(el('p', 'Served build · ' + build));
+    if (!result.comparisons.length) evidence.append(registerCase(capture));
+    else evidence.append(el('pre', JSON.stringify({context:capture.state, ...capture.browser_evidence}, null, 2)));
+    holder.append(evidence);
+  }
+}
 function renderVisualRegister(attempts = registerAttempts) {
   const entries = $('register-entries');
   const statusFilter = $('register-status').value;
   const search = $('register-search').value.trim().toLowerCase();
-  const slices = [...new Set(attempts.map(a => a.slice_id).filter(x => typeof x === 'string'))].sort();
+  const changes = registerMetadata.cross_screen_changes || [];
+  const slices = [...new Set([...attempts.map(a => a.slice_id),
+    ...changes.flatMap(change => change.affected_slices)].filter(x => typeof x === 'string'))].sort();
   const select = $('register-slice');
   const selectedSlice = select.value;
   const allSlices = el('option', 'All slices'); allSlices.value = '';
@@ -620,7 +700,7 @@ function renderVisualRegister(attempts = registerAttempts) {
   const summary = summarizeVisualRegister(attempts, registerMetadata.slices);
   const openCount = summary.findings.filter(f => f.status === 'open').length;
   const correctedCount = summary.findings.filter(f => f.status === 'corrected').length;
-  $('register-counts').textContent = `${attempts.length} attempts · ${summary.cleanAttempts.length} clean evidence records · ${summary.findings.length} distinct findings (${openCount} open, ${correctedCount} corrected) · ${slices.length} slices`;
+  $('register-counts').textContent = `${attempts.length} attempts · ${summary.cleanAttempts.length} clean evidence records · ${summary.findings.length} distinct findings (${openCount} open, ${correctedCount} corrected) · ${slices.length} slices${changes.length ? ` · ${changes.length} cross-screen changes` : ''}`;
   const projectStatus = $('register-project-status');
   projectStatus.replaceChildren();
   for (const warning of registerMetadata.history_warnings || []) {
@@ -647,7 +727,20 @@ function renderVisualRegister(attempts = registerAttempts) {
       : attemptText(entry.value).includes(search))));
   const visible = candidates.reverse();
   entries.replaceChildren();
-  if (!visible.length) { entries.append(el('p', 'No current findings or clean evidence match these filters.')); return; }
+  const matches = changes.filter(change => {
+    if (select.value && !change.affected_slices.includes(select.value)) return false;
+    if (search && !JSON.stringify(change).toLowerCase().includes(search)) return false;
+    const findings = change.attempts.flatMap(attempt => attempt.findings);
+    const latestFindings = change.attempts.at(-1)?.findings || [];
+    const status = change.current_status || change.status;
+    return !statusFilter || (statusFilter === 'open' && !['verified','abandoned','historical'].includes(status)) ||
+      (statusFilter === 'clean' && status === 'verified' && !findings.some(finding => finding.status === 'fixed')) ||
+      (statusFilter === 'corrected' && status === 'verified' && findings.some(finding => finding.status === 'fixed')) ||
+      (statusFilter === 'improved' && latestFindings.some(finding => finding.status === 'improved')) ||
+      (statusFilter === 'noted' && findings.some(finding => finding.status === 'noted'));
+  });
+  for (const change of matches.reverse()) entries.append(crossScreenCard(change));
+  if (!visible.length && !matches.length) { entries.append(el('p', 'No current findings or clean evidence match these filters.')); return; }
   for (const entry of visible) {
     if (entry.kind !== 'finding') {
       const attempt = entry.value;
@@ -717,7 +810,7 @@ async function loadVisualRegister() {
   const response = await read('/visual-integrity');
   const result = await response.json();
   registerAttempts = Array.isArray(result) ? result : result.attempts || [];
-  registerMetadata = result.project || {};
+  registerMetadata = {...result.project, cross_screen_changes: result.cross_screen_changes || []};
   renderVisualRegister();
 }
 function mergeState(previous, delta) {

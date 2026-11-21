@@ -27,8 +27,8 @@ The utility locks the contract's hash. Alterations after dispatch invalidate rec
 
 1. Run `resume` and `validate`; read the slice packet, locked prototype source/reference pixels, executable fixture setup and replay proof; compare current Git and user modifications. If ignored state is absent in your worktree or the approval is stale, **stop**.
 2. Work only inside `allowed_paths`; if the real app requires a shared component or another file, request a coordinator-owned prerequisite, do not reach across ownership boundaries.
-3. Implement current behavior end-to-end while reusing prototype markup/tokens. Preserve unrelated code changes. Run relevant behavior checks and capture visual evidence at every specified case.
-4. Write a worker JSON file with `slice_id`, `owner`, `status` (`submitted` or `blocked`), `summary`, `implementation_paths`, `source_revision`, `functional_evidence`, `visual_evidence`, `blockers` and `next_action`.
+3. Trace the consumers of shared UI source before editing it. Run the [cross-screen regression workflow](cross-screen-regression.md) for affected routes and slices. Implement current behavior end-to-end while reusing prototype markup and tokens. Run relevant behavior checks and capture each required case.
+4. Write a worker JSON file with `slice_id`, `owner`, `status` (`submitted` or `blocked`), `summary`, `implementation_paths`, `shared_ui_paths` (empty after checking a local change), `source_revision`, `functional_evidence`, `visual_evidence`, `blockers` and `next_action`.
 5. Run `slice-report --slice-id ... --owner ... --report-file ...`; this writes only within your slice directory. **Never** directly edit global approval, manifest, or checkpoint files.
 6. The coordinator runs `reconcile --action report`, inspects the worker's code and evidence, then separately accepts or rejects according to the visual verification gate. A submitted report is not acceptance.
 

@@ -1419,6 +1419,8 @@ class BlueprintState:
         paths, deps = packet['allowed_paths'], packet['dependencies']
         for dependency_id in deps:
             dependency = self.manifest['slices'][dependency_id]
+            if dependency.get('status') == 'accepted':
+                self.api.require_cross_screen(self.directory, self.manifest, dependency_id)
             if dependency.get('status') == 'accepted' and dependency.get('visual_integrity_required'):
                 self.api.require_visual_integrity(self.directory, self.manifest, dependency_id)
         waiting = [dep for dep in deps if self.manifest['slices'][dep]['status'] != 'accepted']
@@ -1861,6 +1863,8 @@ class BlueprintState:
                      + ', '.join(sorted(applicable-bound)))
 
     def all_accepted(self):
+        if self.api.cross_screen_blockers(self.directory, self.manifest):
+            return False
         active = self.manifest.get('active_approval_id')
         if not active:
             return False

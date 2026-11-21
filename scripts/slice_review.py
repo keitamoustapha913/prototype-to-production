@@ -1642,6 +1642,7 @@ class SliceReview:
                          f'{slice_id}: release and accept locked dependencies first ({key})')
             errors = self.blueprint.check_saved_verification(key, assignment)
             self.require(not errors, f'{slice_id}: accepted dependency {key} is stale: ' + '; '.join(errors))
+            self.blueprint.api.require_cross_screen(self.blueprint.directory, self.manifest, key)
             if assignment.get('visual_integrity_required'):
                 self.blueprint.api.require_visual_integrity(self.blueprint.directory,
                                                             self.manifest, key)
@@ -1653,6 +1654,7 @@ class SliceReview:
         key, entry, package = self.require_execution(value=value)
         slice_id = value.get('slice_id')
         self.require(isinstance(slice_id, str) and slice_id in package['slices'], f'Unknown slice in {key}: {slice_id}')
+        self.blueprint.api.require_cross_screen(self.blueprint.directory, self.manifest, slice_id)
         self.blueprint.require_ready()
         self.guard_source(self.manifest['approvals'][self.active_approval], self.authorized_paths())
         authorization = entry['authorization_path']

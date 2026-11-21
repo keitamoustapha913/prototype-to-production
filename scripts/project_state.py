@@ -66,6 +66,27 @@ def require_visual_integrity(directory: Path, manifest: dict, slice_id: str, *, 
     sibling_module("visual_integrity").require_verified(directory, manifest, slice_id, historical=historical)
 
 
+def cross_screen_blockers(directory: Path, manifest: dict, slice_id: str | None = None) -> list[str]:
+    if not manifest.get("cross_screen_changes"):
+        return []
+    return sibling_module("cross_screen").blockers(directory, manifest, slice_id)
+
+
+def cross_screen_holds_by_slice(directory: Path, manifest: dict) -> dict:
+    result = {}
+    if manifest.get("cross_screen_changes"):
+        for slice_ids, reason in sibling_module("cross_screen").holds(directory, manifest):
+            for slice_id in sorted(slice_ids):
+                result.setdefault(slice_id, []).append(reason)
+    return result
+
+
+def require_cross_screen(directory: Path, manifest: dict, slice_id: str) -> None:
+    blockers = cross_screen_blockers(directory, manifest, slice_id)
+    if blockers:
+        raise StateError("; ".join(blockers))
+
+
 def slice_has_visual_scope(directory: Path, manifest: dict, slice_id: str) -> bool:
     """Use the locked assignment to decide whether this slice changes a UI surface."""
     if initiative_mode(manifest) == "prototype":
@@ -91,6 +112,8 @@ def require_visual_integrity_if_required(directory: Path, manifest: dict, slice_
 
 def all_slices_accepted(directory: Path, manifest: dict) -> bool:
     """Return whether every active slice is accepted and its required gates remain current."""
+    if cross_screen_blockers(directory, manifest):
+        return False
     for slice_id, assignment in manifest.get("slices", {}).items():
         if assignment.get("status") != "accepted":
             return False
@@ -1251,9 +1274,12 @@ def render_checkpoint(manifest: dict, *, resume_action: str | None = None) -> st
         if item.get("superseded_by"):
             status += f", superseded by {item['superseded_by']}"
         lines.append(f"- {slice_id}: {status} ({item.get('owner', 'unassigned')})")
-    if any(item.get("visual_integrity_head") for item in manifest.get("slices", {}).values()):
+    if manifest.get("cross_screen_changes") or any(
+            item.get("visual_integrity_head") for item in manifest.get("slices", {}).values()):
         lines += ["", "## Visual Review Register", "",
                   "Open the register with review-viewer or list saved inspections with visual-integrity --action list."]
+        lines.extend(f"- Shared change {key}: {item['status']}"
+                     for key, item in sorted(manifest.get("cross_screen_changes", {}).items()))
     lines += ["", "## Functionality coverage", ""]
     lines.append(f"- Latest application-A audit: {manifest.get('active_discovery_id') or 'none'}")
     coverage_group = "blueprint_coverage" if mode == "blueprint" else "prototype_coverage"
@@ -1754,7 +1780,7 @@ def record_worker_report(directory: Path, slice_id: str, owner: str, report_file
     report = read_json(Path(report_file))
     allowed = {
         "slice_id", "owner", "status", "summary", "implementation_paths",
-        "functional_evidence", "visual_evidence", "blockers", "next_action", "source_revision",
+        "functional_evidence", "visual_evidence", "blockers", "next_action", "source_revision", "shared_ui_paths",
     }
     if set(report) - allowed:
         raise StateError("Worker reports cannot modify global approval, stage or manifest fields")
@@ -1781,6 +1807,15 @@ def record_worker_report(directory: Path, slice_id: str, owner: str, report_file
         for p in report["implementation_paths"]
     ):
         raise StateError("Implementation paths must stay within assigned ownership")
+    submitted_ui = report["status"] == "submitted" and slice_has_visual_scope(directory, manifest, slice_id)
+    if submitted_ui and "shared_ui_paths" not in report:
+        raise StateError("Submitted UI work requires shared_ui_paths. Use an empty array after checking local changes.")
+    if "shared_ui_paths" in report:
+        shared = sibling_module("cross_screen")
+        paths = shared.checked_paths(report["shared_ui_paths"])
+        if not set(paths) <= set(report["implementation_paths"]):
+            raise StateError("Shared UI paths must be included in the implementation paths")
+        shared.require_planned_paths(manifest, slice_id, paths, report["implementation_paths"])
     target = directory / "slices" / slice_id
     with coordinator_lock(target):
         journal_report = {**report, "reported_at": utc_now()}
@@ -2430,10 +2465,12 @@ def check_work_state(directory: Path, manifest: dict) -> list[str]:
     return errors
 
 
-def check_initiative(directory: Path, manifest: dict, *, allow_questions: bool = False) -> list[str]:
+def check_initiative(directory: Path, manifest: dict, *, allow_questions: bool = False,
+                     shared_holds: dict | None = None) -> list[str]:
     errors = check_approval(directory, manifest, allow_questions=allow_questions)
     errors.extend(check_coverage_records(directory, manifest))
     errors.extend(check_work_state(directory, manifest))
+    errors.extend(sibling_module("cross_screen").history_errors(directory, manifest))
     if initiative_mode(manifest) == "blueprint":
         state = blueprint_state(directory, manifest)
         errors.extend(state.check_records())
@@ -2457,7 +2494,8 @@ def check_initiative(directory: Path, manifest: dict, *, allow_questions: bool =
                 errors.append(f"Slice {slice_id}: sha256 mismatch in handoff contract")
         except (StateError, OSError, KeyError) as error:
             errors.append(str(error))
-        if assignment.get("status") in {"verified", "provisional", "accepted"}:
+        if (assignment.get("status") in {"verified", "provisional", "accepted"}
+                and slice_id not in (shared_holds or {})):
             errors.extend(check_saved_verification(directory, slice_id, assignment, manifest))
             if assignment.get("visual_integrity_required"):
                 try:
@@ -2635,7 +2673,8 @@ def reconcile_slice(directory: Path, slice_id: str, action: str, review_file: st
             raise StateError(f"Unknown slice: {slice_id}")
         if review_state and action in {"unblock", "report", "verify", "accept", "accept-warning"}:
             review_state.require_execution(slice_id)
-        errors = check_initiative(directory, manifest, allow_questions=independent_question)
+        errors = check_initiative(directory, manifest, allow_questions=independent_question,
+                                  shared_holds=cross_screen_holds_by_slice(directory, manifest))
         if assignment.get("blueprint_version", assignment.get("prototype_version")) != manifest.get("approved_version"):
             errors.append(f"Slice references superseded {initiative_mode(manifest)}; reapproval and reslicing required")
         if errors:
@@ -2646,6 +2685,8 @@ def reconcile_slice(directory: Path, slice_id: str, action: str, review_file: st
             review_cursor = {field: manifest[field] for field in ("stage", "next_action")}
         if action in {"unblock", "verify"} and VISUAL_DEFECT_BLOCKER in assignment.get("blockers", []):
             raise StateError("Visual integrity is unresolved; record the corrected browser inspection first")
+        if action in {"unblock", "verify", "accept", "accept-warning"}:
+            require_cross_screen(directory, manifest, slice_id)
         if action == "block":
             if assignment["status"] == "cancelled" or not review_file:
                 raise StateError("Blocking an active slice requires --review-file with the defect and next action")
@@ -2904,7 +2945,8 @@ def build_resume_packet(directory: Path, project_root: Path, *, delivery_slice: 
                     reconciliation.append(f"Task evidence changed since the saved step: {path}")
             except (StateError, OSError) as error:
                 reconciliation.append(f"Saved task evidence is unavailable: {path} ({error})")
-    errors = check_initiative(directory, manifest, allow_questions=independent_review_wait)
+    shared_holds = cross_screen_holds_by_slice(directory, manifest)
+    errors = check_initiative(directory, manifest, allow_questions=independent_review_wait, shared_holds=shared_holds)
     blockers = list(manifest.get("blockers", []))
     if work:
         for item in work.get("blockers", []):
@@ -2989,7 +3031,12 @@ def build_resume_packet(directory: Path, project_root: Path, *, delivery_slice: 
             and work_ready_for_delivery and not pending_questions):
         dispatchable = [key for key, status in delivery.items() if status == "ready"
                         and dependencies_satisfied(manifest, manifest["slices"][key]["dependencies"], reviewed=False)]
+    dispatchable = [key for key in dispatchable if key not in shared_holds]
+    for key in shared_holds.keys() & delivery.keys():
+        if delivery[key] != "cancelled":
+            delivery[key] = "blocked"
     return {
+        "cross_screen_blockers": shared_holds,
         "initiative_id": manifest["initiative_id"], "initiative_directory": str(directory),
         "scope": manifest["scope"], "phase": manifest["stage"],
         "initiative_mode": initiative_mode(manifest),
@@ -3058,6 +3105,9 @@ def print_resume(directory: Path, project_root: Path, *, delivery_slice: str | N
         if review["active_package"]:
             package = review["packages"][review["active_package"]]
             print(f"Package index: {package['index_path']} (hash {package['package_hash']})")
+    for slice_id, reasons in sorted(packet["cross_screen_blockers"].items()):
+        for reason in reasons:
+            print(f"- {slice_id}: {reason}")
     print(f"Current Git HEAD: {packet['git_head'] or 'unavailable (inspect code manually)'}")
     print(f"Current Git status: {packet['git_worktree_status'] or ('clean' if packet['git_worktree_status'] is not None else 'unavailable')}")
     if packet["active_work"]:
@@ -3099,7 +3149,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     for name in (
-        "init", "artifact-setup", "review-viewer", "review-revision", "visual-integrity", "event", "checkpoint", "conversation-record", "plan-record", "blueprint-record", "blueprint-coverage", "blueprint-index-rebuild", "work-update", "discovery-record", "discovery-capture", "browser-build-fingerprint", "missing-feature", "prototype-coverage", "approve", "revoke-approval", "slice-create", "slice-cancel",
+        "init", "artifact-setup", "review-viewer", "review-revision", "visual-integrity", "cross-screen", "event", "checkpoint", "conversation-record", "plan-record", "blueprint-record", "blueprint-coverage", "blueprint-index-rebuild", "work-update", "discovery-record", "discovery-capture", "browser-build-fingerprint", "missing-feature", "prototype-coverage", "approve", "revoke-approval", "slice-create", "slice-cancel",
         "slice-report", "reconcile", "warning-record", "warning-decide", "resume", "validate", *REVIEW_COMMANDS,
     ):
         sub = commands.add_parser(name)
@@ -3114,6 +3164,10 @@ def main(argv: list[str] | None = None) -> int:
             sub.add_argument("--slice-id")
             sub.add_argument("--attempt-file")
             sub.add_argument("--capture-file")
+        if name == "cross-screen":
+            sub.add_argument("--action", choices=["plan", "extend", "capture", "record", "abandon", "list"], required=True)
+            sub.add_argument("--slice-id")
+            sub.add_argument("--input-file")
         if name == "browser-build-fingerprint":
             sub.add_argument("--source-path", action="append", default=[])
         if name == "init":
@@ -3213,7 +3267,22 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 if not args.slice_id:
                     raise StateError("visual-integrity verify requires --slice-id")
-                print(json.dumps(visual.require_verified(directory, manifest_at(directory), args.slice_id), indent=2))
+                manifest = manifest_at(directory)
+                require_cross_screen(directory, manifest, args.slice_id)
+                print(json.dumps(visual.require_verified(directory, manifest, args.slice_id), indent=2))
+        elif args.command == "cross-screen":
+            shared = sibling_module("cross_screen")
+            try:
+                if args.action == "list":
+                    with coordinator_lock(directory):
+                        result = shared.review_changes(directory, manifest_at(directory))
+                else:
+                    if not args.slice_id or not args.input_file:
+                        raise StateError("cross-screen requires --slice-id and --input-file for changes")
+                    result = shared.change(directory, args.slice_id, args.action, read_json(Path(args.input_file)))
+            except shared.project_state.StateError as error:
+                raise StateError(str(error)) from error
+            print(json.dumps(result, indent=2))
         elif args.command == "artifact-setup":
             print(f"Artifact setup complete for {directory}")
         elif args.command in REVIEW_COMMANDS:

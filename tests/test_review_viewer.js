@@ -221,3 +221,37 @@ test('an unverified repair and a protected difference keep their own register ou
   const {findings} = context.summarizeVisualRegister(attempts);
   assert.deepEqual(Array.from(findings, item => item.status), ['improved', 'noted']);
 });
+
+test('cross-screen evidence is grouped by the change and searchable from a consuming slice', () => {
+  const checks = Object.fromEntries(['visual','interaction','blueprint']
+    .map(kind => [kind,{result:'not_checked',note:'Fixture unavailable'}]));
+  context.sharedChanges = [{
+    change_id:'shared-dropdown', summary:'Correct dropdown spacing', slice_id:'erp-slice', status:'unresolved',
+    component_paths:['src/Dropdown.tsx'], affected_slices:['erp-slice','settings-slice'],
+    screens:[{route:'/settings', reason:'Imports the shared dropdown', slice_ids:['settings-slice'], cases:[{
+      case_id:'keyboard', state:{interaction:'open by keyboard'}, renderCase:{viewport:{width:390,height:844}},
+      reason:'Narrow keyboard interaction', expectation:'Focus stays with the menu'
+    }]}], baseline_cases:{}, attempts:[{recorded_at:'2026-11-21', findings:[], cases:[
+      {case_id:'keyboard',status:'not_verified',checks,unavailable_reason:'Settings fixture unavailable',comparisons:[]}
+    ]}]
+  }];
+  vm.runInContext("registerMetadata = {cross_screen_changes: sharedChanges}; $('register-slice').value = ''; $('register-status').value = 'open'; $('register-search').value = ''; renderVisualRegister([]);",context);
+  const select = dom.window.document.getElementById('register-slice');
+  select.value = 'settings-slice';
+  vm.runInContext("renderVisualRegister([]);",context);
+  const content = dom.window.document.getElementById('register-entries').textContent;
+  assert.match(content,/Correct dropdown spacing · unresolved/);
+  assert.match(content,/shared-dropdown · Originating slice erp-slice/);
+  assert.match(content,/\/settings/);
+  assert.match(content,/not verified/);
+  assert.match(content,/Settings fixture unavailable/);
+  const change = context.sharedChanges[0];
+  change.current_status = 'stale';
+  change.attempts[0].cases[0].status = 'verified';
+  vm.runInContext("renderVisualRegister([]);",context);
+  const register = dom.window.document.getElementById('register-entries');
+  const [caseSummary, attemptSummary] = register.querySelectorAll('summary');
+  assert.match(caseSummary.textContent,/not verified/);
+  assert.match(attemptSummary.textContent,/2026-11-21 · verified/);
+  vm.runInContext("registerMetadata = {}; $('register-status').value = '';",context);
+});

@@ -496,7 +496,7 @@ document.getElementById('observation').textContent = JSON.stringify({
 
         page.write_text(page.read_text().replace('gap:12px', 'gap:16px'))
         report = {'slice_id': 'items-slice', 'owner': 'builder', 'status': 'submitted',
-                  'summary': 'Adjust grid spacing', 'implementation_paths': ['src/items.html']}
+                  'summary': 'Adjust grid spacing', 'implementation_paths': ['src/items.html'], 'shared_ui_paths': []}
         self.cli('slice-report', '--slice-id', 'items-slice', '--owner', 'builder',
                  '--report-file', self.payload('report', report))
         self.cli('reconcile', '--slice-id', 'items-slice', '--action', 'report')
@@ -2523,7 +2523,7 @@ document.getElementById('observation').textContent = JSON.stringify({
             packet['functional_tests'].append('items-behavior')
         self.cli('slice-create','--contract-file',self.payload('slice',packet))
         report={'slice_id':'items-slice','owner':'builder','status':'submitted','summary':'Implemented item access',
-            'implementation_paths':['src/service.py'],'functional_evidence':['API tests'],
+            'implementation_paths':['src/service.py'],'functional_evidence':['API tests'], 'shared_ui_paths':[],
             'visual_evidence':[], 'blockers':[], 'next_action':'Independent review'}
         self.cli('slice-report','--slice-id','items-slice','--owner','builder','--report-file',self.payload('report',report))
         self.cli('reconcile','--slice-id','items-slice','--action','report')
@@ -2977,7 +2977,7 @@ print(json.dumps(output))
         path = self.root / 'src/items.html'
         path.write_text(original.replace('<button id="admin-delete" hidden>Delete item</button>', ''))
         report = {'slice_id': 'items-slice', 'owner': 'builder', 'status': 'submitted', 'summary': 'Render items',
-                  'implementation_paths': ['src/items.html'], 'next_action': 'Independent review'}
+                  'implementation_paths': ['src/items.html'], 'shared_ui_paths': [], 'next_action': 'Independent review'}
         self.cli('slice-report', '--slice-id', 'items-slice', '--owner', 'builder',
                  '--report-file', self.payload('report', report))
         self.cli('reconcile', '--slice-id', 'items-slice', '--action', 'report')
@@ -3606,7 +3606,7 @@ print(json.dumps(output))
         self.cli('approve','--approval-file',self.payload('approval',self.approval()))
         packet=self.slice();packet['functional_tests']=['items-access','items-behavior','success-visibility']
         self.cli('slice-create','--contract-file',self.payload('slice',packet))
-        report={'slice_id':'items-slice','owner':'builder','status':'submitted','summary':'Implemented states',
+        report={'slice_id':'items-slice','owner':'builder','status':'submitted','summary':'Implemented states', 'shared_ui_paths':[],
             'implementation_paths':['src/service.py'],'functional_evidence':[], 'visual_evidence':[],
             'blockers':[], 'next_action':'Review'}
         self.cli('slice-report','--slice-id','items-slice','--owner','builder','--report-file',self.payload('report',report))

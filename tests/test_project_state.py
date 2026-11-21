@@ -260,7 +260,7 @@ class ProjectStateTests(unittest.TestCase):
         report = {
             "slice_id": "invoice-list", "owner": "agent-1", "status": "submitted",
             "summary": "Implemented the invoice flow", "implementation_paths": ["src/features/invoices/table.tsx"],
-            "functional_evidence": ["npm run test:billing"], "visual_evidence": [],
+            "functional_evidence": ["npm run test:billing"], "visual_evidence": [], "shared_ui_paths": [],
             "blockers": [], "next_action": "Independent verification",
         }
         self.cli("slice-report", "--slice-id", "invoice-list", "--owner", "agent-1",
@@ -1110,7 +1110,7 @@ class ProjectStateTests(unittest.TestCase):
         report = {
             "slice_id": "invoice-list", "owner": "agent-1", "status": "submitted",
             "summary": "Implemented invoice table", "implementation_paths": ["src/features/invoices/table.tsx"],
-            "functional_evidence": ["pytest invoices: PASS"], "visual_evidence": [],
+            "functional_evidence": ["pytest invoices: PASS"], "visual_evidence": [], "shared_ui_paths": [],
             "blockers": [], "next_action": "Coordinator visual review",
         }
         report_file = self.write_input("worker.json", report)

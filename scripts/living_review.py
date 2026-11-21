@@ -810,20 +810,25 @@ def serve(root, port):
                         data, kind = row[0], 'application/octet-stream'
                     elif route == '/visual-integrity':
                         try:
-                            from scripts import project_state, visual_integrity
+                            from scripts import cross_screen, project_state, visual_integrity
                         except ModuleNotFoundError:
+                            import cross_screen
                             import project_state
                             import visual_integrity
                         warnings = []
                         with project_state.coordinator_lock(root):
                             manifest = json.loads(local(root, 'manifest.json').read_bytes())
                             records = visual_integrity.list_attempts(root, manifest=manifest, warnings=warnings)
+                            warnings.extend(cross_screen.history_errors(root, manifest))
+                            cross_screen_changes = cross_screen.review_changes(root, manifest)
                         dispatchable = set()
                         next_action = manifest.get('next_action')
+                        shared_blockers = {}
                         if manifest.get('slices'):
                             try:
                                 packet = project_state.build_resume_packet(root, root.parents[2])
                                 dispatchable.update(packet['dispatchable_slices'])
+                                shared_blockers = packet['cross_screen_blockers']
                                 next_action = packet['next_action']
                             except (project_state.StateError, OSError, ValueError, KeyError) as exc:
                                 next_action = f'Cannot determine dispatchable slices: {exc}'
@@ -831,13 +836,13 @@ def serve(root, port):
                         for slice_id, assignment in manifest.get('slices', {}).items():
                             dependencies = assignment.get('dependencies', []) if isinstance(assignment, dict) else []
                             slices[slice_id] = {
-                                'status': assignment.get('status'),
+                                'status': 'blocked' if slice_id in shared_blockers else assignment.get('status'),
                                 'superseded_by': assignment.get('superseded_by'),
-                                'blockers': assignment.get('blockers', []),
+                                'blockers': assignment.get('blockers', []) + shared_blockers.get(slice_id, []),
                                 'dependencies': dependencies,
                                 'independent': slice_id in dispatchable,
                             }
-                        data, kind = encode({'attempts': records, 'project': {
+                        data, kind = encode({'attempts': records, 'cross_screen_changes': cross_screen_changes, 'project': {
                             'next_action': next_action, 'stage': manifest.get('stage'), 'slices': slices,
                             'history_warnings': warnings,
                         }}), 'application/json'

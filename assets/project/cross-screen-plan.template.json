@@ -1,0 +1,40 @@
+{
+  "change_id": "dropdown-layout",
+  "summary": "Correct the shared dropdown spacing",
+  "component_paths": ["src/ui/Dropdown.tsx"],
+  "screens": [
+    {
+      "route": "/settings",
+      "reason": "The Settings form renders the dropdown inside a two-column group of fields",
+      "slice_ids": ["settings-slice"],
+      "source_paths": ["src/settings/Form.tsx"],
+      "cases": [
+        {
+          "case_id": "settings-keyboard-narrow",
+          "reason": "Keyboard opening at the narrow breakpoint exercises space and focus",
+          "expectation": "The choices are visible without covering the adjacent control and focus moves to the selected option",
+          "state": {
+            "route": "/settings",
+            "theme": "light",
+            "data": "Settings fixture with a saved preference",
+            "interaction": "open by keyboard",
+            "active_control": "saved preference option",
+            "open_menus": ["preference options"]
+          },
+          "renderCase": {
+            "route": "/settings",
+            "viewport": {"width": 390, "height": 844},
+            "ready_selector": "[data-testid='preference-field']",
+            "setup": [
+              {"action": "press", "key": "Tab"},
+              {"action": "press", "key": "Enter"}
+            ]
+          },
+          "interaction_assertions": [
+            {"selector": "[data-testid='saved-option']", "probe": "focused", "expected": true}
+          ]
+        }
+      ]
+    }
+  ]
+}
