@@ -24,10 +24,11 @@ flowchart TD
     D1 -->|Clear| R1{Independent review required?}
     R1 -->|Yes| R2[Fresh agent traces the candidate and its references]
     R2 -->|Gap found| H1
-    R2 -->|Ready| I[Show readiness, explain and discuss the slice]
+    R2 -->|Ready| I[Show readiness and walk through the slice in the terminal]
     R1 -->|Coordinator evidence is sufficient| I
     I -->|Correction| H1
-    I -->|User confirms| I1{More slices?}
+    I -->|Coverage and comprehension verified| I0[Request approval of the exact revision]
+    I0 -->|User approves| I1{More slices?}
     I1 -->|Yes| I2[Wait for explicit instruction to continue]
     I2 -->|User continues| H
     I1 -->|All reviewed| J[Run final cross-slice and handoff validation]
@@ -86,11 +87,35 @@ Attach a walkthrough JSON record. Use `record_type: independent_no_code_walkthro
 
 ## Review one slice at a time
 
-1. Present the saved readiness summary from `resume` or the register. Then explain in plain language what exists today, what the slice will deliver, how to implement it, which source paths and symbols it affects, and how completion will be verified. Show a compact flow, state table, schema or before-and-after layout with a concrete example and applicable approved values. Link the exact guide and contract, source references and focused viewer section. Save the displayed excerpt as versioned evidence before requesting consent.
-2. Invite clarification, corrections or additional illustrations. Record each consequential exchange through `conversation-record` with the exact question and answer, rejected options, illustrations, source basis and affected IDs. Use phase `slice_review`, the current `slice_id` and `proposal_revision`.
-3. If an answer changes the approved blueprint, pause for a new blueprint approval. For a clarification of approved behavior, use `record_type: slice_detail` and unchanged `clarifies_decision_ids`. Link corrections with `supersedes`, keeping the same answer link and scope. For an earlier slice, record `action: reopen` with the exact reopening request. Update traceability and freeze a new guide and contract revision with `slice-draft`. The viewer refreshes generated handoff guides and illustrations in place for comparison. For custom catalog sections, update the source under the same section ID. Run `review-revision` and show the focused before-and-after view. Repeat readiness for the new revision and recheck affected dependents.
-4. Recap the corrections and show the exact guide path, revision and guide/contract hashes. Save a UTF-8 excerpt beginning with the exact current readiness summary and followed by the slice explanation and terminal illustration shown to the user. For manual approval, attach its initiative-relative path in both `presentation_path` and `evidence_paths` on the [consent exchange](../assets/project/slice-consent.template.json). Record the user's affirmative consent and pass its `exchange_id` as `consent_id` with `slice-review-record`. The coordinator binds the saved excerpt and readiness receipt to the approval. A separately delegated range lists every exact slice revision and both hashes with the user's constraints. Resolve consequential questions before advancing.
-5. After reviewing the current slice, wait for the user's explicit instruction to continue. The register and `resume --format json` expose `pending_continue` with the exact next revision. Present that scope and record a separate `slice_consent` exchange with `consent_action: continue` to open it. After the last review, validate the complete collection. Package lock and coding each require their own authorization.
+### Present the Guided Slice Walkthrough
+
+Show the saved readiness summary from `resume` or the register. Start with an illustrated, standalone explanation of the purpose, current behavior, proposed behavior, dependencies and verification. Explain technical terms when introducing them. Use a concrete example with approved values and show a compact terminal flow, state table, component sketch or layout comparison. For a straightforward slice, cover the whole scope in one walkthrough. For complex work, begin with the same essential picture and group the follow-up into natural parts, such as a user action and its underlying data flow. Let the user choose where to go deeper. Emphasize behavior and consequences in the conversation and use the coverage table when saving evidence.
+
+| Topic key | What the user needs to understand |
+| --- | --- |
+| `purpose` | What the slice delivers, who benefits and why |
+| `existing_functionality` | What the application does today, grounded in the repository or approved baseline |
+| `proposed_changes` | What will be added, preserved, modified or removed, with the expected result |
+| `illustrations` | A readable terminal example of the resulting interface, architecture or workflow |
+| `technical_implementation` | The components, meaningful source files and symbols, API or schema changes and how the pieces interact |
+| `dependencies` | What other slices supply or consume, or why the slice can stand on its own |
+| `verification` | How the assigned checks will demonstrate completion, including material failure cases and observable outcomes |
+| `open_decisions` | What needs a decision and what has been settled, including explicit confirmation when there are no material open decisions |
+
+Link the exact Markdown guide, contract and focused section of the living viewer for deeper inspection. The viewer provides the technical specifications, exact source references, diagrams, schemas, dependencies, detailed decisions and acceptance tests. Show the essential information in the terminal even when the viewer is unavailable.
+
+### Save progress and resolve changes
+
+1. Save a versioned UTF-8 excerpt of what was actually shown, beginning with the exact current readiness summary. Include the explanation and terminal illustration in the body. Use `slice-review-record` with `action: presentation` and the [walkthrough input](../assets/project/slice-walkthrough.template.json). Set the `position` to where the discussion should resume. For each covered topic, cite a distinct, verbatim excerpt from the explanation. Save a cumulative excerpt and updated topic mapping after each material section. Use new evidence paths when the presented text changes. Read `walkthroughs` in the register or `resume --format json` to recover the position and remaining topics.
+2. Invite questions, repository investigation, corrections and more illustrations. Record consequential exchanges through `conversation-record` with the exact question and answer, rejected options, illustrations, source basis and affected IDs. Use phase `slice_review`, the current `slice_id` and `proposal_revision`. Record material open questions as open A+ exchanges and link the answers as separate records.
+3. If an answer changes the approved blueprint, obtain a new blueprint approval. For a clarification of approved behavior, use `record_type: slice_detail` and unchanged `clarifies_decision_ids`. Link corrections with `supersedes`, keeping the same answer link and scope. For an earlier slice, record `action: reopen` with the exact reopening request. Update traceability, the guide, contract and illustrations, then freeze a new revision with `slice-draft`. The viewer refreshes generated guides and illustrations automatically. For custom catalog sections, update the source under the same section ID. Run `review-revision` and show the focused before-and-after view. Repeat readiness, recheck affected dependents and present the corrected revision.
+
+### Verify comprehension before asking for approval
+
+1. Check the recorded coverage against the exact guide and contract. Explain any missing specifications or scenarios and settle all material ambiguities. Recap the expected result, including any correction. Ask one concrete question about a material consequence or confirm a specific example with the user. For example, describe what the existing membership guard does and ask what a member and an outsider should see after the change. Let the user answer in their own words or explicitly confirm the concrete recap. Expand and check again if the response is unclear, introduces a correction, or leaves a material misunderstanding. A generic acknowledgment, an approval instruction or a valid handoff by itself provides insufficient evidence.
+2. With all topics saved, record the exact comprehension prompt and actual response through `conversation-record`. Use `record_type: recap`, `status: decided`, `phase: slice_review`, `comprehension_check: true`, the current `slice_id` and `proposal_revision`, and the saved presentation in `evidence_paths`. Rerun the exact presentation input with `comprehension.exchange_id` and `comprehension.basis` explaining what the reply confirmed. The CLI checks coverage and evidence binding. Codex judges whether the answer confirms the proposed behavior. Record any consequential decision or correction separately using the usual A+ workflow.
+3. After comprehension is recorded, show the exact guide path, revision and guide and contract hashes, then request explicit approval. Attach the same presentation in both `presentation_path` and `evidence_paths` on the [consent exchange](../assets/project/slice-consent.template.json). Pass the affirmative exchange ID as `consent_id` with `slice-review-record` and link consequential exchanges in `conversation_exchange_ids`. For an explicitly delegated range, record the exact slice revisions, hashes and constraints. Delegation uses the handoff evidence for the delegated reviews.
+4. After approval, wait for the user's explicit instruction to continue. The register and `resume --format json` expose `pending_continue` with the exact next revision. Present that scope and record a separate `slice_consent` exchange with `consent_action: continue` to open it. After the last review, validate the collection. Package lock and coding each require their own authorization.
 
 ## Record explicit consent
 

@@ -1,0 +1,17 @@
+{
+  "action": "presentation",
+  "slice_id": "",
+  "proposal_revision": 1,
+  "presentation_path": "",
+  "position": "",
+  "topics": {
+    "purpose": "",
+    "existing_functionality": "",
+    "proposed_changes": "",
+    "illustrations": "",
+    "technical_implementation": "",
+    "dependencies": "",
+    "verification": "",
+    "open_decisions": ""
+  }
+}

@@ -3079,7 +3079,9 @@ def build_resume_packet(directory: Path, project_root: Path, *, delivery_slice: 
                                   if question.get("record_type") == "review_checkpoint"), None)
     if question_source_errors:
         next_action = "Reconcile the changed question source before continuing."
-    elif active_question_answer:
+    elif active_question_answer and not (
+            review and (walkthrough := review.get('walkthroughs', {}).get(review.get('current_slice_id')))
+            and active_question_answer['exchange_id'] in walkthrough['discussion']):
         next_action = "Use the recorded answer and update the saved work cursor."
     elif pending_guided_review and (not work or work.get("status") == "in_progress"):
         next_action = f"Wait for the user's reply on {pending_guided_review['review_target']}."
@@ -3256,6 +3258,14 @@ def print_resume(directory: Path, project_root: Path, *, delivery_slice: str | N
             print(f"Open slice: {review['current_slice_id']} revision {review['current_revision']}")
             if ready := review["handoff_readiness"].get(review["current_slice_id"]):
                 print(ready["terminal"], end="")
+            if walkthrough := review["walkthroughs"].get(review["current_slice_id"]):
+                print(f"Guided walkthrough — {walkthrough['position']}")
+                if remaining := walkthrough["remaining_topics"]:
+                    print("Still to discuss — " + ", ".join(topic.replace("_", " ") for topic in remaining))
+                elif not walkthrough.get("comprehension"):
+                    print("Comprehension check pending")
+                else:
+                    print("Comprehension confirmed")
         if review["active_package"]:
             package = review["packages"][review["active_package"]]
             print(f"Package index: {package['index_path']} (hash {package['package_hash']})")

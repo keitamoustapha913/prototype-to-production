@@ -6,6 +6,7 @@
   "pending_question": null,
   "pending_continue": null,
   "handoff_readiness": {},
+  "walkthroughs": {},
   "completed_review_ids": [],
   "changed_dependents": [],
   "continuing_releases": {},

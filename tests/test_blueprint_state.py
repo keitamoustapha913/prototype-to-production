@@ -114,21 +114,57 @@ class BlueprintTests(unittest.TestCase):
         self.assertFalse(report['reviews'])
         self.assertIn('Attach the saved terminal presentation', self.with_slice_consent(
             'slice-review-record', readiness | {'action': 'approve'}, ok=False).stderr)
+        earlier_walkthrough = self.walkthrough_input(readiness)
+        self.review_cli('slice-review-record', earlier_walkthrough)
         previous_presentation = receipt['terminal'] + '\nUse the current service and preserve membership checks.\n'
         revision = self.guide_candidate(feature, revision=2) | {'boundary_reason': candidate['boundary_reason']}
         report = self.review_cli('slice-draft', revision)
         self.assertNotIn('items-slice', report['handoff_readiness'])
+        self.assertNotIn('items-slice', report['walkthroughs'])
         self.assertIn('confirm-map', report['slice_map']['consent_id'])
         readiness = self.readiness_input()
         report = self.review_cli('slice-review-record', readiness)
         receipt = report['handoff_readiness']['items-slice']
         approval = {key: value for key, value in readiness.items() if key not in ('handoff_review', 'assessment')}
-        self.assertIn('current readiness summary', self.with_slice_consent(
-            'slice-review-record', approval | {'action': 'approve'}, ok=False,
-            presentation=previous_presentation).stderr)
-        report = self.review_cli('slice-review-record', approval | {'action': 'approve'})
+        walkthrough = self.walkthrough_input(approval, previous_presentation)
+        self.assertIn('current readiness summary', self.review_cli(
+            'slice-review-record', walkthrough, ok=False).stderr)
+        walkthrough = self.walkthrough_input(approval)
+        partial = walkthrough | {'topics': {'purpose': walkthrough['topics']['purpose']}}
+        self.review_cli('slice-review-record', partial)
+        resumed = json.loads(self.cli('resume', '--format', 'json').stdout)
+        progress = resumed['active_work']['slice_review']['walkthrough']
+        self.assertEqual(progress['position'], walkthrough['position'])
+        self.assertIn('verification', progress['remaining_topics'])
+        self.assertIn('Still to discuss', self.cli('resume').stdout)
+        manual = approval | {'action': 'approve'}
+        self.assertIn('Complete the current guided walkthrough', self.with_slice_consent(
+            'slice-review-record', manual, ok=False, presentation_path=walkthrough['presentation_path']).stderr)
+        self.review_cli('slice-review-record', walkthrough)
+        self.assertIn('Complete the current guided walkthrough', self.with_slice_consent(
+            'slice-review-record', manual, ok=False, presentation_path=walkthrough['presentation_path']).stderr)
+        decision = 'Should we move the access check after the storage call?'
+        self.exchange('access-question', status='open', phase='slice_review', question=decision,
+                      feature_ids=['items-feature'])
+        self.assertIn('after resolving questions', self.walkthrough_recap(walkthrough, ok=False).stderr)
+        self.exchange('access-answer', status='rejected', phase='slice_review',
+                      question=decision, responds_to='access-question',
+                      response='Keep the access check before storage.', feature_ids=['items-feature'])
+        self.review_cli('slice-review-record', walkthrough)
+        self.assertIn('Record a response about the proposed behavior', self.walkthrough_recap(
+            walkthrough, response='Approve items-slice revision 2', ok=False).stderr)
+        comprehension = self.walkthrough_recap(walkthrough)
+        self.assertIn('exact completed terminal walkthrough', self.review_cli(
+            'slice-review-record', walkthrough | {'comprehension': comprehension, 'position': 'Changed'}, ok=False).stderr)
+        self.review_cli('slice-review-record', walkthrough | {'comprehension': comprehension})
+        self.assertIn('Ask for approval of the exact reviewed revision', self.cli('resume').stdout)
+        manual['conversation_exchange_ids'] = ['access-question', 'access-answer']
+        report = self.review_cli('slice-review-record', self.with_slice_consent(
+            'slice-review-record', manual, presentation_path=walkthrough['presentation_path']))
         self.assertEqual(report['reviews']['items-slice']['readiness_path'], receipt['path'])
         self.assertEqual(report['reviews']['items-slice']['presentation']['readiness_path'], receipt['path'])
+        self.assertEqual(report['reviews']['items-slice']['presentation']['comprehension_exchange_id'],
+                         comprehension['exchange_id'])
         self.lock_reviewed_package()
         self.cli('validate')
 
@@ -1826,7 +1862,35 @@ document.getElementById('observation').textContent = JSON.stringify({
         self.cli('approve', '--approval-file', self.payload('approval', self.approval()))
         return blueprint['features'][0]
 
-    def with_slice_consent(self, command, value, *, response=None, ok=True, presentation=None):
+    def walkthrough_input(self, value, presentation=None):
+        key, revision = value['slice_id'], value['proposal_revision']
+        receipt = self.manifest()['slice_review']['handoff_readiness'][key]
+        topics = {
+            'purpose': 'Keep access to the item list predictable.',
+            'existing_functionality': 'The service currently loads items for members.',
+            'proposed_changes': 'Preserve the membership check while implementing the approved item behavior.',
+            'illustrations': 'Member -> item list. Outsider -> 403.',
+            'technical_implementation': 'The existing handler checks membership before the storage call.',
+            'dependencies': 'Use the existing membership and storage interfaces.',
+            'verification': 'Verify the list and the denial against the approved checks.',
+            'open_decisions': 'The approved membership behavior settles the access decision.',
+        }
+        path = self.artifact(f'inputs/{key}-r{revision}-walkthrough.txt',
+                             presentation or receipt['terminal'] + '\n' + '\n'.join(topics.values()) + '\n')
+        return {'action': 'presentation', 'slice_id': key, 'proposal_revision': revision,
+                'topics': topics, 'position': 'Discuss the member and outsider paths.', 'presentation_path': path}
+
+    def walkthrough_recap(self, walkthrough, *, response='Members see the list and outsiders get a 403.', ok=True):
+        exchange_id = f"comprehension-{len(self.manifest().get('conversation', {})) + 1}"
+        exchange = {'exchange_id': exchange_id, 'phase': 'slice_review', 'record_type': 'recap',
+                    'comprehension_check': True, 'status': 'decided',
+                    'slice_id': walkthrough['slice_id'], 'proposal_revision': walkthrough['proposal_revision'],
+                    'question': 'What happens for a member and for an outsider?', 'response': response,
+                    'evidence_paths': [walkthrough['presentation_path']]}
+        result = self.cli('conversation-record', '--exchange-file', self.payload(exchange_id, exchange), ok=ok)
+        return {'exchange_id': exchange_id, 'basis': 'The user described both outcomes correctly.'} if ok else result
+
+    def with_slice_consent(self, command, value, *, response=None, ok=True, presentation_path=None):
         if command == 'slice-review-record':
             action = value['action']
             target = {'slices': [{field: value[field] for field in
@@ -1849,12 +1913,14 @@ document.getElementById('observation').textContent = JSON.stringify({
                     'response': quote, 'consent_action': action, 'target': target}
         if command == 'slice-review-record' and action == 'approve':
             receipt = self.manifest()['slice_review'].get('handoff_readiness', {}).get(value['slice_id'])
-            if receipt and (ok or presentation is not None):
-                if presentation is None:
-                    presentation = receipt['terminal'] + ('\nThe service checks membership before loading items.\n'
-                        'Member -> list items. Outsider -> 403. Verify both responses against the approved check.\n')
-                path = self.artifact(f'inputs/{consent_id}-terminal.txt', presentation)
-                exchange.update(presentation_path=path, evidence_paths=[path])
+            if receipt and ok and presentation_path is None:
+                walkthrough = self.walkthrough_input(value)
+                self.review_cli('slice-review-record', walkthrough)
+                comprehension = self.walkthrough_recap(walkthrough)
+                self.review_cli('slice-review-record', walkthrough | {'comprehension': comprehension})
+                presentation_path = walkthrough['presentation_path']
+            if presentation_path:
+                exchange.update(presentation_path=presentation_path, evidence_paths=[presentation_path])
         result = self.cli('conversation-record', '--exchange-file', self.payload(consent_id, exchange), ok=ok)
         return value | {'consent_id': consent_id} if ok else result
 
