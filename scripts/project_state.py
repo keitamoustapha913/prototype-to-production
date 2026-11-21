@@ -3262,10 +3262,10 @@ def print_resume(directory: Path, project_root: Path, *, delivery_slice: str | N
                 print(f"Guided walkthrough — {walkthrough['position']}")
                 if remaining := walkthrough["remaining_topics"]:
                     print("Still to discuss — " + ", ".join(topic.replace("_", " ") for topic in remaining))
-                elif not walkthrough.get("comprehension"):
-                    print("Comprehension check pending")
+                elif walkthrough.get("recap"):
+                    print("Completeness recap recorded")
                 else:
-                    print("Comprehension confirmed")
+                    print("Completeness recap pending")
         if review["active_package"]:
             package = review["packages"][review["active_package"]]
             print(f"Package index: {package['index_path']} (hash {package['package_hash']})")

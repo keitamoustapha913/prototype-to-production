@@ -12,8 +12,6 @@ SLICE_FIELDS = ('slice_id', 'scope', 'owner', 'status', 'blueprint_version', 'fe
                 'dependencies', 'functional_tests', 'test_plan', 'prohibited_deviations')
 REGISTER = 'slice-review/register'
 INVENTORY = 'slice-review/inventory.json'
-WALKTHROUGH_TOPICS = ('purpose', 'existing_functionality', 'proposed_changes', 'illustrations',
-                      'technical_implementation', 'dependencies', 'verification', 'open_decisions')
 
 
 def digest(data):
@@ -265,8 +263,8 @@ class SliceReview:
         if progress := summary['walkthroughs'].get(summary['current_slice_id']):
             missing = ', '.join(topic.replace('_', ' ') for topic in progress['remaining_topics'])
             position = progress['position'].replace('\n', ' ')
-            status = ('Comprehension confirmed' if progress.get('comprehension') else
-                      f'Still to discuss — {missing}' if missing else 'Comprehension check pending')
+            status = (f'Still to discuss — {missing}' if missing else
+                      'Completeness recap recorded' if progress.get('recap') else 'Completeness recap pending')
             rows.extend(['## Guided walkthrough', '', f'{status}. {position}', ''])
         rows.extend(['| Slice | Purpose | Features | Revision | Method | Status | Blockers | Dependencies | Next action |',
                      '| --- | --- | --- | --- | --- | --- | --- | --- | --- |'])
@@ -332,9 +330,9 @@ class SliceReview:
                          and bool(value.get('responds_to')) and value.get('status') in ('decided', 'rejected'))
         if not (map_consent or legacy_answer):
             self.require_map_confirmed()
+        reopen_topics = []
         if value.get('record_type') == 'slice_consent':
-            self.require(value.get('comprehension_check') is not True,
-                         'Record comprehension and approval as separate exchanges')
+            self.require(not value.get('reopen_topics'), 'Record corrections separately from consent')
             self.validate_consent(value)
             if map_consent:
                 value['map_presentation'] = self.current_map()['presentation']
@@ -345,9 +343,15 @@ class SliceReview:
             self.require(self.blueprint.identifier(key) and key in self.registry['selected'],
                          'Review exchange must belong to a selected slice')
             value['slice_id'] = key
+            coverage = self.api.sibling_module('slice_coverage')
+            reopen_topics = coverage.reopened_topics(self, value)
+            if reopen_topics:
+                revision = self.registry['selected'][key]['revision']
+                self.require(key == self.registry.get('current_slice_id') and key not in self.registry['reviews']
+                             and value.get('proposal_revision', revision) == revision,
+                             'Reopen topics for the current pending slice revision')
+                value['proposal_revision'] = revision
             self.validate_exchange_scope(self.selected_packet(key), value)
-            if value.get('comprehension_check') is True:
-                self.bind_comprehension_exchange(key, value)
             if not linked_id and self.adaptive_handoff and key not in self.registry['reviews']:
                 self.require_review_turn()
                 self.require(key == self.registry['current_slice_id'], 'Discuss the current slice before opening another')
@@ -365,7 +369,14 @@ class SliceReview:
         paths = value.get('illustration_paths', []) + value.get('evidence_paths', [])
         if paths:
             self.api.sibling_module('slice_evidence').evidence_hashes(self, paths)
+        new_exchange = value.get('exchange_id') not in self.manifest.get('conversation', {})
         self.blueprint.conversation_record(value, transition=(self.files, self.events))
+        if (new_exchange and value.get('record_type') not in ('recap', 'slice_consent')
+                and key not in self.registry['reviews']):
+            progress = self.registry.get('walkthroughs', {}).get(key, {})
+            if progress.pop('recap', None):
+                self.manifest['next_action'] = 'Update the saved walkthrough and completeness recap'
+            coverage.reopen_coverage(self, key, reopen_topics)
         if map_consent:
             self.registry['slice_map']['consent_id'] = value['exchange_id']
             self.events.append({'type': 'slice_map_confirmed', 'exchange_id': value['exchange_id'],
@@ -379,8 +390,6 @@ class SliceReview:
             self.advance(value['target']['slices'][0]['slice_id'])
         elif value.get('status') in ('open', 'proposed'):
             self.registry['pending_question_id'] = value['exchange_id']
-            if self.registry.get('walkthroughs', {}).get(value['slice_id'], {}).get('comprehension'):
-                self.registry['walkthroughs'].pop(value['slice_id'])
             self.registry['collection'] = None
             self.manifest['next_action'] = value['question']
         elif value.get('status') == 'rejected':
@@ -437,7 +446,8 @@ class SliceReview:
                 self.require(len(keys) == 1 and keys[0] == self.registry['current_slice_id'],
                              'Manual approval must identify the current slice')
                 readiness = self.require_readiness(keys[0])
-                exchange['slice_presentation'] = self.require_walkthrough(keys[0], exchange, readiness)
+                coverage = self.api.sibling_module('slice_coverage')
+                exchange['slice_presentation'] = coverage.require_recap(self, keys[0], exchange, readiness)
             expected = {'slices': [self.visual_consent_target(key, self.registry['selected'][key]) for key in keys]}
             if action == 'delegate':
                 self.require(self.blueprint.text(target.get('constraints')), 'Delegation must record its exact constraints')
@@ -965,6 +975,15 @@ class SliceReview:
         for key in list(blockers):
             if reset or key in changed:
                 blockers.pop(key)
+        previous = self.registry.setdefault('previous_coverage', {})
+        for key in list(previous):
+            if reset or key in impacted - changed or key not in self.registry['selected']:
+                previous.pop(key)
+        if not reset:
+            for key in changed & self.registry['selected'].keys():
+                progress = self.registry.get('walkthroughs', {}).get(key, {})
+                if progress.get('documented'):
+                    previous[key] = progress
         for field in ('handoff_readiness', 'walkthroughs'):
             for key in list(self.registry.get(field, {})):
                 if reset or key in impacted:
@@ -1136,11 +1155,12 @@ class SliceReview:
         self.files[path] = receipt
         self.references.update(hashes)
         current = self.registry.get('handoff_readiness', {}).get(key, {}).get('path') == path
-        if not current:
-            self.registry.get('walkthroughs', {}).pop(key, None)
-        self.registry.setdefault('handoff_readiness', {})[key] = receipt | {'path': path}
+        ready = receipt | {'path': path}
+        self.registry.setdefault('handoff_readiness', {})[key] = ready
         self.events.append({'type': 'slice_handoff_ready', 'path': path, 'target': target, 'depth': depth})
-        if key == self.registry.get('current_slice_id') and (not current or key not in self.registry.get('walkthroughs', {})):
+        if not current:
+            self.api.sibling_module('slice_coverage').refresh_readiness(self, key, ready)
+        if key == self.registry.get('current_slice_id') and key not in self.registry.get('walkthroughs', {}):
             self.manifest['next_action'] = f'Discuss {key} revision {entry["revision"]} using its readiness result and guide'
 
     def require_readiness(self, key, packet=None):
@@ -1170,94 +1190,6 @@ class SliceReview:
             else:
                 media.validate_raster(data, extension, relative)
 
-    def record_walkthrough(self, key, value):
-        self.require(self.adaptive_handoff and key == self.registry['current_slice_id']
-                     and key not in self.registry['reviews'], 'Discuss the current pending slice')
-        ready = self.require_readiness(key)
-        path, topics, position = (value.get(field) for field in ('presentation_path', 'topics', 'position'))
-        self.require(self.blueprint.text(path) and self.blueprint.text(position)
-                     and isinstance(topics, dict) and bool(topics) and set(topics) <= set(WALKTHROUGH_TOPICS),
-                     'Supply the saved terminal presentation, covered topics and current review position')
-        hashes = self.api.sibling_module('slice_evidence').evidence_hashes(self, [path])
-        body = self.api.artifact_file(self.directory, path).read_bytes()
-        self.require(digest(body) == hashes[path], 'The terminal presentation changed while it was being read')
-        text = body.decode('utf-8').replace('\r\n', '\n')
-        summary = ready['terminal']
-        self.require(text.startswith(summary) and text[len(summary):].strip(),
-                     'The terminal presentation must start with the current readiness summary and include the slice explanation')
-        explanation = text[len(summary):]
-        for topic, excerpt in topics.items():
-            self.require(self.blueprint.text(excerpt) and excerpt in explanation,
-                         f'Provide a verbatim terminal excerpt for {topic}')
-        self.require(len(set(topics.values())) == len(topics), 'Cite distinct excerpts for the covered topics')
-        remaining = [topic for topic in WALKTHROUGH_TOPICS if topic not in topics]
-        progress = {'target': ready['target'], 'readiness_path': ready['path'], 'presentation_path': path,
-                    'presentation_sha256': hashes[path], 'topics': topics, 'remaining_topics': remaining,
-                    'position': position, 'discussion': self.walkthrough_discussion(key)}
-        if result := value.get('comprehension'):
-            self.require(not remaining and not self.blueprint.pending(),
-                         'Cover every topic and resolve open questions before completing the walkthrough')
-            self.require(isinstance(result, dict) and self.blueprint.identifier(result.get('exchange_id'))
-                         and self.blueprint.text(result.get('basis')),
-                         'Cite the actual comprehension exchange and explain what the response confirmed')
-            exchange_id = result['exchange_id']
-            exchange = self.blueprint.load('conversation', exchange_id)
-            self.require(exchange.get('comprehension_check') is True and exchange['phase'] == 'slice_review'
-                         and exchange.get('record_type') == 'recap' and exchange['status'] == 'decided'
-                         and exchange.get('walkthrough_sha256') == canonical_hash(progress),
-                         'Comprehension must refer to the exact completed terminal walkthrough')
-            progress['comprehension'] = {'exchange_id': exchange_id, 'basis': result['basis']}
-            self.references.update(self.blueprint.bound_hashes('conversation', exchange_id))
-        receipt = f'slice-proposals/{key}/walkthroughs/r{value["proposal_revision"]}-{canonical_hash(progress)}.json'
-        self.files[receipt] = progress
-        self.references.update(hashes)
-        self.registry.setdefault('walkthroughs', {})[key] = progress | {'path': receipt}
-        self.events.append({'type': 'slice_walkthrough_recorded', 'slice_id': key, 'path': receipt})
-        if not self.blueprint.pending():
-            self.manifest['next_action'] = (f'Ask for approval of the exact reviewed revision of {key}'
-                if progress.get('comprehension') else 'Continue the guided walkthrough' if remaining
-                else 'Check the user’s understanding of the proposed slice before asking for approval')
-
-    def walkthrough_discussion(self, key):
-        question_id = self.review_question_id(key)
-        if not question_id:
-            return []
-        answer, _ = self.blueprint.question_context(question_id, self.blueprint.conversations())
-        return [question_id, answer['exchange_id']] if answer else [question_id]
-
-    def bind_comprehension_exchange(self, key, exchange):
-        self.require(key == self.registry.get('current_slice_id') and not self.blueprint.pending()
-                     and exchange.get('record_type') == 'recap' and exchange.get('status') == 'decided',
-                     'Record the comprehension check as a recap for the current slice after resolving questions')
-        progress = self.registry.get('walkthroughs', {}).get(key)
-        ready = self.require_readiness(key)
-        self.require(progress and not progress['remaining_topics'] and progress['readiness_path'] == ready['path']
-                     and progress['discussion'] == self.walkthrough_discussion(key)
-                     and exchange.get('proposal_revision') == ready['target']['proposal_revision']
-                     and progress['presentation_path'] in exchange.get('evidence_paths', []),
-                     'First record all walkthrough topics and cite that exact presentation in the recap')
-        consent = self.api.sibling_module('slice_consent')
-        self.require(not consent.affirmative('approve', {'slices': [ready['target']]}, exchange.get('response'))
-                     and not consent.affirmative('continue', {'slices': [ready['target']]}, exchange.get('response')),
-                     'Record a response about the proposed behavior before asking for a separate approval')
-        self.blueprint.check_hashes({progress['presentation_path']: progress['presentation_sha256']})
-        exchange['walkthrough_sha256'] = canonical_hash({
-            field: item for field, item in progress.items() if field not in ('path', 'comprehension')})
-
-    def require_walkthrough(self, key, exchange, readiness):
-        path = exchange.get('presentation_path')
-        self.require(self.blueprint.text(path) and path in exchange.get('evidence_paths', []),
-                     'Attach the saved terminal presentation in presentation_path and evidence_paths before approval')
-        progress = self.registry.get('walkthroughs', {}).get(key)
-        self.require(progress and progress['readiness_path'] == readiness['path']
-                     and progress['presentation_path'] == path and not progress['remaining_topics']
-                     and progress.get('comprehension') and not self.blueprint.pending()
-                     and progress['discussion'] == self.walkthrough_discussion(key),
-                     'Complete the current guided walkthrough and comprehension check before approval')
-        self.blueprint.check_hashes({path: progress['presentation_sha256']})
-        return {'path': path, 'sha256': progress['presentation_sha256'], 'readiness_path': readiness['path'],
-                'walkthrough_path': progress['path'], 'comprehension_exchange_id': progress['comprehension']['exchange_id']}
-
     def require_readiness_or_blocker_question(self, key, exchange):
         if exchange.get('handoff_blocker') is True:
             blocker = self.registry.get('review_blockers', {}).get(key)
@@ -1281,17 +1213,25 @@ class SliceReview:
                      f'{key}: review must target exact revision {entry["revision"]}')
         action = value.get('action')
         self.require(action in ('question', 'reopen', 'block', 'approve', 'delegate', 'readiness',
-                                'require-independent', 'presentation'), 'Choose a valid slice review action')
+                                'require-independent', 'presentation', 'completeness'), 'Choose a valid slice review action')
         if action not in ('reopen', 'block', 'require-independent'):
             self.require_review_turn()
         if value.get('next_action') is not None:
             self.require(self.blueprint.text(value['next_action']), 'Review next_action must be text')
-        approval = self.approval(allow_questions=action in ('question', 'block', 'require-independent', 'presentation'))
+        approval = self.approval(allow_questions=action in ('question', 'block', 'require-independent', 'presentation', 'completeness'))
         if action == 'readiness':
             self.record_readiness(key, entry, value, approval)
             return
-        if action == 'presentation':
-            self.record_walkthrough(key, value)
+        if action in ('presentation', 'completeness'):
+            self.require(self.adaptive_handoff and key == self.registry['current_slice_id']
+                         and key not in self.registry['reviews'], 'Discuss the current pending slice')
+            ready = self.require_readiness(key)
+            coverage = self.api.sibling_module('slice_coverage')
+            if action == 'presentation':
+                coverage.record_presentation(self, key, value, ready)
+            else:
+                self.guard_source(approval, self.authorized_paths())
+                coverage.record_recap(self, key, value, ready)
             return
         if action == 'require-independent':
             self.require(self.adaptive_handoff and key not in self.registry['reviews']
@@ -1300,7 +1240,7 @@ class SliceReview:
             self.registry.setdefault('handoff_escalations', {}).setdefault(key, {})['user'] = (
                 'The user requested independent review')
             self.registry.get('handoff_readiness', {}).pop(key, None)
-            self.registry.get('walkthroughs', {}).pop(key, None)
+            self.registry.get('walkthroughs', {}).get(key, {}).pop('recap', None)
             if key == self.registry.get('current_slice_id') and not self.registry.get('pending_question_id'):
                 self.manifest['next_action'] = f'Prepare independent handoff readiness for {key}'
         elif action == 'reopen':
@@ -1418,12 +1358,11 @@ class SliceReview:
         presentation = None
         if readiness and action == 'approve':
             exchange = self.blueprint.load('conversation', consent_id)
-            presentation = self.require_walkthrough(key, exchange, readiness)
+            coverage = self.api.sibling_module('slice_coverage')
+            presentation = coverage.require_recap(self, key, exchange, readiness)
             self.require(exchange.get('slice_presentation') == presentation,
                          'Slice consent must bind the current terminal presentation and readiness receipt')
-            path = presentation['walkthrough_path']
-            evidence[path] = self.registry['artifact_hashes'][path]
-            evidence.update(self.blueprint.bound_hashes('conversation', presentation['comprehension_exchange_id']))
+            evidence.update(coverage.bound_evidence(self, key, presentation))
             self.references.update(evidence)
         evidence.update(self.blueprint.bound_hashes('conversation', consent_id))
         review_id = f'{key}-r{entry["revision"]}-review-{self.registry.get("review_sequence", 0) + 1}'

@@ -135,38 +135,120 @@ class BlueprintTests(unittest.TestCase):
         resumed = json.loads(self.cli('resume', '--format', 'json').stdout)
         progress = resumed['active_work']['slice_review']['walkthrough']
         self.assertEqual(progress['position'], walkthrough['position'])
-        self.assertIn('verification', progress['remaining_topics'])
+        self.assertIn('open_decisions', progress['remaining_topics'])
+        self.assertEqual(progress['topics']['verification']['presented_revision'], 1)
         self.assertIn('Still to discuss', self.cli('resume').stdout)
         manual = approval | {'action': 'approve'}
         self.assertIn('Complete the current guided walkthrough', self.with_slice_consent(
             'slice-review-record', manual, ok=False, presentation_path=walkthrough['presentation_path']).stderr)
         self.review_cli('slice-review-record', walkthrough)
-        self.assertIn('Complete the current guided walkthrough', self.with_slice_consent(
+        self.assertIn('Record the completeness recap', self.with_slice_consent(
             'slice-review-record', manual, ok=False, presentation_path=walkthrough['presentation_path']).stderr)
         decision = 'Should we move the access check after the storage call?'
         self.exchange('access-question', status='open', phase='slice_review', question=decision,
                       feature_ids=['items-feature'])
-        self.assertIn('after resolving questions', self.walkthrough_recap(walkthrough, ok=False).stderr)
+        self.assertIn('resolve all material questions', self.walkthrough_recap(walkthrough, ok=False).stderr)
         self.exchange('access-answer', status='rejected', phase='slice_review',
                       question=decision, responds_to='access-question',
                       response='Keep the access check before storage.', feature_ids=['items-feature'])
-        self.review_cli('slice-review-record', walkthrough)
-        self.assertIn('Record a response about the proposed behavior', self.walkthrough_recap(
-            walkthrough, response='Approve items-slice revision 2', ok=False).stderr)
-        comprehension = self.walkthrough_recap(walkthrough)
-        self.assertIn('exact completed terminal walkthrough', self.review_cli(
-            'slice-review-record', walkthrough | {'comprehension': comprehension, 'position': 'Changed'}, ok=False).stderr)
-        self.review_cli('slice-review-record', walkthrough | {'comprehension': comprehension})
+        clarification = 'Keep the access check before storage.'
+        followup = walkthrough | {'presentation_path': self.artifact('inputs/access-answer.txt', clarification),
+                                  'topics': {'technical_implementation': clarification},
+                                  'conversation_exchange_ids': ['access-question', 'access-answer']}
+        progress = self.review_cli('slice-review-record', followup)['walkthroughs']['items-slice']
+        self.assertFalse(progress['remaining_topics'])
+        self.assertEqual(progress['topics']['purpose']['presentation_path'], walkthrough['presentation_path'])
+        self.assertEqual(progress['topics']['technical_implementation']['exchange_ids'],
+                         ['access-question', 'access-answer'])
+        self.assertTrue(progress['topics']['technical_implementation']['guide_sections'])
+        recap = self.walkthrough_recap(followup)
         self.assertIn('Ask for approval of the exact reviewed revision', self.cli('resume').stdout)
-        manual['conversation_exchange_ids'] = ['access-question', 'access-answer']
+        correction = 'The access check runs in the existing handler before the storage call.'
+        self.exchange('access-correction', status='rejected', phase='slice_review',
+                      question='Should the explanation say the storage call comes first?',
+                      feature_ids=['items-feature'], response=correction,
+                      reopen_topics=['technical_implementation'])
+        resumed = json.loads(self.cli('resume', '--format', 'json').stdout)
+        progress = resumed['active_work']['slice_review']['walkthrough']
+        self.assertEqual(progress['remaining_topics'], ['technical_implementation'])
+        self.assertNotIn('recap', progress)
+        self.assertEqual(progress['topics']['purpose']['presentation_path'], walkthrough['presentation_path'])
+        self.assertIn('Complete the current guided walkthrough', self.with_slice_consent(
+            'slice-review-record', manual, ok=False, presentation_path=followup['presentation_path']).stderr)
+        followup |= {'presentation_path': self.artifact('inputs/access-correction.txt', correction),
+                     'topics': {'technical_implementation': correction},
+                     'conversation_exchange_ids': ['access-correction']}
+        self.review_cli('slice-review-record', followup)
+        recap = self.walkthrough_recap(followup, filename='corrected-recap')
+        manual['conversation_exchange_ids'] = ['access-question', 'access-answer', 'access-correction']
         report = self.review_cli('slice-review-record', self.with_slice_consent(
-            'slice-review-record', manual, presentation_path=walkthrough['presentation_path']))
+            'slice-review-record', manual, presentation_path=followup['presentation_path']))
         self.assertEqual(report['reviews']['items-slice']['readiness_path'], receipt['path'])
         self.assertEqual(report['reviews']['items-slice']['presentation']['readiness_path'], receipt['path'])
-        self.assertEqual(report['reviews']['items-slice']['presentation']['comprehension_exchange_id'],
-                         comprehension['exchange_id'])
+        self.assertEqual(report['reviews']['items-slice']['presentation']['recap_path'], recap['walkthroughs']['items-slice']['recap']['path'])
         self.lock_reviewed_package()
         self.cli('validate')
+
+    def open_coverage_review(self):
+        feature = self.reviewed_blueprint()
+        self.enable_adaptive_handoff()
+        self.review_cli('slice-plan', {'slices': [self.guide_candidate(feature)]})
+        readiness = self.readiness_input()
+        self.review_cli('slice-review-record', readiness)
+        return readiness, self.walkthrough_input(readiness)
+
+    def test_adaptive_handoff_rejects_missing_illustration_evidence(self):
+        _, walkthrough = self.open_coverage_review()
+        body = (self.directory / walkthrough['presentation_path']).read_text()
+        placeholder = 'Illustration pending'
+        path = self.artifact('inputs/no-illustration.txt',
+                             body.replace(walkthrough['topics']['illustrations'], placeholder))
+        result = self.review_cli('slice-review-record', walkthrough | {
+            'presentation_path': path, 'topics': walkthrough['topics'] | {'illustrations': placeholder},
+        }, ok=False)
+        self.assertIn('shown illustration or displayed link', result.stderr)
+        visual = 'inputs/member-flow.txt'
+        self.artifact(visual, 'Member -> list\nOutsider -> 403')
+        link = f'[Open the membership flow]({visual})'
+        path = self.artifact('inputs/linked-illustration.txt',
+                             body.replace(walkthrough['topics']['illustrations'], link))
+        report = self.review_cli('slice-review-record', walkthrough | {
+            'presentation_path': path, 'topics': walkthrough['topics'] | {'illustrations': link},
+            'illustration_paths': [visual],
+        })
+        proof = report['walkthroughs']['items-slice']['topics']['illustrations']
+        self.assertIn(visual, proof['illustration_hashes'])
+        absolute_link = f'[Open the membership flow](<{self.directory / visual}>)'
+        path = self.artifact('inputs/absolute-illustration-link.txt',
+                             body.replace(walkthrough['topics']['illustrations'], absolute_link))
+        report = self.review_cli('slice-review-record', walkthrough | {
+            'presentation_path': path, 'topics': walkthrough['topics'] | {'illustrations': absolute_link},
+            'illustration_paths': [visual],
+        })
+        proof = report['walkthroughs']['items-slice']['topics']['illustrations']
+        self.assertIn(visual, proof['illustration_hashes'])
+
+    def test_adaptive_handoff_rejects_recap_without_required_content(self):
+        _, walkthrough = self.open_coverage_review()
+        self.review_cli('slice-review-record', walkthrough)
+        incomplete = self.walkthrough_recap(walkthrough, filename='incomplete', text='OK', ok=False)
+        self.assertIn('verbatim recap excerpts', incomplete.stderr)
+        self.assertNotIn('recap', self.manifest()['slice_review']['walkthroughs']['items-slice'])
+
+    def test_adaptive_handoff_keeps_coverage_when_readiness_receipt_changes(self):
+        readiness, walkthrough = self.open_coverage_review()
+        before = self.review_cli('slice-review-record', walkthrough)['walkthroughs']['items-slice']
+        self.walkthrough_recap(walkthrough)
+        readiness['assessment']['rationale'] += ' Confirmed the rationale during a second read.'
+        self.review_cli('slice-review-record', readiness)
+        resumed = json.loads(self.cli('resume', '--format', 'json').stdout)
+        after = resumed['active_work']['slice_review']['walkthrough']
+        self.assertEqual(after['topics'], before['topics'])
+        self.assertEqual(after['position'], before['position'])
+        self.assertNotEqual(after['readiness_path'], before['readiness_path'])
+        self.assertNotIn('recap', after)
+        self.assertIn('present the slice review recap', resumed['next_action'])
+        self.walkthrough_recap(walkthrough, filename='refreshed-recap')
 
     def test_adaptive_handoff_rejects_unresolved_findings_and_requires_an_ambiguity_resolution(self):
         feature = self.reviewed_blueprint()
@@ -1869,7 +1951,7 @@ document.getElementById('observation').textContent = JSON.stringify({
             'purpose': 'Keep access to the item list predictable.',
             'existing_functionality': 'The service currently loads items for members.',
             'proposed_changes': 'Preserve the membership check while implementing the approved item behavior.',
-            'illustrations': 'Member -> item list. Outsider -> 403.',
+            'illustrations': '```text\nMember -> item list\nOutsider -> 403\n```',
             'technical_implementation': 'The existing handler checks membership before the storage call.',
             'dependencies': 'Use the existing membership and storage interfaces.',
             'verification': 'Verify the list and the denial against the approved checks.',
@@ -1880,15 +1962,22 @@ document.getElementById('observation').textContent = JSON.stringify({
         return {'action': 'presentation', 'slice_id': key, 'proposal_revision': revision,
                 'topics': topics, 'position': 'Discuss the member and outsider paths.', 'presentation_path': path}
 
-    def walkthrough_recap(self, walkthrough, *, response='Members see the list and outsiders get a 403.', ok=True):
-        exchange_id = f"comprehension-{len(self.manifest().get('conversation', {})) + 1}"
-        exchange = {'exchange_id': exchange_id, 'phase': 'slice_review', 'record_type': 'recap',
-                    'comprehension_check': True, 'status': 'decided',
-                    'slice_id': walkthrough['slice_id'], 'proposal_revision': walkthrough['proposal_revision'],
-                    'question': 'What happens for a member and for an outsider?', 'response': response,
-                    'evidence_paths': [walkthrough['presentation_path']]}
-        result = self.cli('conversation-record', '--exchange-file', self.payload(exchange_id, exchange), ok=ok)
-        return {'exchange_id': exchange_id, 'basis': 'The user described both outcomes correctly.'} if ok else result
+    def walkthrough_recap(self, walkthrough, *, ok=True, filename='recap', text=None):
+        key, revision = walkthrough['slice_id'], walkthrough['proposal_revision']
+        register = self.manifest()['slice_review']
+        progress = register['walkthroughs'][key]
+        guide = register['selected'][key]['guide_path']
+        sections = {
+            'expected_result': 'Members see the item list and outsiders receive a 403.',
+            'review_changes': 'The guide preserves the original handler order.',
+            'material_questions': 'The membership and storage checks are settled.',
+            'approval_scope': f'Approval covers {key} revision {revision} in {guide}.',
+        }
+        path = self.artifact(f'inputs/{key}-r{revision}-{filename}.txt',
+                             text if text is not None else '\n'.join(sections.values()))
+        value = {'action': 'completeness', 'slice_id': key, 'proposal_revision': revision,
+                 'walkthrough_path': progress['path'], 'recap_path': path, 'recap_sections': sections}
+        return self.review_cli('slice-review-record', value, ok=ok)
 
     def with_slice_consent(self, command, value, *, response=None, ok=True, presentation_path=None):
         if command == 'slice-review-record':
@@ -1916,11 +2005,14 @@ document.getElementById('observation').textContent = JSON.stringify({
             if receipt and ok and presentation_path is None:
                 walkthrough = self.walkthrough_input(value)
                 self.review_cli('slice-review-record', walkthrough)
-                comprehension = self.walkthrough_recap(walkthrough)
-                self.review_cli('slice-review-record', walkthrough | {'comprehension': comprehension})
+                self.walkthrough_recap(walkthrough)
                 presentation_path = walkthrough['presentation_path']
             if presentation_path:
                 exchange.update(presentation_path=presentation_path, evidence_paths=[presentation_path])
+            recap = self.manifest()['slice_review'].get('walkthroughs', {}).get(value['slice_id'], {}).get('recap')
+            if recap:
+                exchange['evidence_paths'].append(recap['path'])
+                exchange['question'] = (self.directory / recap['path']).read_text().strip() + '\n' + exchange['question']
         result = self.cli('conversation-record', '--exchange-file', self.payload(consent_id, exchange), ok=ok)
         return value | {'consent_id': consent_id} if ok else result
 

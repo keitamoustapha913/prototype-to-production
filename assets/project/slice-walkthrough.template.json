@@ -4,6 +4,9 @@
   "proposal_revision": 1,
   "presentation_path": "",
   "position": "",
+  "conversation_exchange_ids": [],
+  "illustration_paths": [],
+  "reopen_topics": [],
   "topics": {
     "purpose": "",
     "existing_functionality": "",

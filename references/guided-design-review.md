@@ -6,7 +6,7 @@ Explain what you understood, illustrate the proposal, discuss one consequential 
 
 The checkpoints below apply to blueprint initiatives. Use `init --guided-design-review` for new initiatives to enforce checkpoint evidence at discovery, roadmap and blueprint approval. Use the same conversation when resuming unfinished reviews in earlier initiatives. On the full-prototype route, use the terminal presentation for discovery, prototype review and slice handoffs, with the [prototype route's evidence and approvals](workflow.md).
 
-For blueprint-first implementation slices, follow the [Guided Slice Walkthrough](slice-review-workflow.md#review-one-slice-at-a-time) for adaptive pacing, coverage evidence and the comprehension check.
+For blueprint-first implementation slices, follow the [Guided Slice Walkthrough](slice-review-workflow.md#review-one-slice-at-a-time) for adaptive pacing, background coverage tracking and the completeness recap.
 
 ## Discovery and roadmap
 

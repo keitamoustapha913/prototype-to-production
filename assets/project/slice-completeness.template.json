@@ -1,0 +1,13 @@
+{
+  "action": "completeness",
+  "slice_id": "",
+  "proposal_revision": 1,
+  "walkthrough_path": "",
+  "recap_path": "",
+  "recap_sections": {
+    "expected_result": "",
+    "review_changes": "",
+    "material_questions": "",
+    "approval_scope": ""
+  }
+}
