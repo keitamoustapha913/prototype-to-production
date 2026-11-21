@@ -6,6 +6,7 @@
   "routes": ["/invoices"],
   "allowed_paths": ["src/features/invoices/**"],
   "dependencies": [],
+  "requirement_ids": [],
   "current_behavior": ["List invoices, search and filter, open invoice details."],
   "prototype_version": "v1",
   "prototype_source_paths": ["prototype/versions/v1/invoices.tsx"],

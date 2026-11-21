@@ -6,6 +6,9 @@
   "workstreams": [
     "REPLACE actual workstream"
   ],
+  "requirement_workstreams": {
+    "example-requirement": ["REPLACE actual workstream"]
+  },
   "dependencies": [],
   "risks": [],
   "decision_ids": [

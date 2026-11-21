@@ -1,0 +1,25 @@
+{
+  "exchange_id": "alignment-v1-question",
+  "phase": "discover",
+  "record_type": "review_checkpoint",
+  "review_step": "initial_alignment",
+  "review_version": "alignment-v1",
+  "review_target": "Initial Understanding and Alignment",
+  "status": "open",
+  "question": "REPLACE with the exact displayed request for confirmation of understanding",
+  "response": null,
+  "requirement_ids": ["example-requirement"],
+  "evidence_paths": ["alignment/presentations/alignment-v1.md"],
+  "requirement_mappings": [
+    {
+      "requirement_id": "example-requirement",
+      "text": "REPLACE with the actual requirement",
+      "request_reference": "REPLACE with the exact brief section or message",
+      "classification": "not_yet_verified",
+      "finding": "REPLACE with what was inspected and what remains unknown",
+      "direction": "REPLACE with the proposed direction and open issue",
+      "source_paths": [],
+      "evidence_paths": ["alignment/evidence/inspection.md"]
+    }
+  ]
+}

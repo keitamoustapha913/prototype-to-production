@@ -547,15 +547,18 @@ document.getElementById('observation').textContent = JSON.stringify({
         self.cli('init', '--scope', 'feature')
         self.assertNotIn('initiative_mode', self.manifest())
 
-    def start(self, *, review=False):
-        self.cli('init', '--scope', 'feature')
+    def start(self, *, review=False, guided=False):
+        args = ['--guided-design-review'] if guided else []
+        self.cli('init', '--scope', 'feature', *args)
+        manifest = self.manifest()
+        # Existing workflow fixtures predate the separate intake checkpoint.
+        manifest.pop('initial_alignment_required', None)
         if not review:
             # Reproduce a blueprint manifest written before conversational review existed.
-            manifest = self.manifest()
             manifest.pop('slice_review_required', None)
             manifest.pop('visual_baselines_required', None)
             manifest['schema_version'] = 4
-            (self.directory / 'manifest.json').write_text(json.dumps(manifest))
+        (self.directory / 'manifest.json').write_text(json.dumps(manifest))
 
 
     def exchange(self, exchange_id='choose-layout', status='decided', **changes):
@@ -3791,7 +3794,7 @@ print(json.dumps(output))
                 self.cli(command, argument, self.payload(step, payload))
 
     def test_guided_approval_requires_all_workstreams_and_consistency_evidence(self):
-        self.cli('init', '--scope', 'feature', '--guided-design-review')
+        self.start(review=True, guided=True)
         self.exchange()
 
         def checkpoint(step, phase, version, name=None, *, skip=False):

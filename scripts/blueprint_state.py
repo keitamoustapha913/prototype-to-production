@@ -23,6 +23,20 @@ ROADMAP_SECTIONS = frozenset({
     'objective', 'user journeys', 'scope boundary', 'preservation constraints',
     'workstreams', 'dependencies', 'risks', 'build order',
 })
+ALIGNMENT_CLASSIFICATIONS = {
+    'already_implemented': 'Already implemented',
+    'partially_implemented': 'Partially implemented',
+    'missing': 'Missing',
+    'conflicting': 'Conflicting',
+    'not_yet_verified': 'Not yet verified',
+}
+ALIGNMENT_CONFIRMATION = re.compile(
+    r'^(?:yes[, .!:]+)?(?:'
+    r'(?:i )?confirm(?:ed)?(?=$|[,.!:])|'
+    r'(?:i )?confirm (?:your |the |that you )?(?:initial )?underst(?:and|ood)\w*\b|'
+    r'you (?:correctly )?(?:understand|understood)\b|'
+    r'(?:your understanding|that) (?:is (?:accurate|correct)|(?:accurately )?(?:matches|captures|reflects))\b)'
+)
 SURFACE_PARTS = {'ui': {'ui'}, 'backend': {'backend'}, 'fullstack': {'ui', 'backend'}}
 SCRIPT_SUFFIXES = {'.py', '.sh', '.js', '.mjs', '.cjs', '.ts', '.mts', '.cts', '.rb', '.php', '.ps1'}
 BACKEND_CONTRACT_FIELDS = ('request', 'response', 'authorization', 'side_effects', 'failure', 'compatibility')
@@ -438,20 +452,31 @@ class BlueprintState:
         hashes = self.hashes(paths) if paths else {}
         sources = {p:self.api.digest_of(self.api.project_source_file(self.directory.parents[2], p))
                    for p in value.get('source_paths', [])}
+        if record_type == 'review_checkpoint' and value.get('review_step') == 'initial_alignment' and value['status'] == 'open':
+            hashes.update(self.decisions(value.get('scope_removal_decision_ids', []), allow_empty=True))
+            self.write_alignment_map(value)
+            hashes.update(self.hashes([value['alignment_map_path']]))
+            value['evidence_paths'] = [*value['evidence_paths'], value['alignment_map_path']]
         self.freeze('conversation', key, {**value, 'recorded_at':self.api.utc_now(),
                     'source_hashes_at_record':sources}, hashes, transition=transition)
+        if record_type == 'review_checkpoint' and value.get('review_step') == 'initial_alignment' and value['status'] == 'open':
+            self.manifest['stage'] = 'discover'
         if transition is None:
             self.persist()
 
     def check_review_checkpoint(self, value):
         step = value.get('review_step')
-        self.require((step, value['phase']) in (('discovery', 'discover'), ('roadmap', 'plan'),
+        self.require((step, value['phase']) in (('initial_alignment', 'discover'),
+                                                ('discovery', 'discover'), ('roadmap', 'plan'),
                                                 ('workstream', 'blueprint'))
                      and self.text(value.get('review_target')),
                      'Review checkpoint needs the displayed stage and review target')
         self.require(not any(key in value for key in ('authorized_changes', 'protected_visual_decisions',
                                                      'report_id', 'supersedes')),
                      'Review checkpoints record presentation and pacing only; record design decisions separately')
+        if step == 'initial_alignment':
+            self.check_initial_alignment(value)
+            return
         if self.manifest.get('guided_design_review'):
             version = value.get('review_version')
             self.require(self.identifier(version), 'Review checkpoint needs the exact audit, roadmap or blueprint version')
@@ -490,6 +515,112 @@ class BlueprintState:
         return [record for record in self.conversations()
                 if record.get('record_type') == 'review_checkpoint'
                 and record.get('review_step') == step and record['status'] == 'decided']
+
+    def check_initial_alignment(self, value):
+        self.require(not any(self.manifest.get(field) for field in
+                             ('blueprint_plans', 'prototype_coverage', 'approvals')),
+                     'Initial understanding is scoped to intake; use the design amendment workflow after planning')
+        self.require(self.identifier(value.get('review_version')), 'Initial alignment needs a stable review version')
+        records = self.initial_alignment_records()
+        if value['status'] == 'open':
+            self.require(not any(value.get(key) for key in ('review_action', 'responds_to')),
+                         'Open initial alignment needs the actual terminal presentation')
+            self.markdown(value.get('evidence_paths'))
+            self.require(not any(record.get('review_step') == 'initial_alignment' for record in self.pending()),
+                         'Resolve the current initial alignment presentation first')
+            prior = [record for record in records if record['status'] == 'open']
+            self.require(all(record['review_version'] != value['review_version'] for record in prior),
+                         'Present revised understanding under a fresh review version')
+            self.require(all(set(value['evidence_paths']).isdisjoint(record['presentation_paths']) for record in prior),
+                         'Save a fresh terminal presentation when you revise initial understanding')
+            rows = value.get('requirement_mappings')
+            self.require(isinstance(rows, list) and rows, 'Map every requirement with evidence before confirmation')
+            ids, sources, evidence = set(), set(value.get('source_paths', [])), set(value['evidence_paths'])
+            for row in rows:
+                self.require(isinstance(row, dict) and self.identifier(row.get('requirement_id'))
+                             and all(self.text(row.get(field)) for field in
+                                     ('text', 'request_reference', 'classification', 'finding', 'direction'))
+                             and row['classification'] in ALIGNMENT_CLASSIFICATIONS
+                             and self.strings(row.get('source_paths', []), False)
+                             and self.strings(row.get('evidence_paths', []), False)
+                             and (row.get('source_paths') or row.get('evidence_paths')),
+                             'Each requirement needs a stable ID, request reference, classification, finding, direction and evidence')
+                key = row['requirement_id']
+                self.require(key not in ids, 'Duplicate initial alignment requirement ID')
+                ids.add(key)
+                sources.update(row.get('source_paths', []))
+                evidence.update(row.get('evidence_paths', []))
+            self.require(ids == set(value.get('requirement_ids', [])),
+                         'Checkpoint scope must include every mapped requirement ID')
+            removal_ids = value.get('scope_removal_decision_ids', [])
+            self.require(self.strings(removal_ids, False), 'Scope removal decision IDs must be distinct')
+            dropped = set(prior[-1]['requirement_ids']) - ids if prior else set()
+            removed = {change['baseline_id'] for decision_id in removal_ids
+                       for change in self.load('conversation', decision_id).get('authorized_changes', [])
+                       if change['classification'] == 'REMOVE'}
+            self.require(dropped == removed and (dropped or not removal_ids),
+                         'Every dropped requirement needs an explicit scope removal decision')
+            path = f"alignment/{value['review_version']}.md"
+            self.require(path not in evidence, 'Keep the generated requirement map separate from input evidence')
+            value.update(presentation_paths=value['evidence_paths'], source_paths=sorted(sources),
+                         evidence_paths=sorted(evidence), alignment_map_path=path)
+            return
+        action = value.get('review_action')
+        self.require(value['status'] == 'decided' and action in ('confirm', 'revise') and value.get('responds_to'),
+                     'Initial understanding cannot be waived; record an actual confirmation or correction to the open presentation')
+        self.require(not any(field in value for field in ('requirement_mappings', 'alignment_map_path',
+                                                          'scope_removal_decision_ids')),
+                     'Record a new presentation to change the requirement map')
+        if action == 'confirm':
+            response = ' '.join(value['response'].casefold().strip().rstrip('.!').split())
+            self.require(ALIGNMENT_CONFIRMATION.search(response)
+                         and not re.search(r'\b(?:you (?:missed|misunderstood|forgot)|not (?:correct|accurate)|'
+                                           r'i (?:disagree|do not confirm)|(?:please )?skip (?:the |this )?(?:checkpoint|confirmation))\b',
+                                           response),
+                         'Ask the user to explicitly confirm your understanding before planning')
+            self.require(all(record['exchange_id'] == value['responds_to'] for record in self.pending()),
+                         'Resolve outstanding consequential questions before confirming initial understanding')
+            presentation = self.load('conversation', value['responds_to'])
+            errors = self.check_question_sources(self.directory.parents[2], [presentation])
+            self.require(not errors, 'Update the evidence and present revised understanding: ' + '; '.join(errors))
+
+    def write_alignment_map(self, value):
+        lines = ['# Initial Understanding and Alignment', '', f"Revision `{value['review_version']}`"]
+        if removal_ids := value.get('scope_removal_decision_ids'):
+            lines.extend(['', 'Scope removal decisions', '', *[f'- `{key}`' for key in removal_ids]])
+        for row in value['requirement_mappings']:
+            lines.extend(['', f"## {row['requirement_id']}", '', row['text'], '',
+                          f"- Request reference — {row['request_reference']}",
+                          f"- Classification — {ALIGNMENT_CLASSIFICATIONS[row['classification']]}",
+                          f"- Finding — {row['finding']}", f"- Proposed direction — {row['direction']}"])
+            lines.extend(f"- {label} — `{path}`" for field, label in
+                         (('source_paths', 'Repository source'), ('evidence_paths', 'Evidence'))
+                         for path in row.get(field, []))
+        path = self.directory / value['alignment_map_path']
+        content = '\n'.join(lines) + '\n'
+        self.require(path.resolve().is_relative_to(self.directory.resolve()),
+                     'Requirement map must stay inside the initiative')
+        if path.exists():
+            self.require(path.read_text(encoding='utf-8') == content, 'Use a new version for a changed requirement map')
+        else:
+            self.api.atomic_text(path, content)
+
+    def initial_alignment_records(self):
+        return [record for record in self.conversations()
+                if record.get('record_type') == 'review_checkpoint' and record.get('review_step') == 'initial_alignment']
+
+    def confirmed_alignment(self, *, check_sources=False):
+        records = self.initial_alignment_records()
+        if not records and not self.manifest.get('initial_alignment_required'):
+            return {}, {}
+        answer = records[-1] if records else {}
+        self.require(answer.get('review_action') == 'confirm' and not self.pending(),
+                     'Initial understanding requires explicit user confirmation of the current presentation before planning')
+        presentation = self.load('conversation', answer['responds_to'])
+        if check_sources:
+            errors = self.check_question_sources(self.directory.parents[2], [presentation])
+            self.require(not errors, 'Update the evidence and reconfirm initial understanding: ' + '; '.join(errors))
+        return self.review_exchange_hashes([answer]), presentation
 
     def review_exchange_hashes(self, answers):
         hashes = {}
@@ -540,7 +671,11 @@ class BlueprintState:
         self.require(candidate.get('scope') == self.manifest['scope'], 'Discovery scope must match initiative')
         self.require(self.identifier(candidate.get('audit_id')), 'Stable audit ID required')
         audit_id = candidate['audit_id']
-        review_hashes = self.stage_review_hashes('discovery', audit_id)
+        alignment_hashes, alignment = {}, {}
+        if not self.manifest.get('blueprint_plans'):
+            alignment_hashes, alignment = self.confirmed_alignment(check_sources=True)
+        confirmed_requirements = {row['requirement_id']: row['text'] for row in alignment.get('requirement_mappings', [])}
+        review_hashes = {**alignment_hashes, **self.stage_review_hashes('discovery', audit_id)}
         kind, surface = candidate.get('baseline_kind'), candidate.get('surface')
         self.require(kind in {'existing','greenfield'} and surface in {'ui','backend','fullstack'},
                      'Blueprint discovery requires baseline_kind and surface')
@@ -551,10 +686,14 @@ class BlueprintState:
             self.require(previous.get('baseline_kind') == kind and previous.get('surface') == surface,
                          'Baseline kind/surface cannot silently change')
         requirements = candidate.get('requirements', [])
-        self.require(isinstance(requirements, list) and (requirements or kind == 'existing'),
+        self.require(isinstance(requirements, list) and (requirements or kind == 'existing' or confirmed_requirements),
                      'Greenfield needs recorded user requirements; use a requirements list for existing apps')
         prior_requirements = (previous or {}).get('requirements', [])
-        self.require(all(requirement in requirements for requirement in prior_requirements),
+        previous_alignment = (previous or {}).get('initial_alignment_id')
+        revised_ids = (set(self.load('conversation', previous_alignment)['requirement_ids'])
+                       if alignment and previous_alignment and previous_alignment != alignment['exchange_id'] else set())
+        self.require(all(requirement in requirements or requirement['requirement_id'] in revised_ids
+                         for requirement in prior_requirements),
                      'Cannot remove/rewrite prior requirements')
         if kind == 'greenfield':
             self.require(candidate.get('features') == [] and candidate.get('unresolved') == [],
@@ -626,9 +765,21 @@ class BlueprintState:
                          and self.text(requirement.get('text')), 'Requirements need stable IDs and actual intent')
             key = requirement['requirement_id']
             self.require(key not in ids, f'Requirement ID {key} duplicates another requirement or observed A feature')
-            hashes.update(self.decisions(requirement.get('decision_ids'), key,
-                                         historical=requirement in prior_requirements))
+            if key in confirmed_requirements:
+                self.require(requirement['text'] == confirmed_requirements[key],
+                             f'Discovery must match the confirmed requirement text for {key}')
+            prior_decisions = next((row.get('decision_ids') for row in prior_requirements
+                                    if row['requirement_id'] == key), None)
+            hashes.update(self.decisions(requirement.get('decision_ids', []), key,
+                                         historical=requirement in prior_requirements,
+                                         allow_empty=key in confirmed_requirements or prior_decisions == []))
             ids.append(key)
+        self.require(confirmed_requirements.keys() <= {requirement['requirement_id'] for requirement in requirements},
+                     'The discovery audit must carry all confirmed requirement IDs')
+        if alignment:
+            candidate = {**candidate, 'initial_alignment_id': alignment['exchange_id']}
+        elif previous_alignment:
+            candidate = {**candidate, 'initial_alignment_id': previous_alignment}
 
         hashes.update(review_hashes)
         registry = self.manifest.setdefault('discovery_audits', {})
@@ -818,17 +969,21 @@ class BlueprintState:
             journal = [json.loads(line) for line in (self.directory/'decisions.jsonl').read_text().splitlines()]
             frozen = {(e['group'], e['record_id']):e['entry'] for e in journal
                       if e.get('type') == 'blueprint_record_frozen'}
-            for group in GROUP_PATHS:
+            blueprint = self.api.initiative_mode(self.manifest) == 'blueprint'
+            groups = GROUP_PATHS if blueprint else {'conversation': GROUP_PATHS['conversation']}
+            for group in groups:
                 for key, entry in self.manifest.get(group, {}).items():
                     self.load(group, key)
                     self.require(frozen.get((group,key)) == entry, 'Record registry differs from append-only journal')
             self.require(all(key in self.manifest.get(group, {}) or (group,key) == recovering for group,key in frozen),
                          'Frozen conversation/spec record is missing from manifest')
-            for group, folder in GROUP_PATHS.items():
+            for group, folder in groups.items():
                 for path in (self.directory/folder).glob('*.json'):
                     key = path.stem
                     self.require(key in self.manifest.get(group, {}) or (group,key) == recovering,
                                  f'Incomplete record write: {path.relative_to(self.directory)}; retry original command with exact input')
+            if not blueprint:
+                return errors
             created_slices = {e['slice_id'] for e in journal if e.get('type') == 'blueprint_slice_created'}
             saved_slices = {path.parent.name for path in (self.directory / 'slices').glob('*/contract.json')}
             for key in sorted((created_slices | saved_slices) - self.manifest.get('slices', {}).keys()):
@@ -951,6 +1106,21 @@ class BlueprintState:
         for field in ('workstreams','dependencies','risks'):
             self.require(self.strings(value.get(field), nonempty=field == 'workstreams'), f'Plan requires concrete {field}')
         hashes = self.baseline_hashes(value.get('baseline_id'))
+        first_plan = not self.manifest.get('blueprint_plans')
+        alignment_hashes, alignment = self.confirmed_alignment(check_sources=first_plan)
+        alignment_ids = set(alignment.get('requirement_ids', []))
+        if first_plan:
+            self.require(alignment_hashes.items() <= hashes.items(),
+                         'Freeze discovery against the current initial understanding before recording the roadmap')
+        if alignment_ids:
+            workstreams = value.get('requirement_workstreams')
+            self.require(isinstance(workstreams, dict) and alignment_ids <= workstreams.keys()
+                         and workstreams.keys() <= {row['requirement_id']
+                                                    for row in self.baseline(value['baseline_id']).get('requirements', [])}
+                         and all(self.strings(names) and set(names) <= set(value['workstreams'])
+                                 for names in workstreams.values()),
+                         'Map every confirmed requirement ID to the applicable roadmap workstreams')
+        hashes.update(alignment_hashes)
         hashes.update(self.stage_review_hashes('roadmap', value['version']))
         hashes.update(self.decisions(value.get('decision_ids'), allow_empty=True))
         self.require_applicable_decisions({**value, 'features': []})

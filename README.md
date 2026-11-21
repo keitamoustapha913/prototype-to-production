@@ -54,7 +54,7 @@ The agent discovers the relevant app, scope, and initiative from the repository 
 New initiatives default to **blueprint-first**:
 
 1. Inspect actual source and behavior, or verify an empty baseline for a new project.
-2. Explain the discovery findings in the terminal and invite corrections. Discuss one consequential question at a time and preserve exact questions and actual answers.
+2. Discuss the findings in Codex CLI, one significant area at a time. Codex records the evidence and classification for each requirement and shares the full map in Markdown and the viewer. Explicitly confirm Codex’s current understanding before planning. [Initial Understanding and Alignment](references/initial-alignment.md)
 3. Review the proposed roadmap in the terminal before freezing it. Draft indexed Markdown/Mermaid feature specifications with behavior, state, UI or API contracts and acceptance checks.
 4. Walk through one blueprint workstream at a time using compact terminal illustrations. Say **Continue** or **Next** when ready to advance. The current position and pending discussion survive a fresh session. After the last workstream, Codex checks consistency and coverage, then asks for formal approval of the exact blueprint. Detailed documents and the browser viewer are available throughout. [Guided design review](references/guided-design-review.md)
 5. Draft the complete slice inventory and an illustrated implementation guide for each slice. Review the slices one at a time by default.
@@ -63,7 +63,7 @@ New initiatives default to **blueprint-first**:
 
 A complete runnable clone is optional. Backend-only work needs source/API/test evidence rather than screenshots. UI blueprint verification checks concrete approved criteria and real rendered states; it does not claim pixel equality against a nonexistent prototype.
 
-To choose the preserved full-prototype route, request it explicitly or initialize with `--mode prototype`. That route still requires complete A-to-B interaction coverage, two clean-context replays, exact source/screenshot approval and approved-B verification. Existing manifests without a mode remain prototype initiatives; they are never automatically migrated.
+To choose the full-prototype route, request it explicitly or initialize with `--mode prototype`. That route starts with the same initial understanding checkpoint and requires complete A-to-B interaction coverage, two clean-context replays, exact source/screenshot approval and approved-B verification. Existing manifests without a mode retain prototype semantics.
 
 Pending questions and task progress are durable. `resume --format json` also links decisions and coverage to their slices. Missing functionality blocks delivery until a fresh audit and the appropriate new approval. Transfer the complete Git-ignored initiative directory when moving between clones or machines.
 

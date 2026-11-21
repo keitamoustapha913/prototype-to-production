@@ -204,8 +204,10 @@ def record_blueprint_command(directory: Path, command: str, input_file: str, pro
         if command == "conversation-record" and recover_workflow_transition(directory, request):
             return
         manifest = manifest_at(directory)
-        if initiative_mode(manifest) != "blueprint":
-            raise StateError("Blueprint commands require an explicitly initialized blueprint initiative")
+        if initiative_mode(manifest) != "blueprint" and not (
+            command == "conversation-record" and value.get("phase") == "discover"
+        ):
+            raise StateError("Blueprint commands require blueprint mode, except for prototype discovery conversation")
         state = blueprint_state(directory, manifest)
         group = {"conversation-record":"conversation", "plan-record":"blueprint_plans",
                  "blueprint-record":"blueprints", "blueprint-coverage":"blueprint_coverage",
@@ -609,6 +611,13 @@ def record_discovery(directory: Path, project_root: Path, audit_file: str) -> No
     candidate = read_json(Path(audit_file))
     with coordinator_lock(directory):
         manifest = manifest_at(directory)
+        state = blueprint_state(directory, manifest)
+        alignment_hashes, alignment = {}, {}
+        if not manifest.get("prototype_coverage"):
+            integrity_errors = state.check_records()
+            if integrity_errors:
+                raise StateError("Reconcile protected conversation history first: " + "; ".join(integrity_errors))
+            alignment_hashes, alignment = state.confirmed_alignment(check_sources=True)
         audits = manifest.setdefault("discovery_audits", {})
         audit_id = candidate.get("audit_id")
         if not isinstance(audit_id, str) or not VERSION_ID.fullmatch(audit_id):
@@ -658,10 +667,13 @@ def record_discovery(directory: Path, project_root: Path, audit_file: str) -> No
         relative = f"discovery/audits/{audit_id}.json"
         if (directory / relative).exists():
             raise StateError("Refusing to overwrite an existing discovery audit")
+        alignment_id = alignment.get("exchange_id") or (previous or {}).get("initial_alignment_id")
+        if alignment_id:
+            candidate = {**candidate, "initial_alignment_id": alignment_id}
         atomic_json(directory / relative, candidate)
         audits[audit_id] = {
             "path": relative, "sha256": digest_of(directory / relative),
-            "evidence_hashes": evidence, "source_hashes_at_discovery": sources,
+            "evidence_hashes": {**evidence, **alignment_hashes}, "source_hashes_at_discovery": sources,
             "feature_ids": [item["feature_id"] for item in candidate["features"]],
         }
         if not previous_id and (manifest.get("visual_baselines_required") or manifest.get("visual_baselines")):
@@ -785,6 +797,14 @@ def record_prototype_coverage(directory: Path, coverage_file: str) -> None:
         audits = manifest.get("discovery_audits", {})
         if not audit_id or audit_id not in audits:
             raise StateError("Functionality coverage BLOCKED: first freeze a source/browser application-A discovery")
+        if not manifest.get("prototype_coverage"):
+            state = blueprint_state(directory, manifest)
+            integrity_errors = state.check_records()
+            if integrity_errors:
+                raise StateError("Reconcile protected conversation history first: " + "; ".join(integrity_errors))
+            alignment_hashes, _ = state.confirmed_alignment(check_sources=True)
+            state.require(alignment_hashes.items() <= audits[audit_id]["evidence_hashes"].items(),
+                          "Freeze discovery against the current initial understanding before recording prototype coverage")
         version = candidate.get("prototype_version")
         if not isinstance(version, str) or not VERSION_ID.fullmatch(version):
             raise StateError("Prototype functionality coverage needs a stable prototype_version")
@@ -793,6 +813,10 @@ def record_prototype_coverage(directory: Path, coverage_file: str) -> None:
         if version in manifest.setdefault("prototype_coverage", {}):
             raise StateError("Prototype functionality coverage is already frozen; use a new prototype version")
         audit = read_json(artifact_file(directory, audits[audit_id]["path"]))
+        if alignment_id := audit.get("initial_alignment_id"):
+            alignment = blueprint_state(directory, manifest).load("conversation", alignment_id)
+            candidate = {**candidate, "initial_alignment_id": alignment_id,
+                         "requirement_ids": alignment["requirement_ids"]}
         required = {item["feature_id"] for item in audit["features"]}
         for report_id, report in manifest.get("missing_reports", {}).items():
             if report.get("status") != "open":
@@ -1356,6 +1380,7 @@ def initialize(directory: Path, scope: str, next_action: str | None, mode: str |
             "schema_version": 4,
             "visual_qa_version": 1,
             "visual_baselines_required": True,
+            "initial_alignment_required": True,
             "final_visual_quality_required": True,
             "initiative_id": directory.name,
             "scope": scope,
@@ -1471,6 +1496,7 @@ def work_update(directory: Path, project_root: Path, work_file: str) -> None:
     with coordinator_lock(directory):
         manifest = manifest_at(directory)
         blueprint = initiative_mode(manifest) == "blueprint"
+        recorded_conversation = blueprint or bool(manifest.get("conversation"))
         if value["phase"] in {"plan", "blueprint", "slice_review"} and not blueprint:
             raise StateError("Plan/blueprint phases require blueprint mode")
         if blueprint and value["phase"] != manifest["stage"]:
@@ -1490,7 +1516,7 @@ def work_update(directory: Path, project_root: Path, work_file: str) -> None:
                 raise StateError("Pending question requires waiting_user status")
         items = manifest.setdefault("work_items", {})
         existing = items.get(task_id)
-        if (blueprint and existing and existing.get("pending_question_id")
+        if (recorded_conversation and existing and existing.get("pending_question_id")
                 and existing["pending_question_id"] != question_id):
             state = blueprint_state(directory, manifest)
             answer, context = state.question_context(existing["pending_question_id"], state.conversations())
@@ -1671,6 +1697,17 @@ def create_slice(directory: Path, contract_file: str) -> None:
             errors.append("Duplicate slice_id; existing slices cannot be overwritten")
         if candidate.get("prototype_version") != approval["approved_version"]:
             errors.append("Slice must target the current exact approved prototype version")
+        approved_coverage = approval.get("functionality_coverage") or {}
+        coverage_entry = manifest.get("prototype_coverage", {}).get(approved_coverage.get("prototype_version"))
+        if coverage_entry:
+            coverage = read_json(artifact_file(directory, coverage_entry["path"]))
+            if alignment_id := coverage.get("initial_alignment_id"):
+                state = blueprint_state(directory, manifest)
+                alignment = state.load("conversation", alignment_id)
+                requirement_ids = candidate.get("requirement_ids")
+                if not state.strings(requirement_ids, False) or not set(requirement_ids) <= set(coverage["requirement_ids"]):
+                    errors.append("Slice requirement_ids must identify the applicable confirmed requirements")
+                candidate = {**candidate, "initial_alignment_map": alignment["alignment_map_path"]}
         permitted_scopes = {
             "app": {"app", "page", "feature"},
             "page": {"page", "feature"},
@@ -2506,6 +2543,8 @@ def check_initiative(directory: Path, manifest: dict, *, allow_questions: bool =
             state.check_baseline_before_delivery()
         except (StateError, KeyError, OSError) as error:
             errors.append(str(error))
+    elif manifest.get("initial_alignment_required") or manifest.get("conversation"):
+        errors.extend(blueprint_state(directory, manifest).check_records())
     for slice_id, assignment in manifest.get("slices", {}).items():
         status = assignment.get("status")
         blockers = assignment.get("blockers", [])
@@ -2990,7 +3029,7 @@ def build_resume_packet(directory: Path, project_root: Path, *, delivery_slice: 
     active_question_answer = None
     question_source_errors = []
     conversation_usage, coverage_with_slices = {}, []
-    if initiative_mode(manifest) == "blueprint":
+    if initiative_mode(manifest) == "blueprint" or manifest.get("initial_alignment_required") or manifest.get("conversation"):
         state = blueprint_state(directory, manifest)
         try:
             conversation = state.conversations()
@@ -3003,10 +3042,11 @@ def build_resume_packet(directory: Path, project_root: Path, *, delivery_slice: 
                     question_source_errors.extend(state.check_question_sources(project_root, [question_context]))
         except (StateError, OSError, ValueError, KeyError, TypeError) as error:
             errors.append(f"Conversation recovery is blocked: {error}")
-        try:
-            conversation_usage, coverage_with_slices = state.traceability()
-        except (StateError, OSError, ValueError, KeyError, TypeError) as error:
-            errors.append(f"Traceability recovery is blocked: {error}")
+        if initiative_mode(manifest) == "blueprint":
+            try:
+                conversation_usage, coverage_with_slices = state.traceability()
+            except (StateError, OSError, ValueError, KeyError, TypeError) as error:
+                errors.append(f"Traceability recovery is blocked: {error}")
     errors.extend(question_source_errors)
     review = slice_review_state(directory, manifest).summary() if initiative_mode(manifest) == "blueprint" else None
     if review and review.get("pending_question_id") and not any(

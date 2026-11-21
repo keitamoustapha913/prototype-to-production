@@ -74,16 +74,19 @@ class ProjectStateTests(unittest.TestCase):
         }
         return self.cli("work-update", "--work-file", self.write_input("work.json", payload))
 
-    def init(self, *, legacy=True, scope="page"):
+    def init(self, *, legacy=True, scope="page", alignment=False):
         self.cli("init", "--scope", scope, "--next-action", "Map billing states")
+        if not self.initiative.exists():
+            self.initiative = self.root / ".artifacts/prototype-to-production/billing-refresh"
+        path = self.initiative / "manifest.json"
+        manifest = self.manifest()
+        # These fixtures start with the workflow that predates the intake checkpoint.
+        if not alignment:
+            manifest.pop("initial_alignment_required", None)
         if legacy:
             # Compatibility fixtures predate the visual baseline requirement.
-            if not self.initiative.exists():
-                self.initiative = self.root / ".artifacts/prototype-to-production/billing-refresh"
-            path = self.initiative / "manifest.json"
-            manifest = self.manifest()
             manifest.pop("visual_baselines_required", None)
-            path.write_text(json.dumps(manifest), encoding="utf-8")
+        path.write_text(json.dumps(manifest), encoding="utf-8")
 
     def write_input(self, name, data):
         path = self.root / name
@@ -263,6 +266,43 @@ class ProjectStateTests(unittest.TestCase):
 
     def slice_create(self, packet, success=True):
         return self.cli("slice-create", "--contract-file", self.write_input("slice.json", packet), success=success)
+
+    def test_prototype_coverage_and_slice_carry_confirmed_requirement_ids(self):
+        self.init(alignment=True)
+        audit = self.discovery_audit()
+        self.artifact("alignment/presentation.md", b"# Understanding the request\n\nPreserve invoice filtering.\n")
+        checkpoint = {
+            "exchange_id": "intake-v1", "phase": "discover", "record_type": "review_checkpoint",
+            "review_step": "initial_alignment", "review_version": "intake-v1",
+            "review_target": "Initial Understanding and Alignment", "status": "open",
+            "question": "Do you confirm my understanding?", "requirement_ids": ["invoice-filters"],
+        }
+        self.cli("conversation-record", "--exchange-file", self.write_input("prompt.json", {
+            **checkpoint, "evidence_paths": ["alignment/presentation.md"], "requirement_mappings": [{
+                "requirement_id": "invoice-filters", "text": "Preserve invoice filtering.",
+                "request_reference": "User brief, invoice filter", "classification": "already_implemented",
+                "finding": "The invoice search action exists.", "direction": "Preserve the current results.",
+                "source_paths": ["src/invoices.ts"],
+            }],
+        }))
+        self.cli("conversation-record", "--exchange-file", self.write_input("answer.json", {
+            **checkpoint, "exchange_id": "intake-v1-answer", "status": "decided", "responds_to": "intake-v1",
+            "response": "Confirm understanding", "review_action": "confirm",
+        }))
+        self.discovery_record(audit)
+        approval = self.approval()
+        self.approve(approval)
+        coverage = json.loads((self.initiative / "coverage/versions/v1.json").read_text())
+        self.assertEqual(coverage["requirement_ids"], ["invoice-filters"])
+        packet = self.slice_packet(approval)
+        packet["requirement_ids"] = ["unknown"]
+        rejected = self.slice_create(packet, success=False)
+        self.assertIn("applicable confirmed requirements", rejected.stderr)
+        packet["requirement_ids"] = ["invoice-filters"]
+        self.slice_create(packet)
+        saved = json.loads((self.initiative / "slices/invoice-list/contract.json").read_text())
+        self.assertEqual(saved["requirement_ids"], ["invoice-filters"])
+        self.assertEqual(saved["initial_alignment_map"], "alignment/intake-v1.md")
 
     def submit_slice(self):
         report = {
