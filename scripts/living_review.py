@@ -825,12 +825,18 @@ def serve(root, port):
                             baseline_errors = visual_baseline.history_errors(root, manifest)
                             warnings.extend(baseline_errors)
                             baselines = visual_baseline.catalog(root, manifest) if not baseline_errors else []
+                            quality_module = project_state.sibling_module("visual_quality")
+                            try:
+                                quality = quality_module.status(root, manifest)
+                            except quality_module.EVIDENCE_ERRORS as exc:
+                                quality = None
+                                warnings.append(f"Visual Quality Report unavailable: {exc}")
                         dispatchable = set()
                         next_action = manifest.get('next_action')
                         shared_blockers = {}
                         if manifest.get('slices'):
                             try:
-                                packet = project_state.build_resume_packet(root, root.parents[2])
+                                packet = project_state.build_resume_packet(root, root.parents[2], include_quality=False)
                                 dispatchable.update(packet['dispatchable_slices'])
                                 shared_blockers = packet['cross_screen_blockers']
                                 next_action = packet['next_action']
@@ -849,8 +855,21 @@ def serve(root, port):
                         data, kind = encode({'attempts': records, 'cross_screen_changes': cross_screen_changes,
                                              'visual_baselines': baselines, 'project': {
                             'next_action': next_action, 'stage': manifest.get('stage'), 'slices': slices,
-                            'history_warnings': warnings,
+                            'history_warnings': warnings, 'visual_quality': quality,
                         }}), 'application/json'
+                    elif match := re.fullmatch(r'/visual-quality/warning/([a-z][a-z0-9-]{2,60})/(\d+)/(before|after)', route):
+                        try:
+                            from scripts import project_state
+                        except ModuleNotFoundError:
+                            import project_state
+                        module = project_state.sibling_module("visual_quality")
+                        warning_id, index, side = match.groups()
+                        with project_state.coordinator_lock(root):
+                            try:
+                                data = module.warning_image(root, project_state.manifest_at(root), warning_id, int(index), side)
+                            except module.EVIDENCE_ERRORS + (IndexError,) as exc:
+                                raise ValueError(str(exc)) from exc
+                        kind = 'image/png'
                     elif route.startswith('/visual-integrity/design/'):
                         try:
                             from scripts import visual_baseline

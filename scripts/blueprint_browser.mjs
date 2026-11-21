@@ -286,7 +286,9 @@ async function capture({ browser, appUrl, renderCase, checks = [], build, intera
                 const node = document.querySelector(rule.selector);
                 switch (rule.probe) {
                     case 'visible': return { target: await visible(node) };
-                    case 'focused': return { actual: Boolean(node && document.activeElement === node) };
+                    case 'focused': return { actual: Boolean(node && document.activeElement === node),
+                        insideComponent: Boolean(ready && node && ready.contains(node)) };
+                    case 'accessibility': return {};
                     case 'text': return { missing: !node, actual: node?.textContent.trim() ?? null };
                     case 'attribute': return { missing: !node, actual: node?.getAttribute(rule.attribute) ?? null };
                     default: throw new Error('Unknown interaction assertion');
@@ -307,6 +309,7 @@ async function capture({ browser, appUrl, renderCase, checks = [], build, intera
                 const computed = getComputedStyle(node);
                 return Object.fromEntries(properties.map(name => [name, computed.getPropertyValue(name).trim()]));
             };
+            const controls = 'button, a[href], input:not([type="hidden"]), select, textarea, summary, audio[controls], video[controls], [onclick], [aria-controls], [tabindex], [contenteditable="true"], [role="button"], [role="link"], [role="checkbox"], [role="radio"], [role="combobox"], [role="menuitem"], [role="option"], [role="switch"], [role="slider"], [role="tab"], [role="textbox"]';
             const descendants = visualEvidence ? ready?.getElementsByTagName('*') : null;
             const [state, targets, probes] = await Promise.all([
                 visible(ready),
@@ -338,6 +341,7 @@ async function capture({ browser, appUrl, renderCase, checks = [], build, intera
                     },
                     structure: {
                         component: describe(ready),
+                        interactive_controls: ready && (Number(ready.matches(controls)) + ready.querySelectorAll(controls).length),
                         descendants: Array.from({length: Math.min(descendants?.length || 0, 200)}, (_, index) => {
                             const node = descendants[index];
                             let depth = 1;
@@ -381,14 +385,50 @@ async function capture({ browser, appUrl, renderCase, checks = [], build, intera
             }
         }
         if (evidenceDirectory || interaction_assertions.length) {
+            let documentNode;
+            const semantics = new Map();
+            async function accessibilityTarget(selector) {
+                if (semantics.has(selector)) return semantics.get(selector);
+                documentNode ??= (await send('DOM.getDocument', { depth: 0 })).root.nodeId;
+                const { nodeId } = await send('DOM.querySelector', { nodeId: documentNode, selector });
+                let target = null;
+                if (nodeId) {
+                    const { nodes } = await send('Accessibility.getPartialAXTree', { nodeId, fetchRelatives: false });
+                    const node = nodes[0];
+                    if (node && !node.ignored) {
+                        target = { name: node.name?.value ?? null, role: node.role?.value ?? null, disabled: false };
+                        for (const property of node.properties || []) {
+                            if (['expanded', 'disabled', 'checked', 'selected', 'pressed'].includes(property.name)) {
+                                const value = property.value.value;
+                                target[property.name] = value === 'true' ? true : value === 'false' ? false : value;
+                            }
+                        }
+                    }
+                }
+                semantics.set(selector, target);
+                return target;
+            }
             measurements.interactionAssertions = [];
+            const accessibilityTargets = [];
             for (const [index, rule] of interaction_assertions.entries()) {
                 const probe = probes[index];
-                const actual = rule.probe === 'visible'
-                    ? await showsMarker(rule.selector, probe.target) : probe.actual;
-                const result = !probe.missing && actual === rule.expected ? 'pass' : 'fail';
-                measurements.interactionAssertions.push({ ...rule, actual, result });
+                let actual = probe.actual;
+                let matches;
+                if (rule.probe === 'accessibility') {
+                    const target = await accessibilityTarget(rule.selector);
+                    actual = target && Object.fromEntries(Object.keys(rule.expected).map(key => [key, target[key] ?? null]));
+                    matches = Boolean(actual && Object.entries(rule.expected).every(([key, value]) => actual[key] === value));
+                } else {
+                    if (rule.probe === 'visible') actual = await showsMarker(rule.selector, probe.target);
+                    matches = !probe.missing && actual === rule.expected;
+                }
+                if (evidenceDirectory && rule.probe === 'focused' && actual === true) {
+                    const target = await accessibilityTarget(rule.selector);
+                    accessibilityTargets.push([rule.selector, { ...target, inside_component: probe.insideComponent }]);
+                }
+                measurements.interactionAssertions.push({ ...rule, actual, result: matches ? 'pass' : 'fail' });
             }
+            if (evidenceDirectory) measurements.accessibilityTargets = Object.fromEntries(accessibilityTargets);
         }
         const buildEvidence = build && await checkBuild(send, responses, build, url);
         if (evidenceDirectory) {

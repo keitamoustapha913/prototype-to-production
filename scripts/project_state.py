@@ -41,6 +41,10 @@ class StateError(Exception):
     """A stopped stage gate, never an implicit success."""
 
 
+class RequiredCheckFailed(StateError):
+    """An observed result violates a required acceptance check."""
+
+
 def initiative_mode(manifest: dict) -> str:
     mode = manifest.get("initiative_mode", "prototype")
     if mode not in {"blueprint", "prototype"}:
@@ -1349,6 +1353,7 @@ def initialize(directory: Path, scope: str, next_action: str | None, mode: str |
             "schema_version": 4,
             "visual_qa_version": 1,
             "visual_baselines_required": True,
+            "final_visual_quality_required": True,
             "initiative_id": directory.name,
             "scope": scope,
             "stage": "discover",
@@ -2036,6 +2041,7 @@ def validate_verification(directory: Path, slice_id: str, manifest: dict, review
         "evidence_hashes": artifact_hashes,
         "implementation_hashes": source_hashes,
         "warning_case_ids": sorted(warning_case_ids),
+        "observed_failure": any(item.get("result") == "FAIL" for item in [*visual, *functional] if isinstance(item, dict)),
         "status": "BLOCKED" if errors else ("WARNING" if warning_case_ids else "PASS"),
     }
     return record, errors
@@ -2720,6 +2726,7 @@ def reconcile_slice(directory: Path, slice_id: str, action: str, review_file: st
                 hashes[path] = digest_of(artifact_file(directory, path))
             assignment.setdefault("block_evidence_hashes", {}).update(hashes)
             assignment["status"] = "blocked"
+            assignment["required_check_failed"] = True
             open_visual_defect = VISUAL_DEFECT_BLOCKER in assignment.get("blockers", [])
             assignment["blockers"] = [blocker["reason"]]
             if open_visual_defect and VISUAL_DEFECT_BLOCKER != blocker["reason"]:
@@ -2743,6 +2750,7 @@ def reconcile_slice(directory: Path, slice_id: str, action: str, review_file: st
                     or not str(resolution.get("next_action") or "").strip()):
                 raise StateError("Unblocking requires an explicit resolution and next action")
             assignment["status"], assignment["blockers"] = "ready", []
+            assignment.pop("required_check_failed", None)
             manifest["stage"] = "implement"
             manifest["next_action"] = resolution["next_action"]
             journal(directory, {"type": "slice_unblocked_after_resolution", "slice_id": slice_id,
@@ -2788,6 +2796,7 @@ def reconcile_slice(directory: Path, slice_id: str, action: str, review_file: st
                 assignment["blockers"] = failures
                 block_dependents(directory, manifest, slice_id)
                 assignment["warning_case_ids"] = []
+                assignment["required_check_failed"] = bool(verified.get("observed_failure"))
                 manifest["stage"] = "verify"
                 manifest["next_action"] = "Fix verification blockers, rerun visual/functional checks and submit review"
                 journal(directory, {"type": "verification_blocked", "slice_id": slice_id, "errors": failures, "review": review})
@@ -2805,6 +2814,7 @@ def reconcile_slice(directory: Path, slice_id: str, action: str, review_file: st
             assignment["status"] = "provisional" if verified["status"] == "WARNING" else "verified"
             assignment["blockers"] = []
             assignment["warning_case_ids"] = verified["warning_case_ids"]
+            assignment.pop("required_check_failed", None)
             manifest["stage"] = "verify"
             if assignment["status"] == "provisional":
                 manifest["next_action"] = ("Continue dependent implementation; capture warning cases "
@@ -2835,7 +2845,8 @@ def reconcile_slice(directory: Path, slice_id: str, action: str, review_file: st
             journal(directory, {"type": "slice_accepted", "slice_id": slice_id, "approved_version": manifest["approved_version"]})
             unblock_dependents(directory, manifest)
             manifest["stage"] = "integrate" if (blueprint_state(directory, manifest).all_accepted() if initiative_mode(manifest) == "blueprint" else all_slices_accepted(directory, manifest)) else "implement"
-            manifest["next_action"] = "Review accepted slice integration and remaining dependencies; do not merge/deploy without user authorization"
+            manifest["next_action"] = ("Run the final Visual Quality Audit and present the completed report for user acceptance"
+                                       if manifest["stage"] == "integrate" else "Continue eligible implementation and verification")
         elif action == "accept-warning":
             if assignment["status"] != "provisional":
                 raise StateError("Only a provisional capture WARNING can receive explicit later user acceptance")
@@ -2863,7 +2874,8 @@ def reconcile_slice(directory: Path, slice_id: str, action: str, review_file: st
                                 "warning_case_ids": saved["warning_case_ids"], "decision": decision})
             unblock_dependents(directory, manifest)
             manifest["stage"] = "integrate" if (blueprint_state(directory, manifest).all_accepted() if initiative_mode(manifest) == "blueprint" else all_slices_accepted(directory, manifest)) else "implement"
-            manifest["next_action"] = "Review accepted slice integration and remaining dependencies; do not merge/deploy without user authorization"
+            manifest["next_action"] = ("Run the final Visual Quality Audit and present the completed report for user acceptance"
+                                       if manifest["stage"] == "integrate" else "Continue eligible implementation and verification")
         else:
             raise StateError(f"Unknown reconciliation action: {action}")
         note_progress(manifest, f"Slice {slice_id}: {assignment['status']} ({action})",
@@ -2925,7 +2937,8 @@ def recent_journal_events(directory: Path, limit: int = 30) -> list[dict]:
         raise StateError(f"Cannot reconstruct recent decision history from {path}: {error}") from error
 
 
-def build_resume_packet(directory: Path, project_root: Path, *, delivery_slice: str | None = None) -> dict:
+def build_resume_packet(directory: Path, project_root: Path, *, delivery_slice: str | None = None,
+                        include_quality: bool = True) -> dict:
     """Create a read-only, machine-usable continuation plan from durable files."""
     manifest = manifest_at(directory)
     independent_review_wait = False
@@ -3056,7 +3069,21 @@ def build_resume_packet(directory: Path, project_root: Path, *, delivery_slice: 
                            if manifest.get("visual_baselines") and not baselines.history_errors(directory, manifest)
                            else [])
     shared_changes = sibling_module("cross_screen").review_changes(directory, manifest, delivery_slice)
+    quality = None
+    if include_quality and manifest.get("visual_quality") and delivery_slice is None:
+        module = sibling_module("visual_quality")
+        try:
+            quality = module.status(directory, manifest)
+            if quality["acceptance_current"]:
+                next_action = "Final acceptance recorded. Use the Visual Review Register for deferred review."
+            elif quality["audit_current"] and quality["status"] in module.COMPLETE:
+                next_action = "Present the current Visual Quality Report for the user's final acceptance."
+            elif quality["audit_current"] and quality["status"] == "blocked":
+                next_action = "Resolve final audit blockers and continue eligible independent work."
+        except module.EVIDENCE_ERRORS as error:
+            errors.append(f"Visual Quality Report: {error}")
     return {
+        "visual_quality": quality,
         "cross_screen_blockers": shared_holds,
         "visual_baselines": original_references,
         "cross_screen_changes": shared_changes,
@@ -3104,7 +3131,12 @@ def print_resume(directory: Path, project_root: Path, *, delivery_slice: str | N
     packet = build_resume_packet(directory, project_root, delivery_slice=delivery_slice)
     manifest = manifest_at(directory)
     answer = packet["active_question_answer"]
-    print(render_checkpoint(manifest, resume_action=packet["next_action"] if answer else None))
+    quality = packet["visual_quality"]
+    if quality:
+        print("Application quality: " + quality["status"].replace("_", " "))
+        if quality["audit"] and not quality["audit_current"]:
+            print("The saved final audit is historical. Reverify affected work and run the final audit.")
+    print(render_checkpoint(manifest, resume_action=packet["next_action"] if answer or quality else None))
     active = manifest.get("approvals", {}).get(manifest.get("active_approval_id"))
     if active and packet["initiative_mode"] == "blueprint":
         print("Approved blueprint specifications:")
@@ -3178,7 +3210,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     for name in (
-        "init", "artifact-setup", "review-viewer", "review-revision", "visual-integrity", "visual-baseline", "cross-screen", "event", "checkpoint", "conversation-record", "plan-record", "blueprint-record", "blueprint-coverage", "blueprint-index-rebuild", "work-update", "discovery-record", "discovery-capture", "browser-build-fingerprint", "missing-feature", "prototype-coverage", "approve", "revoke-approval", "slice-create", "slice-cancel",
+        "init", "artifact-setup", "review-viewer", "review-revision", "visual-integrity", "visual-baseline", "cross-screen", "visual-quality", "event", "checkpoint", "conversation-record", "plan-record", "blueprint-record", "blueprint-coverage", "blueprint-index-rebuild", "work-update", "discovery-record", "discovery-capture", "browser-build-fingerprint", "missing-feature", "prototype-coverage", "approve", "revoke-approval", "slice-create", "slice-cancel",
         "slice-report", "reconcile", "warning-record", "warning-decide", "resume", "validate", *REVIEW_COMMANDS,
     ):
         sub = commands.add_parser(name)
@@ -3193,6 +3225,9 @@ def main(argv: list[str] | None = None) -> int:
             sub.add_argument("--slice-id")
             sub.add_argument("--attempt-file")
             sub.add_argument("--capture-file")
+        if name == "visual-quality":
+            sub.add_argument("--action", choices=["status", "audit", "accept"], required=True)
+            sub.add_argument("--input-file")
         if name == "cross-screen":
             sub.add_argument("--action", choices=["plan", "extend", "capture", "record", "abandon", "reuse", "ready", "list"], required=True)
             sub.add_argument("--slice-id")
@@ -3275,6 +3310,21 @@ def main(argv: list[str] | None = None) -> int:
                 with viewer.History(directory) as history:
                     state = history.sync(viewer.Documents(directory))
                 print(json.dumps(state, indent=2))
+        elif args.command == "visual-quality":
+            quality = sibling_module("visual_quality")
+            try:
+                if args.action == "status":
+                    with coordinator_lock(directory):
+                        result = quality.status(directory, manifest_at(directory))
+                else:
+                    if not args.input_file:
+                        raise StateError("Visual quality audit and acceptance require --input-file")
+                    result = getattr(quality, args.action)(directory, read_json(Path(args.input_file)))
+            except quality.EVIDENCE_ERRORS as error:
+                raise StateError(str(error)) from error
+            print(json.dumps(result, indent=2))
+            if args.action == "audit" and result["status"] not in quality.COMPLETE:
+                return 2
         elif args.command == "visual-integrity":
             visual = sibling_module("visual_integrity")
             if args.action == "capture":

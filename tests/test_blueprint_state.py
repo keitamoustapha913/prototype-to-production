@@ -2585,6 +2585,8 @@ elif kind == 'api':
     output['states'] = dict(success=f'{{member_status}} JSON array', forbidden=f'{{outsider_status}} forbidden',
                             error=f'{{failure_status}} retryable',
                             backend_failure=f'{{outsider_status}} forbidden; {{failure_status}} retryable')
+    if key == 'application-api' and os.environ.get('P2P_FIXTURE_AUDIT_FAIL'):
+        output.update(actual='Everyone gets 200', result='fail')
 else:
     values = {{'items-access':'16px', 'items-behavior':'Member can load items; outsider denied',
                'success-visibility':'visible'}}
@@ -2697,6 +2699,62 @@ print(json.dumps(output))
         self.assertEqual(resumed['active_work']['next_action'], resumed['next_action'])
         self.assertEqual(resumed['active_work']['pending_steps'], cursor['pending_steps'])
         self.cli('validate')
+
+    def test_final_audit_executes_checks_and_requires_explicit_current_acceptance(self):
+        self.assigned()
+        review = self.review()
+        self.cli('reconcile', '--slice-id', 'items-slice', '--action', 'verify',
+                 '--review-file', self.payload('review', review))
+        self.cli('reconcile', '--slice-id', 'items-slice', '--action', 'accept')
+        plan = {'approval_id': self.manifest()['active_approval_id'], 'checks': [{
+            'check_id': 'application-api', 'kind': 'integration', 'slice_ids': ['items-slice'],
+            'scenario': 'Exercise member, forbidden and unavailable storage routes',
+            'command': self.test_command('api', 'application-api'),
+            'test_source_paths': ['tests/test_items.py'],
+            'expected': 'Member gets 200 array; nonmember gets 403',
+        }]}
+        status = lambda: json.loads(self.cli('visual-quality', '--action', 'status').stdout)
+        args = ('--action', 'audit', '--input-file', self.payload('final-audit', plan))
+        self.env['P2P_FIXTURE_AUDIT_FAIL'] = '1'
+        try:
+            failed = json.loads(self.cli('visual-quality', *args, ok=False).stdout)
+        finally:
+            del self.env['P2P_FIXTURE_AUDIT_FAIL']
+        self.assertEqual(failed['status'], 'blocked')
+        self.assertEqual(failed['checks'][0]['result'], 'fail')
+        removed = self.cli('visual-quality', '--action', 'audit', '--input-file',
+                           self.payload('removed-check', {**plan, 'checks': [{
+                               **plan['checks'][0], 'check_id': 'replacement-api'}]}), ok=False)
+        self.assertIn('Retain mandatory audit check application-api', removed.stderr)
+        weakened = self.cli('visual-quality', '--action', 'audit', '--input-file',
+                            self.payload('weakened-audit', {**plan, 'checks': [{
+                                **plan['checks'][0], 'expected': 'Everyone gets 200'}]}), ok=False)
+        self.assertIn('Retain the expected outcome', weakened.stderr)
+        saved = json.loads(self.cli('visual-quality', *args).stdout)
+        self.assertEqual(saved['status'], 'technically_complete')
+        self.assertEqual(saved['checks'][0]['observation']['states'], BACKEND_OUTCOMES)
+        self.assertEqual(json.loads(self.cli('visual-quality', *args).stdout)['audit_id'], saved['audit_id'])
+        current = status()
+        self.assertFalse(current['acceptance_current'])
+        decision = {'approval_id': saved['approval_id'], 'audit_id': saved['audit_id'],
+                    'audit_sha256': current['audit_sha256'], 'approved_by_user': True,
+                    'user_response': 'I accept this completed application.'}
+        self.cli('visual-quality', '--action', 'accept',
+                 '--input-file', self.payload('wrong-decision', {**decision, 'audit_sha256': '0' * 64}), ok=False)
+        decision_file = self.payload('final-decision', decision)
+        self.cli('visual-quality', '--action', 'accept', '--input-file', decision_file)
+        self.assertEqual(status()['status'], 'finally_accepted')
+        self.assertEqual(json.loads(self.cli('resume', '--format', 'json').stdout)['visual_quality']['status'],
+                         'finally_accepted')
+        implementation = self.root / 'src/service.py'
+        implementation.write_text(implementation.read_text() + '\n# Changed after final review\n')
+        stale = status()
+        self.assertFalse(stale['audit_current'])
+        self.assertFalse(stale['acceptance_current'])
+        self.cli('visual-quality', '--action', 'accept', '--input-file', decision_file, ok=False)
+        report = self.directory / 'visual-quality' / 'audit' / f"{saved['audit_id']}.json"
+        report.write_text('{}')
+        self.assertIn('evidence changed', self.cli('visual-quality', '--action', 'status', ok=False).stderr)
 
     def test_blueprint_ui_slice_requires_post_implementation_visual_integrity(self):
         self.assigned('ui')

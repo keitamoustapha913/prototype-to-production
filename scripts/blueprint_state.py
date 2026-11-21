@@ -1480,12 +1480,14 @@ class BlueprintState:
         env = {**os.environ, **context}
         output = subprocess.run(command, cwd=self.directory.parents[2], env=env,
                                 capture_output=True, text=True, timeout=120, check=False)
-        self.require(output.returncode == 0, f'Approved verification command failed ({output.returncode}): {command!r}')
+        if output.returncode:
+            raise self.api.RequiredCheckFailed(f'Approved verification command failed ({output.returncode}): {command!r}')
         try:
             observed = json.loads(output.stdout)
         except ValueError as error:
             raise self.api.StateError(f'Verification command did not emit a JSON observation: {command!r}') from error
-        self.require(observed == expected, 'Executed verification output differs from the reviewed observation')
+        if observed != expected:
+            raise self.api.RequiredCheckFailed('Executed verification output differs from the reviewed observation')
 
     def capture_render(self, render_case, checks, *, build=None):
         app_url = os.environ.get('P2P_APP_URL')
@@ -1504,8 +1506,8 @@ class BlueprintState:
         screenshot = b64decode(observation.pop('screenshot'), validate=True)
         if render_case.get('observations'):
             self.check_capture_identity(render_case['observations'], observation)
-        self.require(observation.get('actual') == [check['expected'] for check in checks],
-                     'Browser measurements differ from the approved visual criteria')
+        if observation.get('actual') != [check['expected'] for check in checks]:
+            raise self.api.RequiredCheckFailed('Browser measurements differ from the approved visual criteria')
         outcomes = observation.get('interactionAssertions', [])
         self.require(isinstance(outcomes, list) and len(outcomes) == len(assertions),
                      'Browser did not return every approved interaction assertion')
@@ -1513,9 +1515,10 @@ class BlueprintState:
             self.require(isinstance(outcome, dict) and
                          {key: value for key, value in outcome.items() if key not in ('actual', 'result')} == rule,
                          'Browser did not return the approved interaction assertion for ' + rule['selector'])
-            self.require(outcome.get('result') == 'pass' and outcome.get('actual') == rule['expected'],
-                         f"Browser interaction assertion failed for {rule['selector']} ({rule['probe']}): "
-                         f"expected {rule['expected']!r}, observed {outcome.get('actual')!r}")
+            if outcome.get('result') != 'pass' or outcome.get('actual') != rule['expected']:
+                raise self.api.RequiredCheckFailed(
+                    f"Browser interaction assertion failed for {rule['selector']} ({rule['probe']}): "
+                    f"expected {rule['expected']!r}, observed {outcome.get('actual')!r}")
         return observation, screenshot
 
     def implementation_hashes(self, packet, paths):
@@ -1689,6 +1692,8 @@ class BlueprintState:
                   'executed_commands': [command for command, _ in executions]
                   + [case['command'] for case, _, _ in render_jobs], 'executed_render_hashes': rendered}
         except (self.api.StateError, KeyError, TypeError, ValueError, OSError, subprocess.TimeoutExpired) as error:
+            if isinstance(error, self.api.RequiredCheckFailed):
+                frozen["observed_failure"] = True
             errors.append(str(error))
         return frozen, errors
 

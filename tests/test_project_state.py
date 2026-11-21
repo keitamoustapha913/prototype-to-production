@@ -1355,6 +1355,56 @@ class ProjectStateTests(unittest.TestCase):
         self.assertIn("identical image pixels in the marked regions", result.stderr)
         self.assertEqual(self.manifest()["slices"]["invoice-list"]["status"], "blocked")
 
+    def test_final_visual_warning_remains_visible_without_blocking_completion(self):
+        from fixtures.visual_capture import capture_fixture_case
+
+        self.init()
+        approval = self.approval()
+        self.approve(approval)
+        self.slice_create(self.slice_packet(approval))
+        self.submit_slice()
+        review = self.review(approval)
+        payload = json.loads((self.root / "visual-integrity.json").read_text())
+        case = payload["cases"][0]
+        capture_fixture_case(self.initiative, "invoice-list", case)
+        payload["findings"] = [{
+            "finding_id": "minor-spacing", "case_id": case["case_id"], "dimension": "geometry",
+            "severity": "minor", "status": "deferred", "classification": "confirmed_defect",
+            "description": "A decorative gap is one pixel wider than adjacent accents.",
+            "classification_reason": "The measured gap differs from its neighbors.",
+            "evidence": "The marked decorative gap measures nine pixels.",
+            "nonblocking_reason": "All approved spacing and interaction criteria pass.",
+            "protected_decision_ids": [],
+        }]
+        case["comparisons"] = [{
+            "finding_id": "minor-spacing", "before": case["closeup_screenshot"], "latest": case["closeup_screenshot"],
+            "normalized_rect": {"x": 0.1, "y": 0.1, "width": 0.5, "height": 0.5},
+        }]
+        args = ("visual-integrity", "--slice-id", "invoice-list", "--action", "record")
+        payload["findings"][0]["severity"] = "major"
+        result = self.cli(*args, "--attempt-file", self.write_input("major-warning.json", payload), success=False)
+        self.assertIn("Only a minor confirmed defect", result.stderr)
+        payload["findings"][0]["severity"] = "minor"
+        self.cli(*args, "--attempt-file", self.write_input("minor-warning.json", payload))
+        # A later clean capture preserves the documented warning.
+        self.visual_integrity_attempt(approval)
+        self.cli("reconcile", "--slice-id", "invoice-list", "--action", "verify",
+                 "--review-file", self.write_input("warning-review.json", review))
+        self.cli("reconcile", "--slice-id", "invoice-list", "--action", "accept")
+        harness = self.root / "audit-test.py"
+        harness.write_text("import json, sys\nprint(json.dumps(dict(check_id=sys.argv[1], expected=True, actual=True, result='pass')))\n")
+        plan = {"approval_id": self.manifest()["active_approval_id"], "checks": [
+            {"check_id": key, "kind": kind, "slice_ids": ["invoice-list"], "scenario": "Audit workflow fixture",
+             "command": [sys.executable, harness.name, key], "test_source_paths": [harness.name], "expected": True}
+            for key, kind in (("invoice-integration", "integration"), ("invoice-journey", "journey"))
+        ]}
+        report = json.loads(self.cli("visual-quality", "--action", "audit",
+                                     "--input-file", self.write_input("audit-with-warning.json", plan)).stdout)
+        self.assertEqual(report["status"], "technically_complete_with_warnings")
+        self.assertEqual(report["slices"]["invoice-list"]["status"], "verified_with_warnings")
+        self.assertEqual([warning["finding_id"] for warning in report["warnings"]], ["minor-spacing"])
+        self.assertFalse(json.loads(self.cli("visual-quality", "--action", "status").stdout)["acceptance_current"])
+
     def test_capture_receipt_and_incomplete_history_through_cli(self):
         from functools import partial
         from http.server import ThreadingHTTPServer
@@ -1393,15 +1443,22 @@ class ProjectStateTests(unittest.TestCase):
             try:
                 request = {"case_id": case["case_id"], "state": case["state"], "browser": browser,
                            "appUrl": f"http://127.0.0.1:{server.server_port}",
-                           "interaction_assertions": [{"selector": "details[open] p", "probe": "text", "expected": "Classic"}],
+                           "interaction_assertions": [
+                               {"selector": "details[open] p", "probe": "text", "expected": "Classic"},
+                               {"selector": "summary", "probe": "focused", "expected": True},
+                               {"selector": "summary", "probe": "accessibility",
+                                "expected": {"name": "Open menu", "role": "DisclosureTriangle",
+                                             "expanded": True, "disabled": False}}],
                            "renderCase": {"route": "/invoices", "viewport": case["viewport"],
                                           "ready_selector": "details[open]",
-                                          "setup": [{"action": "click", "selector": "summary"}]}}
+                                          "setup": [{"action": "press", "key": "Tab"},
+                                                    {"action": "press", "key": "Enter"}]}}
                 source = self.write_input("capture-request.json", request)
                 captured = json.loads(self.cli(*args, "--action", "capture", "--capture-file", source).stdout)
             finally:
                 server.shutdown()
         attempt["cases"] = [captured]
+        attempt["coverage"][0]["accessibility"] = {"result": "pass", "note": "Tab focused Enter-operated summary"}
         file = self.write_input("captured.json", attempt)
         self.cli(*args, "--action", "record", "--attempt-file", file)
         self.cli(*args, "--action", "verify")

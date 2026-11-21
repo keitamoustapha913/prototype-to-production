@@ -73,6 +73,29 @@ class VisualIntegrityTests(unittest.TestCase):
             }],
         }
 
+    def test_accessibility_requires_a_named_semantic_focus_target_inside_the_component(self):
+        target = {"role": "button", "name": "", "inside_component": True}
+        case = {"browser_evidence": {
+            "setup": [{"action": "press", "key": "Tab"}],
+            "interaction_assertions": [{"selector": "#menu", "probe": "focused", "expected": True, "result": "pass"}],
+            "accessibility_targets": {"#menu": target},
+        }}
+        check = {"result": "pass", "note": "Tab reaches the menu"}
+        with self.assertRaisesRegex(visual.VisualIntegrityError, "named, semantic keyboard focus target"):
+            visual.check_accessibility(case, check)
+        target.update(name="Menu", inside_component=False)
+        with self.assertRaisesRegex(visual.VisualIntegrityError, "captured component"):
+            visual.check_accessibility(case, check)
+        target["inside_component"] = True
+        with self.assertRaisesRegex(visual.VisualIntegrityError, "assertions for its accessible name"):
+            visual.check_accessibility(case, check)
+        case["browser_evidence"]["interaction_assertions"].append(
+            {"selector": "#menu", "probe": "accessibility", "expected": {"name": "Menu", "role": "button"}, "result": "pass"})
+        self.assertEqual(visual.check_accessibility(case, check), "pass")
+        case["browser_evidence"]["setup"].append({"action": "click", "selector": "#menu"})
+        with self.assertRaisesRegex(visual.VisualIntegrityError, "keyboard input"):
+            visual.check_accessibility(case, check)
+
     def test_adaptive_coverage_requires_all_three_checks_for_each_case(self):
         case_id = "list-default"
         coverage = [{

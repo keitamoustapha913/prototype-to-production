@@ -210,3 +210,17 @@ h1,h2,h3 {
 }
 
 [hidden] { display: none !important; }
+
+#visual-quality-report { margin-block: 1.5rem; }
+#quality-results details { margin-block: .75rem; }
+#quality-results li button, #quality-results .register-comparison { margin-block: .5rem; }
+#quality-results li button { margin-inline-start: .75rem; }
+.quality-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(12rem, 100%), 1fr));
+  gap: .75rem;
+  padding: 0;
+  list-style: none;
+}
+.quality-stats li { padding: .65rem .85rem; border: 1px solid currentColor; border-radius: .35rem; }
+.quality-stats strong { display: block; font-size: 1.4em; }

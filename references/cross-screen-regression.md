@@ -81,3 +81,7 @@ python3 scripts/project_state.py review-viewer --project-root <app> --initiative
 ```
 
 Open **Visual Review Register** in the Living Blueprint and Slice Review viewer. Search by change ID, route, slice or finding, and expand a case to inspect its comparisons, assertions, measurements and repair history. Include change IDs, outstanding findings, coverage limitations and the viewer command at handoff.
+
+For the [final quality audit](visual-quality.md), include case-level accessibility outcomes. Preserve documented warnings and the defective-to-corrected comparison for repairs.
+
+To add keyboard evidence without replacing a planned screenshot, use `capture` with `phase: "accessibility"` for the same case. Provide `keyboard_steps` to append after the planned setup and `keyboard_assertions` with a positive focus assertion. Finish in the planned state. Record the returned ID as `accessibility.capture_id` on the case alongside its normal after capture. Both receipts must be fresh and come from the same served build. You can refresh the evidence with unchanged source. A subsequent shared component edit still requires a new change plan.

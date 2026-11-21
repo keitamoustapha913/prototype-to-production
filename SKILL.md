@@ -39,6 +39,8 @@ For **every UI-changing implementation slice**, apply the [Visual Integrity Gate
 
 ## Preserved full-prototype route
 
+At slice verification and before reporting application completion, follow [Final Visual Quality Standards](references/visual-quality.md). Run the final audit against current evidence. Documented nonblocking warnings permit technical completion. Record final acceptance only from the user's explicit decision on the exact current report.
+
 For `prototype` initiatives: discover and freeze A → build runnable B → exercise every A feature → `prototype-coverage` → two clean-context replays with QA controls excluded → explicit exact-version source/image-only approval → slices → approved-B visual/functional verification. The original screenshot, replay, warning-gallery and user-warning-acceptance gates still apply. Blueprint coverage cannot substitute for runnable A-to-B parity in this mode.
 
 Design direction comes from the current user and this initiative's references. Before approval, propose values clearly; after approval, preserve exact choices. No aesthetic from another app is a default.

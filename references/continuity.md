@@ -77,3 +77,5 @@ Each approval is a separately identified, hash-locked record in `manifest.json` 
 ## Git and recovery limitations
 
 Store source paths, actual git HEAD/status, and relevant commit/diff references in checkpoints. This utility does not commit, stash, revert, reset, merge, or deploy the user's code. If Git is unavailable, describe that limitation and read relevant code manually. Files and event history can recover only choices that were persisted before compaction; the skill cannot recover unrecorded chat details.
+
+When resuming completed or deferred work, use [Visual Quality status](visual-quality.md) to recover the current technical report and its acceptance. Preserve the `visual-quality/` files with the initiative and use the exact audit ID for user acceptance.

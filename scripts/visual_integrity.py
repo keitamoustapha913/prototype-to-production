@@ -116,6 +116,12 @@ def check_interaction_assertions(value):
             valid = type(expected) is bool
         elif probe == "text":
             valid = isinstance(expected, str)
+        elif probe == "accessibility":
+            valid = isinstance(expected, dict) and bool(expected) and all(
+                (_text(item) if key in {"name", "role"} else
+                 type(item) is bool if key in {"expanded", "disabled", "selected"} else
+                 (type(item) is bool or item == "mixed") if key in {"checked", "pressed"} else False)
+                for key, item in expected.items())
         else:
             valid = probe == "attribute" and _text(rule.get("attribute")) and (
                 isinstance(expected, str) or "expected" in rule and expected is None)
@@ -147,6 +153,86 @@ def _check_blueprint_measurements(case, criteria, result, acceptance_ids):
     if mismatch and result == "not_checked":
         raise VisualIntegrityError("Record an observed mismatch against an approved measurement as failed blueprint coverage")
 
+
+
+def check_accessibility(case, check):
+    """Validate the accessibility conclusion against the saved browser receipt."""
+    if (not isinstance(check, dict) or not _text(check.get("note"))
+            or check.get("result") not in {"pass", "fail", "not_checked", "not_applicable"}):
+        raise VisualIntegrityError("Each relevant case needs an accessibility result and rationale")
+    evidence = (case or {}).get("browser_evidence", {})
+    if check["result"] == "pass":
+        assertions = evidence.get("interaction_assertions", [])
+        targets = evidence.get("accessibility_targets", {})
+        focused = [rule["selector"] for rule in assertions
+                   if rule.get("probe") == "focused" and rule.get("expected") is True and rule.get("result") == "pass"]
+        last_input = next((step.get("action") for step in reversed(evidence.get("setup", []))
+                           if step.get("action") != "wait"), None)
+        if last_input != "press" or not focused or any(rule.get("result") != "pass" for rule in assertions):
+            raise VisualIntegrityError("Accessibility pass requires keyboard input, a verified focus target and passing assertions")
+        for selector in focused:
+            target = targets.get(selector, {})
+            if (target.get("inside_component") is not True or not _text(target.get("name"))
+                    or not _text(target.get("role")) or target["role"] in {"generic", "none", "presentation"}):
+                continue
+            expected = {key: value for rule in assertions
+                        if rule.get("probe") == "accessibility" and rule["selector"] == selector
+                        for key, value in rule["expected"].items()}
+            observed = {key: value for key, value in target.items() if key != "inside_component"}
+            if all(key in expected and expected[key] == value for key, value in observed.items()):
+                break
+        else:
+            raise VisualIntegrityError("Accessibility pass requires a named, semantic keyboard focus target in the captured component "
+                                       "with assertions for its accessible name, role and applicable states")
+    if check["result"] == "not_applicable" and (
+            evidence.get("structure", {}).get("interactive_controls") != 0):
+        raise VisualIntegrityError("Accessibility can be inapplicable only with browser evidence of a passive component")
+    return check["result"]
+
+
+def accessibility_case(case_id, captured, check):
+    case = captured.get(case_id)
+    if not isinstance(check, dict) or "evidence_case_id" not in check:
+        return case
+    ref = check["evidence_case_id"]
+    related = captured.get(ref) if isinstance(ref, str) else None
+    if (not related or not case or check.get("result") != "pass" or related.get("based_on") != case_id
+            or case["viewport"] != related["viewport"]
+            or any(case["state"].get(key) != related["state"].get(key) for key in ("route", "theme", "role"))):
+        raise VisualIntegrityError("Keyboard evidence must reference a captured supplementary case with matching route, viewport, theme and role")
+    return related
+
+
+def require_accessibility(cases, coverage):
+    if not coverage:
+        raise VisualIntegrityError("Accessibility verification needs a case coverage plan")
+    captured = {case["case_id"]: case for case in cases if case}
+    for row in coverage:
+        check = row.get("accessibility")
+        case = accessibility_case(row["case_id"], captured, check)
+        if check_accessibility(case, check) not in {"pass", "not_applicable"}:
+            raise VisualIntegrityError(f"Case {row['case_id']} lacks passing applicable accessibility checks")
+
+
+def is_warning(finding):
+    return finding.get("status") == "deferred" or (
+        finding.get("status") == "noted" and finding.get("classification") == "design_concern")
+
+
+def check_severity(finding):
+    severity = finding.get("severity")
+    classification = finding.get("classification")
+    expected = ({"info"} if classification == "approved_difference"
+                else {"design_concern"} if classification == "design_concern" else {"critical", "major", "minor"})
+    if not isinstance(severity, str) or severity not in expected:
+        raise VisualIntegrityError("Classify severity as critical, major, minor, design_concern, or info for an approved difference")
+
+
+def check_deferral(finding):
+    if finding.get("status") == "deferred" and (
+            finding.get("classification") != "confirmed_defect" or finding.get("severity") != "minor"
+            or not _text(finding.get("nonblocking_reason"))):
+        raise VisualIntegrityError("Only a minor confirmed defect with a nonblocking rationale may be deferred")
 
 def _check_coverage(coverage, cases, expected, contract, records, status):
     if not isinstance(coverage, list) or not coverage or any(not isinstance(row, dict) for row in coverage):
@@ -199,7 +285,10 @@ def _check_coverage(coverage, cases, expected, contract, records, status):
             raise VisualIntegrityError("A failed browser interaction assertion must be recorded as failed coverage")
         _check_blueprint_measurements(captured.get(case, {}), expected.get(case, {}).get("visual_criteria", []),
                                       checks["blueprint"]["result"], row["acceptance_ids"])
-        if all(check["result"] == "pass" for check in checks.values()):
+        accessibility = row.get("accessibility")
+        accessible = accessibility is None or check_accessibility(
+            accessibility_case(case, captured, accessibility), accessibility) in {"pass", "not_applicable"}
+        if accessible and all(check["result"] == "pass" for check in checks.values()):
             passing.add(case)
             checked_acceptance.update(row["acceptance_ids"])
             checked_decisions.update(row["protected_decision_ids"])
@@ -377,6 +466,7 @@ def browser_case(directory, slice_id, state, request, render, observed_state, ca
                 "checks": checks, "identities": measured.get("identities", {}),
                 "blueprint_measurements": blueprint_measurements,
                 "harness": render.get("command"), "interaction_assertions": outcomes,
+                "accessibility_targets": measured.get("accessibilityTargets", {}),
             }
     _check_closeup(directory, case)
     return case, {"served": measured["buildEvidence"], "url": measured["url"], "component": measured["component"],
@@ -515,6 +605,8 @@ def _retry_policy(records, findings):
     limit = 2
     for finding in findings:
         key = finding["finding_id"]
+        if finding.get("status") == "deferred":
+            continue
         diagnosis = finding.get("diagnosis", "")
         if not isinstance(diagnosis, str):
             raise VisualIntegrityError(f"{key}: diagnosis must be text")
@@ -691,13 +783,16 @@ def _validate_payload(directory: Path, manifest: dict, slice_id: str, payload: d
     if any(not isinstance(item, str) or not item for item in finding_ids) or len(set(finding_ids)) != len(finding_ids):
         raise VisualIntegrityError("Every finding needs a unique finding_id")
     for item in findings:
-        if (item.get("status", "open") not in ("open", "fixed", "improved", "noted")
+        if (item.get("status", "open") not in ("open", "fixed", "improved", "noted", "deferred")
                 or not isinstance(item.get("dimension"), str) or item["dimension"] not in OBSERVATION_DIMENSIONS
                 or not isinstance(item.get("case_id"), str)
                 or not isinstance(item.get("description"), str) or not item["description"].strip()):
             raise VisualIntegrityError("Each finding needs a case, dimension, status and actionable description")
         if adaptive:
             _check_classification(item, {decision["decision_id"] for decision in (adaptive_contract or (set(), []))[1]})
+        check_deferral(item)
+        if manifest.get("final_visual_quality_required"):
+            check_severity(item)
         advisory = item.get("classification") in ("approved_difference", "design_concern")
         if advisory != (item.get("status") == "noted"):
             raise VisualIntegrityError("Approved differences and design concerns use the noted status")
@@ -706,6 +801,7 @@ def _validate_payload(directory: Path, manifest: dict, slice_id: str, payload: d
         raise VisualIntegrityError("rechecked_findings must be a list of unique prior finding IDs")
     open_prior = set()
     conflicts = set()
+    prior_deferrals = set()
     approval = manifest.get("active_approval_id")
     for record in old_records:
         for finding in record["findings"]:
@@ -713,15 +809,18 @@ def _validate_payload(directory: Path, manifest: dict, slice_id: str, payload: d
                 conflicts.add(finding["finding_id"])
             if finding.get("status", "open") in ("open", "improved"):
                 open_prior.add(finding["finding_id"])
+            elif finding.get("status") == "deferred":
+                prior_deferrals.add(finding["finding_id"])
             elif finding.get("status") == "fixed":
                 open_prior.discard(finding["finding_id"])
+                prior_deferrals.discard(finding["finding_id"])
     new_open = {item["finding_id"] for item in findings if item.get("status", "open") in ("open", "improved")}
     improved = {item["finding_id"] for item in findings if item.get("status") == "improved"}
     fixed = {item["finding_id"] for item in findings if item.get("status") == "fixed"}
     if any(item["finding_id"] in conflicts
            and (item.get("correction") or item.get("status") in ("improved", "fixed")) for item in findings):
         raise VisualIntegrityError("Approval conflicts require an explicit amendment before repair")
-    if improved and (not improved <= open_prior or any(
+    if improved and (not improved <= open_prior | prior_deferrals or any(
             not _text(item.get("correction")) or not _text(item.get("verification"))
             for item in findings if item["finding_id"] in improved)):
         raise VisualIntegrityError("Improvement requires a prior defect, correction and incomplete verification evidence")
@@ -729,7 +828,11 @@ def _validate_payload(directory: Path, manifest: dict, slice_id: str, payload: d
         raise VisualIntegrityError("Improved status requires improved findings and incomplete adaptive verification")
     if fixed and adaptive and status != "corrected":
         raise VisualIntegrityError("An adaptive repair is verified fixed only after the full selected coverage passes")
-    if fixed != set(resolved) or not fixed <= open_prior:
+    if any(item.get("status") in ("deferred", "noted") and item["finding_id"] in open_prior for item in findings):
+        raise VisualIntegrityError("A blocking finding requires a verified repair")
+    if status not in VERIFIED_STATUSES and any(item.get("status") == "deferred" for item in findings):
+        raise VisualIntegrityError("Defer a minor defect only after mandatory checks pass")
+    if fixed != set(resolved) or not fixed <= open_prior | prior_deferrals:
         raise VisualIntegrityError("Each fixed finding must have a previously recorded defect and a current recheck")
     if status == "clean" and (new_open or fixed or open_prior):
         raise VisualIntegrityError("A clean inspection cannot clear findings; record their verified correction")
@@ -819,6 +922,8 @@ def _validate_payload(directory: Path, manifest: dict, slice_id: str, payload: d
     if adaptive:
         same_approval = [record for record in old_records if record.get("approval_id") == approval]
         _check_coverage(coverage, saved_cases, expected, adaptive_contract or (set(), []), same_approval, status)
+    if manifest.get("final_visual_quality_required") and status in VERIFIED_STATUSES:
+        require_accessibility(saved_cases, coverage or [])
     _check_finding_evidence(directory, saved_cases, findings, old_records)
     for case in saved_cases:
         for pair in case["comparisons"]:
@@ -976,6 +1081,8 @@ def require_verified(directory: Path, manifest: dict, slice_id: str, *, historic
         raise VisualIntegrityError(f"Slice {slice_id} visual integrity is unresolved; latest attempt is {latest.get('status')}")
     if not historical and _adaptive_contract(directory, manifest, slice_id) is not None and "coverage" not in latest:
         raise VisualIntegrityError("Current UI contract requires adaptive visual coverage")
+    if not historical and manifest.get("final_visual_quality_required"):
+        require_accessibility(latest["cases"], latest.get("coverage", []))
     verify_saved_images(directory, records)
     for record in records if historical else [latest]:
         for case in record["cases"]:

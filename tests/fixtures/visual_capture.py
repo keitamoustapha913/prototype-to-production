@@ -13,6 +13,7 @@ def coverage_row(case, acceptance_ids=()):
             "state": case["state"]["interaction"], "viewport": case["viewport"], "reason": "Approved fixture state",
             "checks": {kind: {"result": "pass", "note": f"Fixture confirms {kind} outcome"}
                        for kind in ("visual", "interaction", "blueprint")},
+            "accessibility": {"result": "not_applicable", "note": "Fixture component contains no interactive controls"},
             "acceptance_ids": list(acceptance_ids), "protected_decision_ids": []}
 
 
@@ -37,6 +38,7 @@ def capture_fixture_case(directory, slice_id, case):
                   "closeup": case["closeup_bounds"], "buildEvidence": [{"url": render["route"]}],
                   "identities": {k: v.get("expected") for k, v in render["observations"].items()},
                   "browserState": {"activeControl": None, "expandedControls": []}, "geometry": {},
+                  "structure": {"interactive_controls": 0},
                   "interactionAssertions": [
                       {**rule, "actual": rule["expected"], "result": "pass"} for rule in requested],
                   "actual": [criterion["expected"] for criterion in approved.get("visual_criteria", [])]}

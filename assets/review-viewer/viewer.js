@@ -477,7 +477,7 @@ function summarizeVisualRegister(attempts, slices = {}) {
   for (const attempt of attempts) {
     const latest = latestAttempts.get(attempt.slice_id);
     if (!latest || attempt.attempt_number >= latest.attempt_number) latestAttempts.set(attempt.slice_id, attempt);
-    if (attempt.status === 'unresolved' && (attempt.findings || []).every(finding => finding.status === 'noted')) {
+    if (attempt.status === 'unresolved' && (attempt.findings || []).every(finding => ['noted', 'deferred'].includes(finding.status))) {
       incompleteAttempts.push(attempt);
     }
     if (attempt.status === 'clean') cleanAttempts.push(attempt);
@@ -492,7 +492,7 @@ function summarizeVisualRegister(attempts, slices = {}) {
       current.finding = finding;
       current.latest_attempt = attempt;
       current.status = attempt.status === 'corrected' && attempt.rechecked_findings?.includes(id)
-        ? 'corrected' : {improved: 'improved', noted: 'noted'}[finding.status] || 'open';
+        ? 'corrected' : {improved: 'improved', noted: 'noted', deferred: 'warning'}[finding.status] || 'open';
       current.history.push({attempt, finding});
     }
   }
@@ -504,7 +504,7 @@ function summarizeVisualRegister(attempts, slices = {}) {
   return {findings:[...findings.values()], cleanAttempts, incompleteAttempts:coverageAttempts};
 }
 const findingLabels = {
-  open: 'Unresolved', corrected: 'Verified fixed', improved: 'Improved — not verified', noted: 'For review'
+  open: 'Unresolved', corrected: 'Verified fixed', improved: 'Improved — not verified', noted: 'For review', warning: 'Documented warning'
 };
 const classificationLabels = {
   approved_difference: 'Approved design difference', confirmed_defect: 'Confirmed implementation defect',
@@ -517,7 +517,7 @@ function appendCoverage(holder, attempt) {
   for (const row of attempt.coverage) {
     details.append(el('h4', [row.component, row.state, row.case_id, row.viewport && `${row.viewport.width}×${row.viewport.height}`].filter(Boolean).join(' · ')), el('p', row.reason));
     const list = el('ul');
-    for (const [kind, check] of Object.entries(row.checks)) {
+    for (const [kind, check] of Object.entries({...row.checks, ...(row.accessibility && {accessibility: row.accessibility})})) {
       list.append(el('li', [kind, check.result.replaceAll('_', ' '), check.note].join(' · ')));
     }
     if (row.acceptance_ids?.length) list.append(el('li', 'Acceptance checks · ' + row.acceptance_ids.join(', ')));
@@ -579,7 +579,7 @@ function appendFindingNotes(holder, finding) {
   if (finding?.protected_decision_ids?.length) {
     holder.append(el('p', 'Protected decisions · ' + finding.protected_decision_ids.join(', ')));
   }
-  for (const field of ['classification_reason','evidence','repair_scope','diagnosis','correction','verification']) {
+  for (const field of ['classification_reason','evidence','nonblocking_reason','repair_scope','diagnosis','correction','verification']) {
     const value = finding?.[field];
     if (typeof value === 'string' && value.trim()) {
       holder.append(el('p', `${field[0].toUpperCase() + field.slice(1).replaceAll('_', ' ')}: ${value}`));
@@ -667,13 +667,22 @@ function appendCrossScreenResult(holder, result, findings, retryPolicy) {
     holder.append(el('p', `Capture browser changed · ${beforeBrowser} → ${afterBrowser}`));
   }
   const checks = el('ul');
-  for (const [kind, check] of Object.entries(result.checks)) {
+  for (const [kind, check] of Object.entries({...result.checks, ...(result.accessibility && {accessibility: result.accessibility})})) {
     checks.append(el('li', `${kind} · ${check.result.replaceAll('_', ' ')} · ${check.note}`));
   }
   holder.append(checks);
   for (const finding of findings.filter(item => item.case_id === result.case_id)) {
     holder.append(el('h4', `${finding.finding_id} · ${finding.severity} · ${finding.status}`), el('p', finding.description));
     appendFindingNotes(holder, finding);
+    if (finding.comparison) {
+      const comparison = finding.comparison;
+      const pair = el('div'); pair.className = 'register-shot-grid register-comparison';
+      if (comparison.before) pair.append(registerImage(comparison.before, 'Defective component', comparison.normalized_rect));
+      pair.append(registerImage(comparison.latest, finding.status === 'fixed' ? 'Corrected component' : 'Warning evidence',
+        comparison.normalized_rect));
+      holder.append(pair);
+      if (comparison.annotated_latest) holder.append(annotatedEvidenceLinks(comparison));
+    }
     if (retryPolicy?.automatic_repair_stopped?.includes(finding.finding_id)) {
       holder.append(el('p', 'Automatic retries stopped. Record a new diagnosis to resume repair.'));
     }
@@ -687,12 +696,12 @@ function appendCrossScreenResult(holder, result, findings, retryPolicy) {
     if (comparison.annotated_before) holder.append(annotatedEvidenceLinks(comparison));
   }
   for (const [label, capture, build] of [['Original capture', result.before, result.before_build],
-    ['Updated capture', result.after, result.after_build]]) {
+    ['Updated capture', result.after, result.after_build], ['Keyboard evidence', result.accessibility_capture, result.after_build]]) {
     if (!capture) continue;
     const evidence = el('details');
     evidence.append(el('summary', label));
     if (build) evidence.append(el('p', 'Served build · ' + build));
-    if (!result.comparisons.length) evidence.append(registerCase(capture));
+    if (!result.comparisons.length || capture === result.accessibility_capture) evidence.append(registerCase(capture));
     else evidence.append(el('pre', JSON.stringify({context:capture.state, ...capture.browser_evidence}, null, 2)));
     holder.append(evidence);
   }
@@ -750,6 +759,115 @@ function baselineCapture(label, receipt) {
   section.append(provenance);
   return section;
 }
+const qualityLabels = {
+  in_implementation: 'In implementation',
+  blocked: 'Blocked',
+  technically_complete: 'Technically complete',
+  technically_complete_with_warnings: 'Technically complete — with warnings',
+  finally_accepted: 'Finally accepted',
+  verified: 'Verified',
+  verified_with_warnings: 'Verified with warnings',
+  needs_correction: 'Needs correction',
+  not_verified: 'Not verified',
+  pass: 'Passed',
+  fail: 'Failed',
+};
+function qualityEvidenceButton(slice, key, filter = '') {
+  const button = el('button', 'View evidence');
+  button.type = 'button';
+  button.onclick = () => {
+    $('register-slice').value = slice;
+    $('register-status').value = filter;
+    $('register-search').value = key || '';
+    renderVisualRegister();
+    $('register-search').focus();
+  };
+  return button;
+}
+function renderQualityReport(quality) {
+  const panel = $('visual-quality-report');
+  if (!panel) return;
+  panel.hidden = !quality;
+  const results = $('quality-results');
+  results.replaceChildren();
+  if (!quality) return;
+  const slices = Object.entries(quality.slices);
+  const verified = slices.filter(([,row]) => ['verified', 'verified_with_warnings'].includes(row.status)).length;
+  const stats = el('ul'); stats.className = 'quality-stats';
+  for (const [count, label] of [[verified, 'slices verified'], [quality.repairs.length, 'defects repaired'],
+    [quality.warnings.length, 'nonblocking warnings'], [quality.defects.length, 'blocking visual defects']]) {
+    const item = el('li');
+    item.append(el('strong', String(count)), el('span', label));
+    stats.append(item);
+  }
+  results.append(el('p', qualityLabels[quality.status]), stats);
+  if (quality.audit) {
+    if (quality.audit_sha256) {
+      const identity = el('details');
+      identity.append(el('summary', 'Audit identity'), el('p', quality.audit.audit_id), el('code', quality.audit_sha256));
+      results.append(identity);
+    }
+    results.append(el('p', `${quality.audit_current ? 'Current' : 'Historical'} audit · ${quality.audit.audit_id}`));
+    if (!quality.audit_current) results.append(el('p', 'Rerun the audit for the current implementation.'));
+    const checks = el('ul');
+    for (const check of quality.audit.checks) {
+      const item = el('li');
+      const observation = el('details');
+      observation.append(el('summary', `${qualityLabels[check.result]} · ${check.scenario} · ${check.slice_ids.join(', ')}`));
+      if (Object.hasOwn(check, 'expected')) observation.append(el('pre', JSON.stringify({
+        expected: check.expected, observed: check.observation
+      }, null, 2)));
+      if (check.diagnostic) observation.append(el('pre', check.diagnostic));
+      checks.append(item);
+      item.append(observation);
+    }
+    if (checks.childNodes.length) {
+      const evidence = el('details');
+      evidence.append(el('summary', 'Integration and browser journey results'), checks);
+      results.append(evidence);
+    }
+  }
+  if (quality.acceptance_current) results.append(el('p', `Accepted by the user · ${quality.acceptance.accepted_at}`));
+  else if (quality.acceptance) results.append(el('p', `Prior user acceptance · ${quality.acceptance.audit_id}`));
+  for (const reason of quality.blockers) results.append(el('p', reason));
+  if (slices.length) {
+    const details = el('details');
+    details.append(el('summary', 'Slice verification'));
+    const list = el('ul');
+    for (const [key, row] of slices) {
+      const item = el('li', `${key} · ${qualityLabels[row.status]}`);
+      for (const reason of row.reasons) item.append(el('p', reason));
+      if (row.ui) item.append(qualityEvidenceButton(key));
+      list.append(item);
+    }
+    details.append(list);
+    results.append(details);
+  }
+  for (const [title, records] of [['Documented warnings', quality.warnings],
+    ['Verified corrections', quality.repairs], ['Blocking visual defects', quality.defects]]) {
+    if (!records.length) continue;
+    const details = el('details');
+    details.open = records === quality.warnings;
+    details.append(el('summary', title));
+    for (const record of records) {
+      const item = el('div');
+      item.append(el('h3', `${record.slice_id} · ${record.finding_id} · ${record.severity}`), el('p', record.description));
+      if (record.comparison_count) {
+        for (let index = 0; index < record.comparison_count; index++) {
+          const path = `/visual-quality/warning/${encodeURIComponent(record.finding_id)}/${index}`;
+          const pair = el('div'); pair.className = 'register-shot-grid register-comparison';
+          pair.append(registerImageFromUrl(path + '/before', 'Before'), registerImageFromUrl(path + '/after', 'After'));
+          item.append(pair);
+        }
+      } else {
+        item.append(qualityEvidenceButton(record.slice_id, record.finding_id));
+      }
+      details.append(item);
+    }
+    results.append(details);
+  }
+}
+
 function renderVisualRegister(attempts = registerAttempts) {
   const entries = $('register-entries');
   const statusFilter = $('register-status').value;
@@ -757,6 +875,7 @@ function renderVisualRegister(attempts = registerAttempts) {
   const changes = registerMetadata.cross_screen_changes || [];
   const baselines = registerMetadata.visual_baselines || [];
   const slices = [...new Set([...attempts.map(a => a.slice_id),
+    ...Object.keys(registerMetadata.visual_quality?.slices || {}),
     ...changes.flatMap(change => change.affected_slices),
     ...baselines.flatMap(baseline => baseline.affected_slice_ids || baseline.slice_ids)]
     .filter(x => typeof x === 'string'))].sort();
@@ -772,6 +891,7 @@ function renderVisualRegister(attempts = registerAttempts) {
   $('register-counts').textContent = `${attempts.length} attempts · ${summary.cleanAttempts.length} clean evidence records · ${summary.findings.length} distinct findings (${openCount} open, ${correctedCount} corrected) · ${slices.length} slices${changes.length ? ` · ${changes.length} cross-screen changes` : ''}`;
   const projectStatus = $('register-project-status');
   projectStatus.replaceChildren();
+  renderQualityReport(registerMetadata.visual_quality);
   for (const warning of registerMetadata.history_warnings || []) {
     const message = el('p', warning); message.setAttribute('role', 'alert'); projectStatus.append(message);
   }
@@ -786,7 +906,8 @@ function renderVisualRegister(attempts = registerAttempts) {
     projectStatus.append(section);
   }
   const candidates = [
-    ...summary.findings.filter(f => !statusFilter || f.status === statusFilter).map(f => ({kind:'finding',value:f})),
+    ...summary.findings.filter(f => !statusFilter || f.status === statusFilter ||
+      (statusFilter === 'warnings' && (f.status === 'warning' || f.finding.classification === 'design_concern'))).map(f => ({kind:'finding',value:f})),
     ...summary.cleanAttempts.filter(() => !statusFilter || statusFilter === 'clean').map(a => ({kind:'clean',value:a})),
     ...summary.incompleteAttempts.filter(a => !statusFilter || (statusFilter === 'open' && !a.historical))
       .map(a => ({kind:'incomplete',value:a.attempt,historical:a.historical}))
@@ -806,7 +927,9 @@ function renderVisualRegister(attempts = registerAttempts) {
       (statusFilter === 'clean' && status === 'verified' && !findings.some(finding => finding.status === 'fixed')) ||
       (statusFilter === 'corrected' && status === 'verified' && findings.some(finding => finding.status === 'fixed')) ||
       (statusFilter === 'improved' && latestFindings.some(finding => finding.status === 'improved')) ||
-      (statusFilter === 'noted' && findings.some(finding => finding.status === 'noted'));
+      (statusFilter === 'noted' && findings.some(finding => finding.status === 'noted')) ||
+      (statusFilter === 'warnings' && findings.some(finding =>
+        finding.status === 'deferred' || finding.classification === 'design_concern'));
   });
   const visibleBaselines = baselines.filter(baseline =>
     (!select.value || (baseline.affected_slice_ids || baseline.slice_ids).includes(select.value)) &&

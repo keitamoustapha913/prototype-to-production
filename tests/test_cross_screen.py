@@ -65,7 +65,10 @@ class CrossScreenWorkflowTests(unittest.TestCase):
                                    "ready_selector": "#menu", "setup": [
                                        {"action": "press", "key": "Tab"}, {"action": "press", "key": "Enter"}]},
                     "interaction_assertions": [{"selector": "summary", "probe": "focused", "expected": True},
-                                               {"selector": "section", "probe": "visible", "expected": True}],
+                                               {"selector": "section", "probe": "visible", "expected": True},
+                                               {"selector": "summary", "probe": "accessibility",
+                                                "expected": {"name": "Open", "role": "DisclosureTriangle",
+                                                             "expanded": True, "disabled": False}}],
                 }]}
 
     def run_action(self, action, payload):
@@ -292,6 +295,7 @@ class CrossScreenWorkflowTests(unittest.TestCase):
         locked_hashes = cross_screen.source_hashes(self.directory, ["menu.css", "erp.html"])
         manifest["discovery_audits"] = {"a": {"source_hashes_at_discovery": locked_hashes}}
         manifest["visual_baselines_required"] = True
+        manifest["final_visual_quality_required"] = True
         project_state.atomic_json(self.directory / "manifest.json", manifest)
 
         def capture(server, name, phase):
@@ -305,7 +309,8 @@ class CrossScreenWorkflowTests(unittest.TestCase):
             value = {"case_id": name + "-open", "checks": {
                 check: {"result": result, "note": "Reviewed the captured UI and keyboard outcome"}
                 for check, result in results.items()
-            }}
+            }, "accessibility": {"result": interaction if receipt else "not_checked",
+                                 "note": "Tab and Enter exercise the menu and verify the focused summary"}}
             if receipt is None:
                 return {**value, "unavailable_reason": "Settings fixture could not be loaded"}
             return {**value, "capture_id": receipt["capture_id"]}
@@ -313,7 +318,7 @@ class CrossScreenWorkflowTests(unittest.TestCase):
         request = {"change_id": "menu-layout"}
         baseline = {}
         finding = {"finding_id": "settings-menu-hidden", "case_id": "settings-open",
-                   "status": "open", "severity": "blocking", "dimension": "interaction",
+                   "status": "open", "severity": "major", "dimension": "interaction",
                    "description": "The choices were hidden on Settings after keyboard activation",
                    "classification": "confirmed_defect", "classification_reason": "Keyboard visibility assertion failed",
                    "evidence": "The menu is expanded but the choices are hidden", "protected_decision_ids": []}
@@ -370,7 +375,8 @@ class CrossScreenWorkflowTests(unittest.TestCase):
                 attempts = {"cases": [row("erp", erp), row("settings", settings, "fail")], "findings": [finding]}
                 with self.assertRaisesRegex(ValueError, "actual browser assertion"):
                     self.run_action("record", {**request, **attempts, "cases": [row("erp", erp), row("settings", settings)]})
-                self.assertEqual(self.run_action("record", {**request, **attempts})["status"], "unresolved")
+                failed = self.run_action("record", {**request, **attempts})
+                self.assertEqual(failed["status"], "unresolved")
                 self.component.write_text("#menu {background: blue}")
                 erp = capture(server, "erp", "after")
                 settings = capture(server, "settings", "after")
@@ -379,6 +385,10 @@ class CrossScreenWorkflowTests(unittest.TestCase):
                 plan = self.run_action("record", {**request, "cases": [row("erp", erp), row("settings", settings)],
                                                    "findings": [fixed]})
                 self.assertEqual(plan["status"], "verified")
+                repaired = plan["attempts"][-1]["findings"][0]["comparison"]
+                self.assertEqual(repaired["before"], failed["attempts"][-1]["cases"][1]["after"]["closeup_screenshot"])
+                self.assertTrue(repaired["pixels_changed"])
+                visual_integrity.resolve_evidence_path(self.directory, repaired["annotated_latest"])
                 self.assertFalse(self.blockers("dependent-slice"))
                 settings_file = self.root / "settings.html"
                 settings_file.write_text(settings_file.read_text().replace("Menu choices", "Available choices"))
@@ -388,7 +398,18 @@ class CrossScreenWorkflowTests(unittest.TestCase):
                 self.assertEqual(cross_screen.review_changes(self.directory, manifest)[0]["current_status"], "stale")
                 erp = capture(server, "erp", "after")
                 settings = capture(server, "settings", "after")
-                plan = self.run_action("record", {**request, "cases": [row("erp", erp), row("settings", settings)]})
+                keyboard = self.run_action("capture", {**request, "case_id": "settings-open",
+                    "phase": "accessibility", "browser": browser, "appUrl": f"http://127.0.0.1:{server.server_port}",
+                    "keyboard_steps": [{"action": "press", "key": "Home"}],
+                    "keyboard_assertions": [{"selector": "summary", "probe": "focused", "expected": True},
+                                            {"selector": "summary", "probe": "accessibility",
+                                             "expected": {"name": "Open", "role": "DisclosureTriangle",
+                                                          "expanded": True, "disabled": False}}]})
+                self.assertEqual(keyboard["browser_evidence"]["accessibility_targets"]["summary"]["name"], "Open")
+                refreshed = row("settings", settings)
+                refreshed["accessibility"]["capture_id"] = keyboard["capture_id"]
+                plan = self.run_action("record", {**request, "cases": [row("erp", erp), refreshed]})
+                self.assertEqual(plan["attempts"][-1]["cases"][1]["accessibility_capture"], keyboard)
             finally:
                 server.shutdown()
         self.assertEqual(plan["status"], "verified")

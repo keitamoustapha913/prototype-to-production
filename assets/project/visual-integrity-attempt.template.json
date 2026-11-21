@@ -92,6 +92,10 @@
       "reason": "REPLACE with the reason this case matters.",
       "acceptance_ids": [],
       "protected_decision_ids": [],
+      "accessibility": {
+        "result": "not_checked",
+        "note": "REPLACE with keyboard and focus observations or the reason coverage is incomplete."
+      },
       "checks": {
         "visual": {
           "result": "fail",

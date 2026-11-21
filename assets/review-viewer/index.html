@@ -23,14 +23,18 @@
       <section id="visual-register" aria-labelledby="register-title" hidden>
         <h1 id="register-title">Visual Review Register</h1>
         <p id="register-counts" aria-live="polite"></p>
+        <section id="visual-quality-report" aria-labelledby="quality-title" hidden>
+          <h2 id="quality-title">Application Visual Quality Report</h2>
+          <div id="quality-results"></div>
+        </section>
         <div id="register-project-status"></div>
-        <p class="register-note">This register preserves observations and evidence. Optional review is a handoff only; it does not record user approval.</p>
+        <p class="register-note">Technical verification and your final acceptance are recorded separately. Findings remain available for review.</p>
         <div id="register-filters">
           <label>Slice <select id="register-slice"><option value="">All slices</option></select></label>
           <label>Status <select id="register-status">
             <option value="">All findings and clean evidence</option><option value="open">Unresolved</option>
             <option value="corrected">Verified fixed</option>
-            <option value="improved">Improved — not verified</option><option value="noted">For review</option><option value="clean">Clean evidence</option>
+            <option value="improved">Improved — not verified</option><option value="noted">For review</option><option value="warnings">Documented warnings</option><option value="clean">Clean evidence</option>
             <option value="baselines">Original UI baselines</option>
           </select></label>
           <label>Find <input id="register-search" type="search" autocomplete="off" placeholder="Route, finding, attempt"></label>

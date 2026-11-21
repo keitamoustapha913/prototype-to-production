@@ -1,0 +1,23 @@
+{
+  "approval_id": "<active approval ID>",
+  "checks": [
+    {
+      "check_id": "invoice-integration",
+      "kind": "integration",
+      "scenario": "Saving an invoice updates its detail page and the shared list",
+      "slice_ids": ["invoice-editor", "invoice-list"],
+      "command": ["node", "tests/invoice-delivery.mjs", "invoice-integration"],
+      "test_source_paths": ["tests/invoice-delivery.mjs"],
+      "expected": {"saved": true, "detailTotal": 125, "listTotal": 125}
+    },
+    {
+      "check_id": "invoice-browser-journey",
+      "kind": "journey",
+      "scenario": "An authorized user creates and opens an invoice using the keyboard on a narrow viewport",
+      "slice_ids": ["invoice-editor", "invoice-list"],
+      "command": ["node", "tests/invoice-delivery.mjs", "invoice-browser-journey"],
+      "test_source_paths": ["tests/invoice-delivery.mjs"],
+      "expected": {"opened": true, "focused": "invoice heading", "horizontalOverflow": false}
+    }
+  ]
+}

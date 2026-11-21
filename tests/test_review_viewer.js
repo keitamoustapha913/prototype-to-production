@@ -288,3 +288,36 @@ test('baseline register shows the three design references and preserves unavaila
   assert.doesNotMatch(entries.textContent, /open-menu/);
   vm.runInContext("registerMetadata = {}; $('register-status').value = '';", context);
 });
+
+
+test('project quality displays documented warnings, check results and historical acceptance', () => {
+  const panel = dom.window.document.createElement('section');
+  panel.id = 'visual-quality-report';
+  const results = dom.window.document.createElement('div');
+  results.id = 'quality-results';
+  panel.append(results);
+  dom.window.document.body.append(panel);
+  try {
+    const quality = {
+      status:'technically_complete_with_warnings', blockers:[], defects:[], repairs:[],
+      slices:{'items-slice':{status:'verified_with_warnings', ui:true, reasons:[]}},
+      warnings:[{slice_id:'items-slice', finding_id:'small-gap', severity:'minor',
+        description:'The decorative gap is slightly wider.', comparison_count:1}],
+      audit_current:true, audit_sha256:'abc', audit:{audit_id:'audit-1',
+        checks:[{result:'pass', scenario:'Keyboard navigation', slice_ids:['items-slice']}]},
+      acceptance_current:false,
+    };
+    context.renderQualityReport(quality);
+    assert.match(results.textContent, /Technically complete — with warnings/);
+    assert.match(results.textContent, /Verified with warnings/);
+    assert.match(results.textContent, /Passed · Keyboard navigation/);
+    assert.equal(results.querySelectorAll('img').length, 2);
+    assert.doesNotMatch(results.textContent, /Accepted by the user/);
+    context.renderQualityReport({...quality, status:'in_implementation', audit_current:false,
+      acceptance:{audit_id:'audit-1'}, acceptance_current:false});
+    assert.match(results.textContent, /Historical audit/);
+    assert.match(results.textContent, /Prior user acceptance/);
+  } finally {
+    panel.remove();
+  }
+});

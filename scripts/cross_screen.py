@@ -287,7 +287,6 @@ def require_after_sources(plan, sources):
     previous = plan["attempts"][-1]["sources"]
     require(all(sources[path] == previous[path] for path in plan["component_paths"]),
             "A verified shared change requires a new plan for subsequent shared edits")
-    require(sources != previous, "This change already has verified evidence for the current source")
 
 
 def capture(directory, slice_id, payload):
@@ -302,7 +301,8 @@ def capture(directory, slice_id, payload):
             receipt = max((item for item in plan["captures"].values() if item["phase"] == phase
                            and item["case"]["case_id"] == case_id), key=lambda item: item["captured_at"])
             return receipt["case"]
-    require(phase in ("before", "after") and isinstance(case_id, str) and case_id in case_specs(plan), "Choose a planned case and before/after phase")
+    require(phase in ("before", "after", "accessibility") and isinstance(case_id, str) and case_id in case_specs(plan),
+            "Choose a planned case and before, after or accessibility phase")
     spec = case_specs(plan)[case_id]
     sources = source_hashes(directory, scoped_paths(plan))
     if phase == "before":
@@ -320,9 +320,22 @@ def capture(directory, slice_id, payload):
     snapshot = state.discovery_snapshot(existing)
     build = {"fingerprint": state.build_fingerprint(snapshot), "sources": snapshot}
     criteria = spec["criteria"]
+    render = spec["renderCase"]
+    capture_request = {**spec, "browser": payload["browser"], "appUrl": payload["appUrl"]}
+    if phase == "accessibility":
+        steps = payload.get("keyboard_steps")
+        state.check_browser_setup(steps)
+        actions = {step["action"] for step in steps}
+        require("press" in actions and actions <= {"press", "wait"},
+                "Supplemental accessibility capture steps must use keyboard input and optional waits")
+        assertions = visual.check_interaction_assertions(payload.get("keyboard_assertions"))
+        require(any(rule.get("probe") == "focused" and rule.get("expected") is True for rule in assertions),
+                "Supplemental accessibility captures require a positive focus assertion")
+        render = {**render, "setup": [*render.get("setup", []), *steps]}
+        capture_request["interaction_assertions"] = [*spec.get("interaction_assertions", []), *assertions]
     case, evidence = visual.browser_case(
-        directory, slice_id, state, {**spec, "browser": payload["browser"], "appUrl": payload["appUrl"]},
-        spec["renderCase"], spec["state"], case_id, build,
+        directory, slice_id, state, capture_request,
+        render, spec["state"], case_id, build,
         [*(rule["measurement"] for rule in criteria), *spec.get("checks", [])], criteria,
     )
     require(isinstance(case.get("browser_evidence"), dict), "Cross-screen captures require browser evidence")
@@ -370,7 +383,7 @@ def comparison(directory, slice_id, before, after):
     return result
 
 
-def review_case(directory, plan, spec, row, sources, since):
+def review_case(directory, plan, spec, row, sources, since, *, accessibility_required=False):
     checks = row.get("checks")
     require(isinstance(checks, dict) and set(checks) == CHECKS
             and all(isinstance(check, dict) and check.get("result") in ("pass", "fail", "not_checked")
@@ -418,13 +431,26 @@ def review_case(directory, plan, spec, row, sources, since):
         require(visual._ids(decision_ids) and (checks["blueprint"]["result"] != "pass" or set(decision_ids) ==
                 {decision["decision_id"] for decision in spec["protections"]}),
                 "A blueprint pass must cover every protected decision for the approved case")
-    pair["status"] = ("failed" if any(check["result"] == "fail" for check in checks.values())
-                      else "verified" if all(check["result"] == "pass" for check in checks.values())
+    results = {check["result"] for check in checks.values()}
+    if "accessibility" in row:
+        check = row["accessibility"]
+        if isinstance(check, dict) and "capture_id" in check:
+            keyboard_id = check["capture_id"]
+            keyboard = plan["captures"].get(keyboard_id) if isinstance(keyboard_id, str) else None
+            require(latest and keyboard and keyboard["phase"] == "accessibility" and keyboard["case"]["case_id"] == key
+                    and keyboard["captured_at"] > since and keyboard["sources"] == sources
+                    and keyboard["build"] == receipt["build"], "Use fresh keyboard evidence from this case and the same build")
+            pair["accessibility_capture"] = keyboard["case"]
+        results.add(visual.check_accessibility(pair.get("accessibility_capture") or latest, check))
+    elif accessibility_required:
+        results.add("not_checked")
+    pair["status"] = ("failed" if "fail" in results
+                      else "verified" if results <= {"pass", "not_applicable"}
                       else "not_verified")
     return pair
 
 
-def review_findings(plan, rows, findings):
+def review_findings(directory, plan, rows, findings, *, final_quality=False):
     require(isinstance(findings, list) and all(isinstance(item, dict) for item in findings),
             "Findings must be an array of objects")
     by_case = {row["case_id"]: row for row in rows}
@@ -434,7 +460,7 @@ def review_findings(plan, rows, findings):
     for item in findings:
         key, case, status = item.get("finding_id"), item.get("case_id"), item.get("status")
         require(visual._text(key) and key not in seen and isinstance(case, str) and case in by_case
-                and status in ("open", "fixed", "improved", "noted")
+                and status in ("open", "fixed", "improved", "noted", "deferred")
                 and visual._text(item.get("description")) and visual._text(item.get("severity"))
                 and isinstance(item.get("dimension"), str) and item["dimension"] in visual.OBSERVATION_DIMENSIONS,
                 "Invalid cross-screen finding")
@@ -442,7 +468,7 @@ def review_findings(plan, rows, findings):
         previous = old.get(key, {})
         require(not previous or (case, item["dimension"]) == (previous["case_id"], previous["dimension"]),
                 "Retain the original case and dimension when rechecking a finding")
-        require(previous.get("status") not in ("open", "improved") or status != "noted",
+        require(previous.get("status") not in ("open", "improved") or status not in ("noted", "deferred"),
                 "Recheck an open defect before clearing its hold")
         spec = specs[case]
         visual._check_classification(item, {decision["decision_id"] for decision in spec["protections"]})
@@ -451,11 +477,35 @@ def review_findings(plan, rows, findings):
         require(previous.get("classification") != "approval_conflict" or
                 (item["classification"] == "approval_conflict" and status == "open" and not item.get("correction")),
                 "Resolve approval conflicts through an explicit amendment")
+        visual.check_deferral(item)
+        if final_quality:
+            visual.check_severity(item)
+        if visual.is_warning(item):
+            row = by_case[case]
+            require(row["after"], "A warning requires a rendered screenshot")
+            rect = visual._validate_rect(item.get("normalized_rect"))
+            latest = row["after"]["closeup_screenshot"]
+            item["comparison"] = {"latest": latest, "normalized_rect": rect,
+                                  "annotated_latest": visual._annotated_png(directory, plan["slice_id"], latest, rect)}
+        if status == "deferred":
+            require(all(row["status"] == "verified" for row in rows),
+                    "Defer a minor defect only after mandatory checks pass")
         if status in ("fixed", "improved"):
-            require(previous.get("status") in ("open", "improved") and visual._text(item.get("correction"))
+            require(previous.get("status") in ("open", "improved", "deferred") and visual._text(item.get("correction"))
                     and visual._text(item.get("verification")), "Recheck a recorded defect and explain its repair")
             if status == "fixed":
-                require(by_case[case]["status"] == "verified", "A fixed finding needs passing checks on its case")
+                row = by_case[case]
+                require(row["status"] == "verified", "A fixed finding needs passing checks on its case")
+                original = next((recorded["after"] for attempt in plan["attempts"]
+                                 if any(finding["finding_id"] == key and finding["status"] in ("open", "deferred")
+                                        for finding in attempt["findings"])
+                                 for recorded in attempt["cases"] if recorded["case_id"] == case and recorded["after"]),
+                                None)
+                require(original, "A fixed finding needs a screenshot of the original defect")
+                item["comparison"] = comparison(directory, plan["slice_id"], original["closeup_screenshot"],
+                                                row["after"]["closeup_screenshot"])
+                if final_quality and item["dimension"] in {"geometry", "design", "responsive"}:
+                    require(item["comparison"]["pixels_changed"], "A fixed visual defect needs a changed comparison")
     require({key for key, item in old.items() if item["status"] in ("open", "improved")} <= seen,
             "Retain or explicitly recheck all open findings")
     require({row["case_id"] for row in rows if row["status"] == "failed"} <= {
@@ -464,7 +514,7 @@ def review_findings(plan, rows, findings):
     return visual._retry_policy(plan["attempts"], [item for item in findings if item["classification"] == "confirmed_defect"])
 
 
-def record(directory, plan, payload):
+def record(directory, plan, payload, *, accessibility_required=False):
     specs = case_specs(plan)
     rows = payload.get("cases")
     require(isinstance(rows, list) and all(isinstance(row, dict) and visual._text(row.get("case_id")) for row in rows)
@@ -475,9 +525,10 @@ def record(directory, plan, payload):
     since = max(plan.get("updated_at", plan["created_at"]),
                 plan.get("pre_edit_check", plan["created_at"]),
                 plan["attempts"][-1]["recorded_at"] if plan["attempts"] else plan["created_at"])
-    cases = [review_case(directory, plan, specs[row["case_id"]], row, sources, since) for row in rows]
-    findings = payload.get("findings", [])
-    retry = review_findings(plan, cases, findings)
+    cases = [review_case(directory, plan, specs[row["case_id"]], row, sources, since,
+                         accessibility_required=accessibility_required) for row in rows]
+    findings = deepcopy(payload.get("findings", []))
+    retry = review_findings(directory, plan, cases, findings, final_quality=accessibility_required)
     verified = (all(row["status"] == "verified" for row in cases)
                 and not any(item["status"] in ("open", "improved") for item in findings))
     if verified:
@@ -521,7 +572,10 @@ def change(directory, slice_id, action, payload):
             require(action in ("record", "abandon", "extend", "reuse"), "Unknown cross-screen action")
             plan = get_plan(manifest, slice_id, payload.get("change_id"))
             if action == "record":
-                record(directory, plan, payload)
+                record(directory, plan, payload, accessibility_required=manifest.get("final_visual_quality_required", False))
+                if plan["status"] != "verified" and manifest["stage"] == "integrate":
+                    manifest["stage"] = "implement"
+                    manifest["next_action"] = f"Reverify cross-screen change {plan['change_id']} before integration"
             elif action == "extend":
                 plan = make_plan(directory, manifest, slice_id, payload, existing=plan)
             elif action == "reuse":
@@ -577,6 +631,20 @@ def require_history(directory, manifest):
     require(not errors, "; ".join(errors))
 
 
+def verify_attempt_images(directory, plan):
+    evidence = [{"cases": [
+        {**case, "comparisons": row["comparisons"]}
+        for row in attempt["cases"] for case in (row["before"], row["after"], row.get("accessibility_capture")) if case
+    ]} for attempt in plan["attempts"]]
+    visual.verify_saved_images(directory, evidence)
+    for attempt in plan["attempts"]:
+        for finding in attempt["findings"]:
+            for field in ("before", "latest", "annotated_before", "annotated_latest"):
+                path = finding.get("comparison", {}).get(field)
+                if path:
+                    visual.resolve_evidence_path(directory, path)
+
+
 def current_status(directory, plan):
     if plan["status"] != "verified":
         return plan["status"]
@@ -584,11 +652,7 @@ def current_status(directory, plan):
     try:
         if source_hashes(directory, scoped_paths(plan)) != attempt["sources"]:
             return "stale"
-        visual.verify_saved_images(directory, [{"cases": [
-            case
-            for row in attempt["cases"]
-            for case in ({**row["before"], "comparisons": []}, {**row["after"], "comparisons": row["comparisons"]})
-        ]}])
+        verify_attempt_images(directory, plan)
     except (OSError, ValueError, project_state.StateError):
         return "evidence unavailable"
     return "verified"
