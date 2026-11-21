@@ -4,6 +4,7 @@ import hashlib
 import json
 import subprocess
 import uuid
+from datetime import datetime, timezone
 
 try:
     from scripts import project_state as state
@@ -187,7 +188,7 @@ def warning_image(directory, manifest, warning_id, index, side):
 
 def record_history(directory, manifest):
     """Verify report and acceptance history, including orphan files."""
-    records = {"audit": {}, "accept": {}}
+    records = {"audit": {}, "accept": {}, "correction": {}}
     for line in (directory / "decisions.jsonl").read_text(encoding="utf-8").splitlines():
         entry = json.loads(line)
         kind = entry.get("type", "").removeprefix("visual_quality_")
@@ -205,16 +206,19 @@ def record_history(directory, manifest):
             if state.digest_of(path) != expected:
                 raise state.StateError(f"Visual quality {kind} {key} evidence changed")
     heads = {kind: next(reversed(entries), None) for kind, entries in records.items()}
-    if heads != {"audit": None, "accept": None} and manifest.get("visual_quality") != heads:
+    saved = manifest.get("visual_quality", {})
+    if set(saved) - heads.keys() or any(saved.get(kind) != key for kind, key in heads.items()):
         raise state.StateError("Visual quality history differs from the manifest")
-    if manifest.get("visual_quality") and manifest["visual_quality"] != heads:
-        raise state.StateError("Visual quality history is incomplete")
     return records, heads
 
 
-def basis(directory, manifest, assessment):
+def basis(directory, manifest, assessment, corrections=None):
     slices = active_slices(manifest)
+    started = state.sibling_module("final_review").started_correction
+    correction_basis = {key: row["history"][-1]["record_id"] for key, row in (corrections or {}).items()
+                        if started(row)}
     return digest({
+        **({"corrections": correction_basis} if correction_basis else {}),
         "workspace": state.blueprint_state(directory, manifest).workspace_snapshot(),
         "approval": manifest.get("active_approval_id"), "package": manifest.get("slice_review", {}).get("active_package"),
         "discovery": manifest.get("active_discovery_id"), "pending_coverage": manifest.get("coverage_pending"),
@@ -233,8 +237,16 @@ def read_record(directory, kind, key):
 def status(directory, manifest, *, assessment=None):
     records, heads = record_history(directory, manifest)
     assessment = assess(directory, manifest) if assessment is None else assessment
+    module = state.sibling_module("final_review")
+    corrections = module.corrections(directory, records)
+    correction_hold = any(row["status"] != "verified" and module.started_correction(row)
+                          for row in corrections.values())
     audit = read_record(directory, "audit", heads["audit"]) if heads["audit"] else None
-    current = bool(audit and audit["basis"] == basis(directory, manifest, assessment))
+    completion = audit
+    if audit and audit["status"] not in COMPLETE:
+        completion = next((entry for key in reversed(records["audit"])
+                           if (entry := read_record(directory, "audit", key))["status"] in COMPLETE), None)
+    current = bool(audit and audit["basis"] == basis(directory, manifest, assessment, corrections))
     if current:
         try:
             current = audit["test_source_hashes"] == test_fingerprints(directory, audit["plan"]["checks"])
@@ -245,6 +257,7 @@ def status(directory, manifest, *, assessment=None):
                     and acceptance["audit_id"] == audit["audit_id"]
                     and acceptance["audit_sha256"] == records["audit"][audit["audit_id"]])
     blocked = (assessment["blockers"] or assessment["defects"]
+               or correction_hold
                or any(row["status"] == "needs_correction"
                       or (row["delivery"] in {"blocked", "accepted", "provisional", "verified"} and row["status"] == "not_verified")
                       for row in assessment["slices"].values()))
@@ -253,13 +266,28 @@ def status(directory, manifest, *, assessment=None):
     return {**assessment, "status": phase, "audit": audit, "audit_current": current,
             "audit_sha256": records["audit"].get(heads["audit"]),
             "acceptance": acceptance, "acceptance_current": accepted,
+            "completion_audit": completion, "corrections": corrections, "correction_hold": correction_hold,
             "audit_history": list(records["audit"]), "acceptance_history": list(records["accept"])}
 
 
 def check_plan(directory, manifest, payload, assessment, previous):
-    if not isinstance(payload, dict) or set(payload) != {"approval_id", "checks"} or (
+    if not isinstance(payload, dict) or set(payload) not in ({"approval_id", "checks"},
+                                                            {"approval_id", "checks", "workstreams"}) or (
             not manifest.get("active_approval_id") or payload["approval_id"] != manifest["active_approval_id"]):
         raise state.StateError("Audit input must name the active approval and its integration checks")
+    workstreams = payload.get("workstreams", [])
+    if not isinstance(workstreams, list):
+        raise state.StateError("Workstreams must be a list of titles and assigned slice IDs")
+    titles = set()
+    for row in workstreams:
+        if (not isinstance(row, dict) or row.keys() != {"title", "slice_ids"}
+                or not isinstance(row["title"], str) or not row["title"].strip() or row["title"] in titles
+                or not isinstance(row["slice_ids"], list) or not row["slice_ids"]
+                or any(not isinstance(key, str) for key in row["slice_ids"])
+                or len(set(row["slice_ids"])) != len(row["slice_ids"])
+                or not set(row["slice_ids"]) <= assessment["slices"].keys()):
+            raise state.StateError("Each workstream needs a distinct title and active slices")
+        titles.add(row["title"])
     checks = payload["checks"]
     if not isinstance(checks, list) or not checks:
         raise state.StateError("Final audit requires integration checks")
@@ -330,13 +358,13 @@ def test_fingerprints(directory, checks):
             for check in checks for path in check["test_source_paths"]}
 
 
-def save(directory, manifest, kind, key, record, request):
+def save(directory, manifest, kind, key, record, request, *, events=(), artifacts=None, binary_artifacts=None):
     relative = f"visual-quality/{kind}/{key}.json"
     data = (json.dumps(record, indent=2, sort_keys=True, allow_nan=False) + "\n").encode()
     manifest.setdefault("visual_quality", {"audit": None, "accept": None})[kind] = key
     event = {"type": f"visual_quality_{kind}", "record_id": key, "sha256": hashlib.sha256(data).hexdigest()}
-    state.save_workflow_state(directory, manifest, transition=(request, [event], {}),
-                              binary_artifacts={relative: data})
+    state.save_workflow_state(directory, manifest, transition=(request, [*events, event], artifacts or {}),
+                              binary_artifacts={**(binary_artifacts or {}), relative: data})
 
 
 def audit(directory, payload):
@@ -350,17 +378,18 @@ def audit(directory, payload):
         prior = status(directory, manifest, assessment=assessment)
         previous = prior["audit"]
         checks = check_plan(directory, manifest, payload, assessment, previous)
-        before = basis(directory, manifest, assessment)
+        before = basis(directory, manifest, assessment, prior["corrections"])
         sources = test_fingerprints(directory, checks)
         slices = assessment["slices"]
-        eligible = bool(slices) and not (assessment["blockers"] or assessment["defects"]) and all(
+        eligible = bool(slices) and not (assessment["blockers"] or assessment["defects"]
+                                         or prior["correction_hold"]) and all(
             row["delivery"] == "accepted" and row["status"] in {"verified", "verified_with_warnings"}
             for row in slices.values())
         if (eligible and prior["audit_current"] and previous["status"] in COMPLETE
                 and previous["plan"] == payload and previous["test_source_hashes"] == sources):
             return previous
         outcomes = [run_check(directory.parents[2], check) for check in checks] if eligible else []
-        if before != basis(directory, manifest, assess(directory, manifest)) or sources != test_fingerprints(directory, checks):
+        if before != basis(directory, manifest, assess(directory, manifest), prior["corrections"]) or sources != test_fingerprints(directory, checks):
             raise state.StateError("Application or test evidence changed while the final audit ran")
         passed = eligible and all(row["result"] == "pass" for row in outcomes)
         phase = "blocked"
@@ -369,9 +398,20 @@ def audit(directory, payload):
         elif not eligible and prior["status"] == "in_implementation":
             phase = "in_implementation"
         key = "audit-" + uuid.uuid4().hex
-        report = {"audit_id": key, "approval_id": manifest["active_approval_id"], "recorded_at": state.utc_now(),
+        report = {"audit_id": key, "approval_id": manifest["active_approval_id"], "recorded_at": datetime.now(timezone.utc).isoformat(),
                   "status": phase, "basis": before, "plan": payload, "test_source_hashes": sources,
                   "checks": outcomes, **assessment}
+        if passed:
+            report["review_scope"] = state.sibling_module("final_review").scope_rows(directory, manifest, list(slices))
+            visual = state.sibling_module("visual_integrity")
+            cross = state.sibling_module("cross_screen")
+            captures = {case["capture_id"] for key, row in slices.items() if row["ui"]
+                        for case in visual.require_verified(directory, manifest, key)["cases"]}
+            captures.update(case["capture_id"] for plan in cross.current_plans(manifest)
+                            if plan["status"] == "verified"
+                            for row in plan["attempts"][-1]["cases"]
+                            for case in (row["after"], row.get("accessibility_capture")) if case)
+            report["verified_capture_ids"] = sorted(captures)
         save(directory, manifest, "audit", key, report, request)
         return report
 
@@ -396,6 +436,8 @@ def accept(directory, payload):
             if all(current["acceptance"].get(key) == value for key, value in payload.items()):
                 return current["acceptance"]
             raise state.StateError("This audit already has a user's final acceptance record")
+        if any(row["status"] not in {"verified", "withdrawn", "deferred"} for row in current["corrections"].values()):
+            raise state.StateError("Resolve outstanding final review feedback or record the user's deferral or withdrawal before accepting")
         key = "accept-" + uuid.uuid4().hex
         record = {**payload, "acceptance_id": key, "accepted_at": state.utc_now()}
         save(directory, manifest, "accept", key, record, request)

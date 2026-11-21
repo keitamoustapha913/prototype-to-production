@@ -1405,6 +1405,48 @@ class ProjectStateTests(unittest.TestCase):
         self.assertEqual([warning["finding_id"] for warning in report["warnings"]], ["minor-spacing"])
         self.assertFalse(json.loads(self.cli("visual-quality", "--action", "status").stdout)["acceptance_current"])
 
+        def correction(phase, success=True, **fields):
+            result = self.cli("visual-quality", "--action", "correction", "--input-file",
+                              self.write_input("correction.json", {"status": phase, **fields}), success=success)
+            return json.loads(result.stdout) if success else result.stderr
+
+        finding = correction("reported", audit_id=report["audit_id"], slice_ids=["invoice-list"],
+                             user_feedback="Align the table header with the card actions.")["finding_id"]
+        before = json.loads((self.root / "visual-integrity.json").read_text())["cases"][0]["capture_id"]
+        self.assertIn(before, report["verified_capture_ids"])
+        correction("triaged", finding_id=finding, disposition="within_approval",
+                   rationale="The current card and actions remain in their approved positions.",
+                   before_capture_ids={"invoice-list": [before]})
+        correction("in_progress", finding_id=finding, slice_ids=["invoice-list"], replacements={})
+        self.submit_slice()
+        attempt = json.loads((self.root / "visual-integrity.json").read_text())
+        case = attempt["cases"][0]
+        self.artifact(case["full_screenshot"], png(case["viewport"]["width"], case["viewport"]["height"], color=(251, 252, 252)))
+        self.artifact(case["closeup_screenshot"], png(64, 32, color=(251, 252, 252)))
+        capture_fixture_case(self.initiative, "invoice-list", case)
+        self.cli(*args, "--attempt-file", self.write_input("corrected-visual.json", attempt))
+        self.cli("reconcile", "--slice-id", "invoice-list", "--action", "verify",
+                 "--review-file", self.write_input("new-review.json", review))
+        self.cli("reconcile", "--slice-id", "invoice-list", "--action", "accept")
+        error = correction("verified", success=False, finding_id=finding,
+                           after_capture_ids={"invoice-list": [before]}, summary="Old capture.")
+        self.assertIn("Capture", error)
+        fixed = correction("verified", finding_id=finding, after_capture_ids={"invoice-list": [case["capture_id"]]},
+                           summary="Aligned the header and rechecked the approved table state.")
+        self.assertTrue(fixed["comparisons"][0]["difference"]["pixels_changed"])
+        self.assertIsNotNone(fixed["comparisons"][0]["difference"]["annotated_latest"])
+        self.assertTrue(all((self.initiative / path).is_file() for path in fixed["archived_evidence"].values()))
+        new_report = json.loads(self.cli("visual-quality", "--action", "audit",
+                                         "--input-file", self.write_input("audit-with-warning.json", plan)).stdout)
+        self.assertEqual(new_report["status"], "technically_complete_with_warnings")
+        self.assertIn(case["capture_id"], new_report["verified_capture_ids"])
+        self.assertNotIn(before, new_report["verified_capture_ids"])
+        self.assertEqual([warning["finding_id"] for warning in new_report["warnings"]], ["minor-spacing"])
+        archived = self.initiative / next(iter(fixed["archived_evidence"].values()))
+        archived.write_text("Changed after verification")
+        invalid = self.cli("visual-quality", "--action", "status", success=False)
+        self.assertIn("Archived verification evidence changed", invalid.stderr)
+
     def test_capture_receipt_and_incomplete_history_through_cli(self):
         from functools import partial
         from http.server import ThreadingHTTPServer

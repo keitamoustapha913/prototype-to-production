@@ -3074,10 +3074,14 @@ def build_resume_packet(directory: Path, project_root: Path, *, delivery_slice: 
         module = sibling_module("visual_quality")
         try:
             quality = module.status(directory, manifest)
-            if quality["acceptance_current"]:
-                next_action = "Final acceptance recorded. Use the Visual Review Register for deferred review."
+            pending_review = [key for key, row in quality["corrections"].items()
+                              if row["status"] not in {"verified", "withdrawn", "deferred"}]
+            if pending_review:
+                next_action = "Continue final review findings: " + ", ".join(pending_review)
+            elif quality["acceptance_current"]:
+                next_action = "Final acceptance recorded. Use Application Completion Review for deferred review."
             elif quality["audit_current"] and quality["status"] in module.COMPLETE:
-                next_action = "Present the current Visual Quality Report for the user's final acceptance."
+                next_action = "Present Application Completion Review for the user's final acceptance."
             elif quality["audit_current"] and quality["status"] == "blocked":
                 next_action = "Resolve final audit blockers and continue eligible independent work."
         except module.EVIDENCE_ERRORS as error:
@@ -3226,7 +3230,7 @@ def main(argv: list[str] | None = None) -> int:
             sub.add_argument("--attempt-file")
             sub.add_argument("--capture-file")
         if name == "visual-quality":
-            sub.add_argument("--action", choices=["status", "audit", "accept"], required=True)
+            sub.add_argument("--action", choices=["status", "audit", "accept", "correction"], required=True)
             sub.add_argument("--input-file")
         if name == "cross-screen":
             sub.add_argument("--action", choices=["plan", "extend", "capture", "record", "abandon", "reuse", "ready", "list"], required=True)
@@ -3318,8 +3322,10 @@ def main(argv: list[str] | None = None) -> int:
                         result = quality.status(directory, manifest_at(directory))
                 else:
                     if not args.input_file:
-                        raise StateError("Visual quality audit and acceptance require --input-file")
-                    result = getattr(quality, args.action)(directory, read_json(Path(args.input_file)))
+                        raise StateError("Visual quality audit, acceptance and correction require --input-file")
+                    handler = (sibling_module("final_review").record if args.action == "correction"
+                               else getattr(quality, args.action))
+                    result = handler(directory, read_json(Path(args.input_file)))
             except quality.EVIDENCE_ERRORS as error:
                 raise StateError(str(error)) from error
             print(json.dumps(result, indent=2))

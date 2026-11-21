@@ -48,7 +48,7 @@ flowchart TD
     F -- No --> H{Documented warnings remain?}
     H -- Yes --> I[Technically complete with warnings]
     H -- No --> J[Technically complete]
-    I --> K[Open the Visual Quality Report for review]
+    I --> K[Open Application Completion Review]
     J --> K
     K --> L{User explicitly accepts this report?}
     L -- Yes --> M[Finally accepted]
@@ -56,10 +56,10 @@ flowchart TD
 ```
 
 1. Reconcile every active slice against the locked package. Confirm that the required features, behavior, and blueprint checks are covered. Resolve blockers or collect missing data in the affected areas.
-2. Prepare an audit input inside the initiative using the [audit template](../assets/project/visual-quality-audit.template.json). Include at least one application integration check and browser journey checks covering each UI slice. Select critical flows that cross feature, role, state or screen boundaries. Group related slices in a single journey when that exercises the real integration. Keep established audit check IDs, expected outcomes and their active slice scope on retries and subsequent audits.
+2. Prepare an audit input inside the initiative using the [audit template](../assets/project/visual-quality-audit.template.json). Include at least one application integration check and browser journey checks covering each UI slice. Select critical flows that cross feature, role, state or screen boundaries. Group related slices in a single journey when that exercises the real integration. Keep established audit check IDs, expected outcomes and their active slice scope on retries and subsequent audits. To display named roadmap workstreams, add an optional `workstreams` array with a `title` and `slice_ids` for each area. The dashboard always includes individual slices and approved features.
 3. List the actual test and helper source paths for each check. Commands run as argument arrays from the application root. Each command emits a JSON object with `check_id`, `expected`, `actual` and `result: "pass"`. Emit diagnostics on standard error. Exercise the actual application or integration and report its observations. Use a reproducible, nonproduction fixture. Keep credentials and sensitive fixture data out of audit output.
 4. Run the audit. It validates slice evidence, baseline and cross-screen holds, approved requirement coverage, and the workspace before and after executing the commands. Repeating the same successful audit with unchanged inputs and fingerprints reuses its report. After a change, reuse still-current slice and cross-screen receipts, refresh stale or affected ones, and rerun the integrated checks for the current application.
-5. Present the current report and its audit ID and SHA-256. The **Visual Review Register** shows application status, slice outcomes, check results, repairs and warnings, with links to relevant capture history.
+5. Present the current report and its audit ID and SHA-256. The [Application Completion Review](final-review.md) dashboard is available automatically. It shows slice outcomes, check results, repairs and warnings, with links to the Visual Review Register.
 
 ```sh
 python3 scripts/project_state.py visual-quality --project-root <app> --initiative-id <id> --action audit --input-file <audit.json>
@@ -79,4 +79,4 @@ python3 scripts/project_state.py visual-quality --project-root <app> --initiativ
 
 The command checks the exact report and live fingerprints. The viewer is read-only. Blueprint approval, implementation authorization, and coordinator slice acceptance are separate records. Deployment and merging remain subject to their own authorization.
 
-For a later correction, record the issue and reopen affected work before editing. Follow the existing ownership, protected-design and cross-screen gates. Recheck the affected states and any stale evidence, then generate a fresh technical report. Prior audit and acceptance files in `visual-quality/` remain available in the initiative history. A new result requires new acceptance for the current report.
+For later corrections and optional walkthroughs, follow [Application Completion Review](final-review.md).

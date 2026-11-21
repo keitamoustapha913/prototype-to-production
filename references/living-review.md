@@ -13,7 +13,7 @@ Open the loopback URL printed by the first command. Each initiative uses a stabl
 
 Cross-screen inspections appear in **Visual Review Register** grouped by the original shared-component change. Filter by an affected slice or search by route, change ID or finding. Expand each state for original and updated captures, marked image regions, browser results and outstanding warnings. [Cross-Screen Visual Regression Protection](cross-screen-regression.md)
 
-For implemented slices, open **Visual Review Register** in this same viewer. Filter by slice or status and inspect the saved screenshots and repair history. The register is available when you reopen the initiative after delivery. Its [implementation verification workflow](visual-integrity.md) runs on the actual application. The [Application Visual Quality Report](visual-quality.md) shows current technical status, integration and journey results, warnings, verified repairs and any final user acceptance.
+For implemented slices, open **Visual Review Register** in this same viewer. Filter by slice or status and inspect the saved screenshots and repair history. The register is available when you reopen the initiative after delivery. Its [implementation verification workflow](visual-integrity.md) runs on the actual application. After technical completion, [Application Completion Review](final-review.md) brings together the delivered features, visual comparisons, verification, warnings, correction history and explicit acceptance.
 
 ## Register the review material
 

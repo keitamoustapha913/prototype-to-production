@@ -2756,6 +2756,99 @@ print(json.dumps(output))
         report.write_text('{}')
         self.assertIn('evidence changed', self.cli('visual-quality', '--action', 'status', ok=False).stderr)
 
+    def test_final_review_correction_reopens_delivery_and_preserves_prior_acceptance(self):
+        self.assigned()
+        key = 'items-slice'
+
+        def verify():
+            self.cli('reconcile', '--slice-id', key, '--action', 'verify',
+                     '--review-file', self.payload('quality-review', self.review()))
+            self.cli('reconcile', '--slice-id', key, '--action', 'accept')
+
+        def quality(action, payload=None, expected_success=True):
+            args = [] if payload is None else ['--input-file', self.payload('quality-input', payload)]
+            return self.cli('visual-quality', '--action', action, *args, ok=expected_success)
+
+        def audit():
+            return json.loads(quality('audit', plan).stdout)
+
+        def acceptance(report):
+            return {'approval_id': report['approval_id'], 'audit_id': report['audit_id'],
+                    'audit_sha256': json.loads(quality('status').stdout)['audit_sha256'],
+                    'approved_by_user': True, 'user_response': 'I accept this completed application.'}
+
+        def correction(phase, **args):
+            return json.loads(quality('correction', {'status': phase, **args}).stdout)
+
+        verify()
+        plan = {'approval_id': self.manifest()['active_approval_id'], 'checks': [{
+            'check_id': 'application-api', 'kind': 'integration', 'slice_ids': [key],
+            'scenario': 'Exercise list and permission checks',
+            'command': self.test_command('api', 'application-api'),
+            'test_source_paths': ['tests/test_items.py'], 'expected': 'Member gets 200 array; nonmember gets 403',
+        }]}
+        original = audit()
+        self.assertEqual(original['review_scope'][key]['features'][0]['feature_id'], 'items-feature')
+        approval = acceptance(original)
+        feedback = correction('reported', audit_id=original['audit_id'], slice_ids=[key],
+                              user_feedback='Please simplify the handling of the empty items result.')
+        pending = quality('accept', approval, expected_success=False)
+        self.assertIn('outstanding final review feedback', pending.stderr)
+        correction('deferred', finding_id=feedback['finding_id'], user_response='Keep this for later review.',
+                   rationale='The current response passes every approved requirement.')
+        accepted = json.loads(quality('accept', approval).stdout)
+        self.assertEqual(json.loads(quality('status').stdout)['corrections'][feedback['finding_id']]['status'],
+                         'deferred')
+
+        request = correction('reported', audit_id=original['audit_id'], slice_ids=[key],
+                             user_feedback='Simplify empty item construction while keeping the list response.')
+        finding = request['finding_id']
+        self.assertEqual(request['acceptance_id'], accepted['acceptance_id'])
+        correction('triaged', finding_id=finding, disposition='requires_amendment',
+                   rationale='A behavior change needs approval.', before_capture_ids={})
+        start = {'status': 'in_progress', 'finding_id': finding, 'slice_ids': [key], 'replacements': {}}
+        refused = quality('correction', start, expected_success=False)
+        self.assertIn('required amendment', refused.stderr)
+        correction('triaged', finding_id=finding, disposition='within_approval',
+                   rationale='The expected response and permissions are preserved.', before_capture_ids={})
+        correction('in_progress', finding_id=finding, slice_ids=[key], replacements={})
+        self.assertEqual(self.manifest()['slices'][key]['status'], 'ready')
+        premature = {'status': 'verified', 'finding_id': finding, 'after_capture_ids': {}, 'summary': 'Checks passed.'}
+        self.assertIn('Reverify', quality('correction', premature, expected_success=False).stderr)
+        source = self.root / 'src/service.py'
+        source.write_text(source.read_text() + '\n# Clarify the implementation.\n')
+        self.cli('slice-report', '--slice-id', key, '--owner', 'builder', '--report-file', str(self.directory / 'inputs' / 'report.json'))
+        self.cli('reconcile', '--slice-id', key, '--action', 'report')
+        verify()
+        self.assertEqual(json.loads(quality('audit', plan, expected_success=False).stdout)['status'], 'blocked')
+        verified = correction('verified', finding_id=finding, after_capture_ids={}, summary='Verified API and permissions.')
+        self.assertIn(key, verified['verification'])
+        updated = audit()
+        self.assertNotEqual(updated['audit_id'], original['audit_id'])
+        current = json.loads(quality('status').stdout)
+        self.assertFalse(current['acceptance_current'])
+        self.assertEqual(current['acceptance']['acceptance_id'], accepted['acceptance_id'])
+        self.assertEqual(current['corrections'][finding]['status'], 'verified')
+        quality('accept', acceptance(updated))
+        self.assertEqual(len(json.loads(quality('status').stdout)['acceptance_history']), 2)
+
+        request = correction('reported', audit_id=updated['audit_id'], slice_ids=[key],
+                             user_feedback='Record the new approved approach for item access.')
+        amendment = request['finding_id']
+        correction('triaged', finding_id=amendment, disposition='requires_amendment',
+                   rationale='The requested approach changes the explicitly approved blueprint.',
+                   before_capture_ids={})
+        self.cli('blueprint-record', '--blueprint-file', self.payload('spec-v2', self.blueprint('spec-v2')))
+        self.cli('blueprint-coverage', '--coverage-file', self.payload('coverage-v2', self.coverage('spec-v2')))
+        self.cli('approve', '--approval-file', self.payload('approval-v2', self.approval('spec-v2')))
+        replacement = dict(self.slice(), slice_id='items-slice-v2', blueprint_version='spec-v2')
+        self.cli('slice-create', '--contract-file', self.payload('replacement', replacement))
+        begun = correction('in_progress', finding_id=amendment, slice_ids=['items-slice-v2'],
+                           replacements={key: 'items-slice-v2'})
+        self.assertTrue(begun['amended'])
+        self.assertEqual(begun['approval_id'], 'approve-spec-v2')
+        self.assertEqual(begun['affected_slices'], ['items-slice-v2'])
+
     def test_blueprint_ui_slice_requires_post_implementation_visual_integrity(self):
         self.assigned('ui')
         review = self.review('ui', record_integrity=False)

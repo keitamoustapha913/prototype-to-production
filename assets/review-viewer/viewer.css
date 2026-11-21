@@ -224,3 +224,20 @@ h1,h2,h3 {
 }
 .quality-stats li { padding: .65rem .85rem; border: 1px solid currentColor; border-radius: .35rem; }
 .quality-stats strong { display: block; font-size: 1.4em; }
+
+.review-header-actions,.completion-links {
+  display: flex;
+  gap: .5rem;
+  flex-wrap: wrap;
+}
+
+header { gap: .75rem; flex-wrap: wrap; align-items: center; }
+#completion-results > section { margin: 1.5rem 0; }
+#completion-results > section:focus-visible { outline: 2px solid #39816a; outline-offset: .25rem; }
+#completion-results > section > details { margin: .5rem 0; }
+.completion-comparison-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 14rem), 1fr));
+  gap: 1rem;
+  align-items: start;
+}

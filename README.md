@@ -98,6 +98,8 @@ Existing UI receives an immutable visual baseline during discovery. Shared chang
 
 Each implemented UI slice receives a [Visual Integrity Gate](references/visual-integrity.md). Codex chooses critical states and viewports for each changed component, exercises the UI in a browser, and checks rendered evidence against the approved blueprint and protected design decisions. The register preserves before-and-after evidence and distinguishes verified fixes, incomplete repairs and unresolved defects. Open the Visual Review Register in the browser viewer to inspect findings after a slice or at project handoff.
 
+After the final technical audit, open [Application Completion Review](references/final-review.md) for the consolidated dashboard, optional guided walkthrough, and tracked corrections during or after acceptance.
+
 Blueprint verification executes approved tests from the app root. UI verification uses Node.js 22 or later and Chrome or Chromium to capture the running app at `P2P_APP_URL`. Use an independent reviewer to inspect the assertions and captured results. See the [blueprint verification contract](references/blueprint-workflow.md#approval-implementation-and-verification).
 
 ## Repository guide

@@ -5,6 +5,9 @@ let removed = {};
 let state, selected, affected = [], impactChanges = [], scopeSlice = '', etag, serial = 0, diagramId = 0;
 let registerAttempts = [];
 let registerMetadata = {};
+let reviewRequest = 0;
+let completionSignature;
+let selectedCompletionAudit;
 const renderCache = new Map();
 const el = (tag, text) => {
   const node = document.createElement(tag);
@@ -28,6 +31,7 @@ function button(label, action) {
   return b;
 }
 function choose(key, slice = '') {
+  setReviewMode('');
   selected = key;
   scopeSlice = slice;
   $('context').value = 'Component';
@@ -410,7 +414,13 @@ async function update() {
     $('error').textContent = '';
     const renderPosition = scrollY;
     await display();
-    setRegisterMode(!$('visual-register').hidden);
+    if (next.completion_report && (!prev || next.completion_report !== prev.completion_report ||
+        !$('completion-review')?.hidden || !$('visual-register').hidden) && $('completion-review')) {
+      loadVisualRegister().then(() => {
+        if (!prev && location.hash === '#final-review' && registerMetadata.final_review) setReviewMode('completion');
+      }).catch(showError);
+    }
+    updateReviewVisibility();
     if ((!prev || next.revision !== prev.revision) && scrollY === renderPosition) scrollTo(0,position);
     etag = res.headers.get('ETag');
     remember();
@@ -706,7 +716,7 @@ function appendCrossScreenResult(holder, result, findings, retryPolicy) {
     holder.append(evidence);
   }
 }
-function visualBaselineCard(baseline) {
+function visualBaselineCard(baseline, approvalId) {
   const {definition, original, gap, approved, actual} = baseline;
   const card = el('article');
   card.className = 'register-attempt' + (baseline.available ? '' : ' status-unresolved');
@@ -720,7 +730,25 @@ function visualBaselineCard(baseline) {
   if (baseline.evidence_error) card.append(el('p', baseline.evidence_error));
 
   if (original && baseline.available) card.append(baselineCapture('Original UI', original));
+  const captureRows = [...actual].reverse().filter(capture => !approvalId || capture.approval_id === approvalId);
+  if (approvalId) {
+    const grid = el('div');
+    grid.className = 'completion-comparison-grid';
+    const reference = approved[approvalId];
+    const latest = captureRows[0];
+    const {width, height} = definition.renderCase?.viewport || {};
+    const design = reference?.prototype_cases?.find(row => row.reference_file &&
+      row.viewport?.width === width && row.viewport?.height === height &&
+      (!latest || row.case_id === latest.case.case_id || row.case_id === latest.case.based_on));
+    grid.append(registerImage(baseline.available && original?.case.full_screenshot, 'Original UI'));
+    if (design) grid.append(registerImageFromUrl(
+      '/visual-integrity/design/' + encodeURIComponent(approvalId) + '/' + encodeURIComponent(design.case_id), 'Approved design'));
+    else grid.append(el('p', reference ? 'Approved design is recorded in the specifications below.' : 'Approved design reference unavailable.'));
+    grid.append(registerImage(latest?.case.full_screenshot, 'Implemented UI'));
+    card.append(grid);
+  }
   for (const [id, reference] of Object.entries(approved)) {
+    if (approvalId && id !== approvalId) continue;
     const section = el('details');
     section.append(el('summary', `Approved design · ${reference.version || id}`),
       el('pre', JSON.stringify(reference, null, 2)));
@@ -733,7 +761,7 @@ function visualBaselineCard(baseline) {
     }
     card.append(section);
   }
-  for (const capture of [...actual].reverse()) {
+  for (const capture of captureRows) {
     const section = baselineCapture(`Implemented UI · ${capture.slice_id}`, capture);
     if (original && baseline.available) {
       const shots = el('div');
@@ -772,16 +800,19 @@ const qualityLabels = {
   pass: 'Passed',
   fail: 'Failed',
 };
+function openRegisterEvidence(slice = '', key = '', filter = '') {
+  setReviewMode('register');
+  $('register-slice').value = slice;
+  $('register-status').value = filter;
+  $('register-search').value = key;
+  renderVisualRegister();
+  $('register-entries').tabIndex = -1;
+  $('register-entries').focus();
+}
 function qualityEvidenceButton(slice, key, filter = '') {
   const button = el('button', 'View evidence');
   button.type = 'button';
-  button.onclick = () => {
-    $('register-slice').value = slice;
-    $('register-status').value = filter;
-    $('register-search').value = key || '';
-    renderVisualRegister();
-    $('register-search').focus();
-  };
+  button.onclick = () => openRegisterEvidence(slice, key || '', filter);
   return button;
 }
 function renderQualityReport(quality) {
@@ -1006,13 +1037,228 @@ function renderVisualRegister(attempts = registerAttempts) {
     entries.append(card);
   }
 }
+function completionSection(parent, id, title) {
+  const section = el('section');
+  section.id = id;
+  section.tabIndex = -1;
+  section.append(el('h2', title));
+  parent.append(section);
+  return section;
+}
+function renderCompletionReview() {
+  const review = registerMetadata.final_review;
+  const quality = registerMetadata.visual_quality;
+  const holder = $('completion-results');
+  if (!holder) return;
+  $('completion-toggle').hidden = !review;
+  const signature = JSON.stringify([review, selectedCompletionAudit, state?.revision, registerMetadata.visual_baselines, quality?.status,
+    quality?.audit_current, quality?.acceptance_current,
+    quality?.audit?.audit_id, registerMetadata.history_warnings]);
+  if (signature === completionSignature) return;
+  completionSignature = signature;
+  const openSections = new Set([...holder.querySelectorAll('details[open] > summary')].map(node => node.textContent));
+  holder.replaceChildren();
+  if (!review) {
+    holder.append(el('p', registerMetadata.history_warnings?.at(-1) || 'A technical completion report is pending.'));
+    return;
+  }
+  const {corrections, acceptances} = review;
+  const audit = review.prior_reports?.find(row => row.audit_id === selectedCompletionAudit) || review.audit;
+  const slices = audit.review_scope || (audit === review.audit ? review.slices : {});
+  if (review.prior_reports?.length) {
+    const label = el('label', 'Completion report ');
+    const picker = el('select');
+    for (const report of [review.audit, ...review.prior_reports]) {
+      const option = el('option', `${report.recorded_at} · ${report.audit_id}`);
+      option.value = report.audit_id;
+      picker.append(option);
+    }
+    picker.value = audit.audit_id;
+    picker.onchange = () => {
+      selectedCompletionAudit = picker.value;
+      renderCompletionReview();
+      holder.querySelector('select').focus();
+    };
+    label.append(picker);
+    holder.append(label);
+  }
+  const pending = corrections.filter(row => !['verified', 'withdrawn', 'deferred'].includes(row.status));
+  const isCurrent = quality.audit_current && quality.audit?.audit_id === audit.audit_id;
+  const phase = !isCurrent ?
+    (acceptances.some(record => record.audit_id === audit.audit_id) ? 'Historical report · accepted at the time' :
+      'Historical technical report') : quality.acceptance_current ? 'Finally accepted' : pending.length ?
+    'Review feedback pending' : 'Awaiting acceptance';
+  holder.append(el('p', phase), el('p', `${qualityLabels[audit.status]} · ${audit.audit_id}`));
+  const rows = Object.values(audit.slices);
+  const verified = rows.filter(row => ['verified', 'verified_with_warnings'].includes(row.status)).length;
+  const metrics = el('ul'); metrics.className = 'quality-stats';
+  for (const [count, title] of [[`${verified}/${rows.length}`, 'slices verified'], [audit.repairs.length, 'defects repaired'],
+    [audit.warnings.length, 'warnings remaining'], [audit.defects.length, 'blocking defects in this report']]) {
+    const metric = el('li'); metric.append(el('strong', String(count)), el('span', title)); metrics.append(metric);
+  }
+  holder.append(metrics);
+  const links = el('div'); links.className = 'completion-links'; holder.append(links);
+  const add = (id, title) => {
+    const section = completionSection(holder, id, title);
+    links.append(button(title, () => { section.focus(); section.scrollIntoView?.(); }));
+    return section;
+  };
+
+  const delivered = add('completion-delivery', 'Completed screens and features');
+  for (const workstream of audit.plan?.workstreams || []) {
+    const area = el('details');
+    area.append(el('summary', workstream.title));
+    for (const key of workstream.slice_ids) {
+      area.append(button(slices[key]?.title || key, () => {
+        const slice = document.getElementById('completion-slice-' + key);
+        if (slice) { slice.open = true; slice.querySelector('summary').focus(); }
+      }));
+    }
+    delivered.append(area);
+  }
+  const features = new Map();
+  for (const [key, row] of Object.entries(slices)) {
+    for (const feature of row.features) {
+      if (!features.has(feature.feature_id)) features.set(feature.feature_id, {title: feature.title, sliceIds: [], paths: feature.spec_paths});
+      features.get(feature.feature_id).sliceIds.push(key);
+    }
+  }
+  for (const [id, feature] of features) {
+    const area = el('details');
+    area.append(el('summary', feature.title));
+    for (const section of Object.values(state?.sections || {}).filter(item => item.features?.includes(id) ||
+        feature.paths.includes(item.source))) {
+      area.append(button(section.title, () => choose(section.id)));
+    }
+    for (const key of feature.sliceIds) area.append(el('p', slices[key].title));
+    delivered.append(area);
+  }
+  for (const [key, row] of Object.entries(audit.slices)) {
+    const slice = el('details');
+    slice.id = 'completion-slice-' + key;
+    slice.append(el('summary', `${slices[key]?.title || key} · ${qualityLabels[row.status]}`));
+    slice.append(el('p', key));
+    for (const reason of row.reasons) slice.append(el('p', reason));
+    for (const section of Object.values(state?.sections || {}).filter(item => item.slice === key)) {
+      slice.append(button(section.title, () => choose(section.id, key)));
+    }
+    if (row.ui) slice.append(button('Screenshots and regression checks', () => openRegisterEvidence(key)));
+    delivered.append(slice);
+  }
+
+  const comparison = add('completion-comparisons', 'Original → Approved → Implemented');
+  const verifiedCaptures = audit.verified_capture_ids && new Set(audit.verified_capture_ids);
+  const originals = (registerMetadata.visual_baselines || []).map(baseline => ({
+    ...baseline,
+    actual: baseline.actual.filter(capture => capture.approval_id === audit.approval_id &&
+      (verifiedCaptures ? verifiedCaptures.has(capture.case.capture_id) :
+        Date.parse(capture.captured_at) <= Date.parse(audit.recorded_at))),
+  })).filter(baseline => baseline.approved?.[audit.approval_id] || baseline.actual.length);
+  for (const baseline of originals) {
+    const item = el('details');
+    item.append(el('summary', `${baseline.definition.state.route} · ${baseline.definition.baseline_id}`),
+      visualBaselineCard(baseline, audit.approval_id));
+    comparison.append(item);
+  }
+  if (!originals.length) comparison.append(el('p', 'No original UI comparisons were recorded for this report.'));
+
+  for (const [id, title, records] of [
+    ['completion-repairs', 'Automatic visual repairs', audit.repairs],
+    ['completion-warnings', 'Remaining warnings', audit.warnings]
+  ]) {
+    const section = add(id, title);
+    if (!records.length) section.append(el('p', id === 'completion-repairs' ? 'No automatic visual repairs were recorded.' : 'No warnings were recorded.'));
+    for (const row of records) {
+      const finding = el('details');
+      finding.append(el('summary', `${row.description} · ${row.severity}`), el('p', row.slice_id));
+      if (row.comparison_count) {
+        for (let index = 0; index < row.comparison_count; index++) {
+          const path = `/visual-quality/warning/${encodeURIComponent(row.finding_id)}/${index}`;
+          const pair = el('div'); pair.className = 'register-shot-grid register-comparison';
+          pair.append(registerImageFromUrl(path + '/before', 'Before'), registerImageFromUrl(path + '/after', 'After'));
+          finding.append(pair);
+        }
+      } else {
+        finding.append(qualityEvidenceButton(row.slice_id, row.finding_id));
+      }
+      section.append(finding);
+    }
+  }
+
+  const evidence = add('completion-verification', 'Verification evidence');
+  for (const check of audit.checks) {
+    const detail = el('details');
+    detail.append(el('summary', `${qualityLabels[check.result]} · ${check.scenario}`), el('p', check.slice_ids.join(', ')),
+      el('pre', JSON.stringify({expected: check.expected, observed: check.observation}, null, 2)));
+    if (check.diagnostic) detail.append(el('pre', check.diagnostic));
+    evidence.append(detail);
+  }
+  evidence.append(button('Open Visual Review Register', () => openRegisterEvidence()));
+  const feedback = add('completion-feedback', 'Review feedback and corrections');
+  feedback.append(el('p', 'Tell Codex which screen or interaction needs a correction. You can also ask for a guided review of any feature, a group of slices, or the whole application.'));
+  for (const finding of corrections) {
+    const original = finding.history[0];
+    const detail = el('details');
+    detail.append(el('summary', `${original.user_feedback} · ${finding.status.replaceAll('_', ' ')}`),
+      el('p', `${finding.finding_id} · ${Object.keys(original.scope).join(', ')} · ${original.audit_id}`));
+    for (const [key, row] of Object.entries(original.scope)) {
+      for (const section of Object.values(state?.sections || {}).filter(item =>
+        item.slice === key || row.features.some(feature => feature.spec_paths.includes(item.source)))) {
+        detail.append(button(section.title, () => choose(section.id, section.slice || '')));
+      }
+      if (row.protected_decision_ids.length) detail.append(el('p', 'Protected decisions · ' + row.protected_decision_ids.join(', ')));
+    }
+    for (const event of finding.history.slice(1)) {
+      detail.append(el('p', `${event.status.replaceAll('_', ' ')} · ${event.recorded_at}`));
+      for (const text of [event.rationale, event.summary, event.user_response]) {
+        if (text) detail.append(el('p', text));
+      }
+      for (const comparison of event.comparisons || []) {
+        const pair = el('div'); pair.className = 'register-shot-grid register-comparison';
+        const rect = comparison.difference?.normalized_rect;
+        pair.append(registerImage(comparison.before.closeup_screenshot, 'Before correction', rect),
+          registerImage(comparison.after.closeup_screenshot, 'After correction', rect));
+        detail.append(el('p', `${comparison.slice_id} · ${comparison.after.case_id}`), pair);
+        if (comparison.difference?.annotated_latest) detail.append(annotatedEvidenceLinks(comparison.difference));
+        if (comparison.comparison_note) detail.append(el('p', comparison.comparison_note));
+      }
+      if (event.verification) {
+        const checks = el('details');
+        checks.append(el('summary', 'Saved revalidation results'),
+          el('pre', JSON.stringify({verification: event.verification, evidence: event.archived_evidence}, null, 2)));
+        detail.append(checks);
+      }
+    }
+    feedback.append(detail);
+  }
+  const acceptance = add('completion-acceptance', 'Final acceptance history');
+  const identity = el('details');
+  identity.append(el('summary', 'Report identity'), el('p', audit.audit_id), el('p', audit.approval_id));
+  if (isCurrent) identity.append(el('code', quality.audit_sha256));
+  acceptance.append(identity);
+  for (const record of acceptances) {
+    const detail = el('details');
+    detail.append(el('summary', `${record.accepted_at} · ${record.audit_id}`), el('p', record.user_response));
+    if (record.audit_sha256) detail.append(el('code', record.audit_sha256));
+    acceptance.append(detail);
+  }
+  if (isCurrent && !quality.acceptance_current && !pending.length) {
+    acceptance.append(el('p', 'Give Codex your explicit acceptance when you are ready.'));
+  }
+  for (const summary of holder.querySelectorAll('details > summary')) {
+    if (openSections.has(summary.textContent)) summary.parentElement.open = true;
+  }
+}
 async function loadVisualRegister() {
+  const ticket = ++reviewRequest;
   const response = await read('/visual-integrity');
   const result = await response.json();
+  if (ticket !== reviewRequest) return;
   registerAttempts = Array.isArray(result) ? result : result.attempts || [];
   registerMetadata = {...result.project, cross_screen_changes: result.cross_screen_changes || [],
     visual_baselines: result.visual_baselines || []};
-  renderVisualRegister();
+  renderCompletionReview();
+  if (!$('visual-register').hidden) renderVisualRegister();
 }
 function mergeState(previous, delta) {
   const next = {...previous,...delta.fields};
@@ -1026,22 +1272,35 @@ function mergeState(previous, delta) {
   return next;
 }
 $('register-toggle').onclick = () => {
-  const panel = $('visual-register');
-  panel.hidden = !panel.hidden;
-  $('register-toggle').setAttribute('aria-expanded', String(!panel.hidden));
-  setRegisterMode(!panel.hidden);
-  if (!panel.hidden) loadVisualRegister().catch(showError);
+  const show = $('visual-register').hidden;
+  setReviewMode(show ? 'register' : '');
+  if (show) loadVisualRegister().catch(showError);
 };
-function setRegisterMode(show) {
-  const panel = $('visual-register');
-  panel.hidden = !show;
-  $('title').hidden = !panel.hidden;
-  $('impact').hidden = !panel.hidden;
-  $('why').hidden = !panel.hidden;
-  $('tools').hidden = !panel.hidden;
-  $('cards').hidden = !panel.hidden;
-  const outline = $('outline');
-  if (outline) outline.hidden = !panel.hidden;
+if ($('completion-toggle')) {
+  $('completion-toggle').onclick = () => {
+    const show = $('completion-review').hidden;
+    setReviewMode(show ? 'completion' : '');
+    if (show) {
+      $('completion-title').focus();
+      loadVisualRegister().catch(showError);
+    }
+  };
+  $('completion-refresh').onclick = () => loadVisualRegister().catch(showError);
+}
+function setReviewMode(mode) {
+  $('visual-register').hidden = mode !== 'register';
+  $('register-toggle').setAttribute('aria-expanded', String(mode === 'register'));
+  if ($('completion-review')) {
+    $('completion-review').hidden = mode !== 'completion';
+    $('completion-toggle').setAttribute('aria-expanded', String(mode === 'completion'));
+  }
+  updateReviewVisibility();
+}
+function updateReviewVisibility() {
+  const hide = !$('visual-register').hidden || ($('completion-review') && !$('completion-review').hidden);
+  for (const id of ['title', 'impact', 'why', 'tools', 'cards', 'outline']) {
+    if ($(id)) $(id).hidden = Boolean(hide);
+  }
 }
 $('register-slice').onchange = () => renderVisualRegister();
 $('register-status').onchange = () => renderVisualRegister();

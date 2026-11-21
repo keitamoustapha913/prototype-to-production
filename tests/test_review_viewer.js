@@ -321,3 +321,62 @@ test('project quality displays documented warnings, check results and historical
     panel.remove();
   }
 });
+
+test('completion dashboard keeps explicit acceptance, warnings and focused correction comparisons visible', () => {
+  const fixture = dom.window.document.createElement('div');
+  fixture.innerHTML = '<button id="completion-toggle"></button><section id="completion-review" hidden>' +
+    '<div id="completion-results"></div></section>';
+  dom.window.document.body.append(fixture);
+  try {
+    const audit = {
+      audit_id: 'audit-current', approval_id: 'approval-a', status: 'technically_complete_with_warnings',
+      recorded_at: '2026-01-01T12:00:00+00:00',
+      verified_capture_ids: ['render-verified'],
+      slices: {'slice-a': {status: 'verified_with_warnings', reasons: [], ui: true}},
+      checks: [{result: 'pass', scenario: 'Keyboard journey', slice_ids: ['slice-a']}],
+      repairs: [], warnings: [{description: 'Decorative gap', severity: 'minor', slice_id: 'slice-a'}],
+      defects: [],
+    };
+    context.dashboardData = {
+      visual_quality: {audit, audit_current: true, status: audit.status, audit_sha256: 'report-digest'},
+      visual_baselines: [{
+        definition: {baseline_id: 'invoice', state: {route: '/invoice'}, renderCase: {},
+          baseline_feature_ids: [], source_paths: []},
+        slice_ids: ['slice-a'], available: false, gap: {reason: 'No historical fixture'},
+        approved: {'approval-a': {}}, actual: [
+          {approval_id: 'approval-a', captured_at: '2026-01-01T11:00:00+00:00', slice_id: 'slice-a',
+            case: {capture_id: 'render-verified', full_screenshot: 'verified.png'}},
+          {approval_id: 'approval-a', captured_at: '2026-01-01T11:30:00+00:00', slice_id: 'slice-a',
+            case: {capture_id: 'render-uninspected', full_screenshot: 'uninspected.png'}},
+        ],
+      }],
+      final_review: {audit, slices: {'slice-a': {title: 'Invoice list', features: []}},
+        prior_reports: [{...audit, audit_id: 'audit-prior'}],
+        acceptances: [{audit_id: 'audit-prior', accepted_at: 'Earlier', user_response: 'I accept this report.'}],
+        corrections: [{finding_id: 'review-a', status: 'verified', history: [
+          {audit_id: 'audit-prior', user_feedback: 'Align card actions', scope: {'slice-a': {features: [], protected_decision_ids: []}}},
+          {status: 'verified', summary: 'Alignment confirmed', comparisons: [{slice_id: 'slice-a',
+            before: {closeup_screenshot: 'before.png'}, after: {closeup_screenshot: 'after.png', case_id: 'invoice-open'}}]},
+        ]}],
+      },
+    };
+    vm.runInContext('registerMetadata = dashboardData; renderCompletionReview();', context);
+    const results = fixture.querySelector('#completion-results');
+    assert.match(results.textContent, /Awaiting acceptance/);
+    assert.match(results.textContent, /1\/1slices verified/);
+    assert.match(results.textContent, /Invoice list/);
+    assert.match(results.textContent, /Decorative gap/);
+    assert.match(results.textContent, /Keyboard journey/);
+    assert.match(results.textContent, /guided review/);
+    assert.ok(results.querySelector('#completion-comparisons img[src$="/verified.png"]'));
+    assert.equal(results.querySelector('#completion-comparisons img[src$="/uninspected.png"]'), null);
+    assert.equal(results.querySelectorAll('#completion-feedback img').length, 2);
+    assert.match(results.textContent, /I accept this report\./);
+    const picker = results.querySelector('select');
+    picker.value = 'audit-prior';
+    picker.onchange();
+    assert.match(results.textContent, /Historical report · accepted at the time/);
+  } finally {
+    fixture.remove();
+  }
+});

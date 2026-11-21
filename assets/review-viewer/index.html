@@ -14,12 +14,20 @@
   <header>
     <strong>Blueprint review</strong>
     <span id="revision"></span>
-    <button id="register-toggle" type="button" aria-expanded="false">Visual Review Register</button>
+    <div class="review-header-actions">
+      <button id="completion-toggle" type="button" aria-controls="completion-review" aria-expanded="false" hidden>Application Completion Review</button>
+      <button id="register-toggle" type="button" aria-expanded="false">Visual Review Register</button>
+    </div>
   </header>
   <div id="layout">
     <nav aria-label="Review sections"></nav>
     <main>
       <p id="error" role="alert"></p>
+      <section id="completion-review" aria-labelledby="completion-title" hidden>
+        <h1 id="completion-title" tabindex="-1">Application Completion Review</h1>
+        <div id="completion-results"></div>
+        <button id="completion-refresh" type="button">Refresh completion review</button>
+      </section>
       <section id="visual-register" aria-labelledby="register-title" hidden>
         <h1 id="register-title">Visual Review Register</h1>
         <p id="register-counts" aria-live="polite"></p>

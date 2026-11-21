@@ -1,5 +1,8 @@
 {
   "approval_id": "<active approval ID>",
+  "workstreams": [
+    { "title": "Invoice workflow", "slice_ids": ["invoice-editor", "invoice-list"] }
+  ],
   "checks": [
     {
       "check_id": "invoice-integration",

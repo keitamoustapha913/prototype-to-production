@@ -667,6 +667,7 @@ class History:
         state = dict(slice_status=statuses, revision=rev, sections=sections, removals=removals,
                     approved=approved, current=current, approved_by_scope=approved_by_scope,
                     current_by_scope=current_by_scope, root=str(docs.root),
+                    completion_report=manifest.get("visual_quality", {}).get("audit"),
                     visual_review=groups, consent_hashes={k: digest(encode(v)) for k, v in groups.items() if v})
         for cache in (docs.cache, docs.parsed_json):
             for path in cache.keys() - docs.observed.keys():
@@ -831,6 +832,12 @@ def serve(root, port):
                             except quality_module.EVIDENCE_ERRORS as exc:
                                 quality = None
                                 warnings.append(f"Visual Quality Report unavailable: {exc}")
+                            completion = None
+                            if quality:
+                                try:
+                                    completion = project_state.sibling_module("final_review").dashboard(root, manifest, quality)
+                                except quality_module.EVIDENCE_ERRORS as exc:
+                                    warnings.append(f"Application Completion Review unavailable: {exc}")
                         dispatchable = set()
                         next_action = manifest.get('next_action')
                         shared_blockers = {}
@@ -855,7 +862,7 @@ def serve(root, port):
                         data, kind = encode({'attempts': records, 'cross_screen_changes': cross_screen_changes,
                                              'visual_baselines': baselines, 'project': {
                             'next_action': next_action, 'stage': manifest.get('stage'), 'slices': slices,
-                            'history_warnings': warnings, 'visual_quality': quality,
+                            'history_warnings': warnings, 'visual_quality': quality, 'final_review': completion,
                         }}), 'application/json'
                     elif match := re.fullmatch(r'/visual-quality/warning/([a-z][a-z0-9-]{2,60})/(\d+)/(before|after)', route):
                         try:
