@@ -1,6 +1,6 @@
 # Natural replies and authorization
 
-Use this process for blueprint initiatives with `confirmation_protocol_version: 1`. Earlier initiatives keep their recorded confirmation contracts. Ask one question for one action. In the same visible Codex reply, identify the initiative and the exact version, revision or digest under discussion. Put the question on the final line. Use a separate exchange for each consequential action.
+Use this process for blueprint initiatives with `confirmation_protocol_version: 1`. Earlier initiatives keep their recorded confirmation contracts. Ask one question for one action. In the same visible Codex reply, show the exact initiative ID from the coordinator and the exact version, revision or digest under discussion. Put the question on the final line. If you repeat that question after an acknowledgment or clarification, repeat its exact scope in that reply too. Use a separate exchange for each consequential action.
 
 | Action | Example question | Example reply |
 | --- | --- | --- |

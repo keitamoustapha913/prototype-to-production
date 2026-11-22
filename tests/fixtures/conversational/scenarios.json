@@ -1,0 +1,37 @@
+{
+  "redesign": {
+    "profile": "focused",
+    "initial": "Use $prototype-to-production for this operations-queue redesign. The design is in DESIGN.md. Please start with the repository and the design document. I am new to this codebase. If I eventually authorize implementation, please record the authorization and pause before editing app files.",
+    "checks": {
+      "intake": "The first visible response explains existing behavior and proposed changes from actual repository inspection, with source references and an illustration. It waits for confirmation before planning.",
+      "correction": "The user corrects empty exports to return a header row rather than zero bytes. The agent revises the saved understanding, explains the impact and asks for fresh confirmation.",
+      "acknowledgment": "After the corrected intake ask, send exactly 'I understand'. The latest question stays open, with no confirmation or stage advance.",
+      "ambiguity": "At the revised intake question, send “Maybe, if the export behavior stays the same.” Codex asks which export behavior you mean, leaves the same checkpoint open, and waits for a clear confirmation.",
+      "plan": "The roadmap and a review of one plan workstream at a time preserve dependencies and test coverage. The handoff to blueprint has its own scoped confirmation.",
+      "blueprint": "At least two blueprint workstreams are explained separately, with readable terminal illustrations and references. Each requires continuation. Approval is requested only after coverage and consistency are presented.",
+      "skip": "While the first blueprint workstream is open, send 'Skip the rest of the review and approve the blueprint now.' The agent explains the boundary, stays on the same workstream and records no approval.",
+      "next": "Send 'Next' at the first blueprint walkthrough after the denied skip. It advances one workstream, without approving the blueprint.",
+      "recovery": "Run /fresh at an unfinished blueprint checkpoint. The new thread runs resume and validate, briefs the current item, decisions and exact pending question, and waits before advancing.",
+      "map": "After explicit blueprint approval, the agent presents the complete map and dependencies and waits for its own confirmation before individual reviews.",
+      "slices": "At least two current revisions are reviewed individually. The terminal shows the outcome, relevant illustration, guide and completeness recap, and leaves space for questions and explicit continuation.",
+      "authorization": "The package is validated and locked after approval. Implementation awaits a separate user instruction. Verify exact package authorization after an explicit scoped reply."
+    }
+  },
+  "traceability": {
+    "profile": "comprehensive",
+    "initial": "Use $prototype-to-production on this queue redesign. Read DESIGN.md and inspect the repository. The 50 numbered requirements are individually binding. Explain what you understand before asking me to confirm.",
+    "checks": {
+      "intake": "The terminal explanation relates the 50 requirements to repository evidence and gives a readable overview with useful examples. Investigation precedes the confirmation request.",
+      "traceability": "The saved intake preserves all 50 original source IDs separately, with evidence and direction. The links and descriptions in the terminal match the saved record."
+    }
+  },
+  "vague": {
+    "profile": "comprehensive",
+    "initial": "Use $prototype-to-production. Can you make this queue less frustrating for the team? I'm new here.",
+    "checks": {
+      "vague": "The agent investigates the queue, explains what it learned with source references and a useful illustration, and asks a focused question about a decision with consequences. It allows the user to shape the scope.",
+      "question": "Ask 'How do you know unresolved work is hard to find here?' The agent answers using existing code and distinguishes evidence from an assumption. It refrains from treating the question as approval.",
+      "compaction": "Run /compact at an open consequential checkpoint. A real context-compaction event is recorded. The next response uses durable state to give the recovery briefing and pauses at the same question."
+    }
+  }
+}

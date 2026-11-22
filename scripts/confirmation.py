@@ -111,7 +111,7 @@ def current_exchange(state):
             payload = record.get('payload', {})
             if record.get('type') != 'response_item' or payload.get('type') != 'message':
                 continue
-            if payload.get('role') == 'assistant' and payload.get('phase') in {'commentary', 'final'}:
+            if payload.get('role') == 'assistant' and payload.get('phase') in {'commentary', 'final', 'final_answer'}:
                 text = visible_text(payload, 'output_text')
                 if text:
                     prompt = (payload.get('id'), record.get('timestamp'), text)

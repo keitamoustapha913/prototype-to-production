@@ -20,9 +20,9 @@ class ConfirmationSession:
         with self.path.open('a') as stream:
             stream.write(json.dumps(event) + '\n')
 
-    def prompt(self, text):
+    def prompt(self, text, *, phase="final"):
         self.append('response_item', {'id': str(uuid4()), 'type': 'message', 'role': 'assistant',
-                                      'phase': 'final', 'content': [{'type': 'output_text', 'text': text}]})
+                                      'phase': phase, 'content': [{'type': 'output_text', 'text': text}]})
 
     def reply(self, text, *, provenance='user'):
         self.append('response_item', {

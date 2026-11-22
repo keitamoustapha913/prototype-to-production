@@ -95,6 +95,22 @@ class InitialAlignmentTests(unittest.TestCase):
         self.assertEqual(recovery["next_permitted_action"], "wait_for_user")
         self.assertFalse(packet["safe_to_continue"])
 
+    def test_intake_correction_binds_to_the_codex_cli_final_answer(self):
+        self.initialize("blueprint", legacy=False)
+        with tempfile.TemporaryDirectory() as store:
+            session = ConfirmationSession(self.root, store, self.env)
+            first = self.presentation()
+            first["question"] = "Is my understanding correct?"
+            self.exchange(first)
+            session.prompt("I will inspect the repository.", phase="commentary")
+            session.prompt("Initiative intake / Initial understanding intake-v1\nIs my understanding correct?",
+                           phase="final_answer")
+            session.reply("The list also needs a filter.")
+            self.reply(first, "revise", "The list also needs a filter.")
+        receipt = json.loads((self.directory / "conversation/intake-v1-revise.json").read_text())
+        self.assertEqual(receipt["confirmation_origin"]["scope"], ["intake", "intake-v1"])
+        self.assertEqual(receipt["response"], "The list also needs a filter.")
+
     def test_blueprint_requires_confirmation_and_carries_the_current_map_into_the_plan(self):
         self.initialize("blueprint")
         audit = {"audit_id": "audit-v1", "scope": "feature", "surface": "backend",

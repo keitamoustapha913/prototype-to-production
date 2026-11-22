@@ -133,7 +133,15 @@ python3 -m unittest discover -s tests
 node --test tests/review_viewer.test.js tests/test_review_viewer.js
 ```
 
-### Live workflow checks
+### Mandatory conversational acceptance
+
+Before marking a skill update eligible for installation, run the release gate.
+It requires real, independently reviewed Codex conversations against the
+candidate and passing Python and viewer tests. Use focused coverage for routine
+updates and comprehensive coverage for workflow behavior changes. See
+[Conversational acceptance for skill releases](references/conversational-acceptance.md).
+
+### Previous live workflow checks
 
 The November 2026 review ran Codex CLI 0.170.0 in temporary workspaces with synthetic apps and project-local copies of the skill.
 
