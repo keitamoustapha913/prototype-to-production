@@ -22,6 +22,31 @@ def request_fields(value):
             if key not in {'approved_by_user', 'user_approval_note', 'approval_exchange_id'}}
 
 
+def approval_candidate(state, exchange_id):
+    state.require(required(state.manifest), 'This initiative does not use recorded blueprint approval')
+    answer = state.load('conversation', exchange_id)
+    state.require(answer.get('record_type') == 'review_checkpoint'
+                  and answer.get('review_step') == 'blueprint_approval'
+                  and answer.get('status') == 'decided' and answer.get('review_action') == 'confirm',
+                  'Supply the decided blueprint approval reply exchange ID')
+    request = state.load('conversation', answer['responds_to'])
+    return {**request['approval_presentation'], 'approved_by_user': True,
+            'user_approval_note': answer['response'], 'approval_exchange_id': exchange_id}
+
+
+def resume_approval_wait(state, exchange_id):
+    work = state.manifest.get('work_items', {}).get(state.manifest.get('active_work_id'))
+    if not work or work['status'] != 'waiting_user' or not work.get('pending_question_id'):
+        return
+    answer, context = state.question_context(work['pending_question_id'], state.conversations())
+    if (answer and answer['exchange_id'] == exchange_id
+            and answer.get('review_step') == 'blueprint_approval' and answer.get('review_action') == 'confirm'):
+        errors = state.check_question_sources(state.directory.parents[2], [context])
+        state.require(not errors, 'Reconcile the saved question source before advancing: ' + '; '.join(errors))
+        work['status'] = 'in_progress'
+        work.pop('pending_question_id')
+
+
 def records_for(records, step, version):
     return [record for record in records if record.get('record_type') == 'review_checkpoint'
             and record.get('review_step') == step and record.get('review_version') == version]
@@ -152,7 +177,9 @@ def approval_exchange_hashes(state, value, presentation_hashes, *, current):
     if current:
         state.require(request == latest_request(state.conversations(), version),
                       'Use the reply to the latest recorded blueprint approval request')
-        state.require(request['approval_presentation'] == request_fields(value),
+        # Workstream receipt IDs are recomputed from frozen reviews by the coordinator.
+        state.require({key: item for key, item in request['approval_presentation'].items()
+                       if key != 'workstream_review_ids'} == request_fields(value),
                       'Approval must match the exact recorded approval request')
     return state.review_exchange_hashes([answer])
 

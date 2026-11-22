@@ -145,11 +145,15 @@ def bind(state, question, response, scope, action, *, not_before=None, single_qu
                          not_before=not_before, single_question=single_question)
 
 
+def prompt_lines(text):
+    return '\n'.join(line.rstrip(' \t') for line in text.strip().splitlines())
+
+
 def bind_exchange(state, exchange, question, response, scope, action, *, not_before=None, single_question=False):
     thread, (prompt_id, shown_at, shown), (user_id, replied_at, reply) = exchange
     state.require(reply.strip() == response.strip(),
                   'The recorded reply must match the latest user exchange in the Codex session')
-    state.require(shown.rstrip().endswith(question.strip()),
+    state.require(prompt_lines(shown).endswith(prompt_lines(question)),
                   'The saved prompt must match the latest user exchange. '
                   'Put the exact saved question in plain text on the final line.')
     values = [state.manifest['initiative_id'], *scope]

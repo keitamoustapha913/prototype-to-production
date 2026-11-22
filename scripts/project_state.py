@@ -1588,17 +1588,29 @@ def work_update(directory: Path, project_root: Path, work_file: str) -> None:
     print(f"Work cursor {task_id}: {value['status']} (revision {recorded['revision']})")
 
 
-def approve(directory: Path, approval_file: str) -> None:
-    candidate = read_json(Path(approval_file))
+def approve(directory: Path, approval_file: str | None, *, approval_exchange: str | None = None) -> None:
+    candidate = read_json(Path(approval_file)) if approval_file else None
     request = {"command": "approve", "input": candidate}
+    if approval_exchange is not None:
+        request = {"command": "approve", "approval_exchange": approval_exchange}
     with coordinator_lock(directory):
         if recover_workflow_transition(directory, request):
             return
         manifest = manifest_at(directory)
+        mode = initiative_mode(manifest)
+        if approval_exchange is not None and mode != "blueprint":
+            raise StateError("Approval by exchange requires blueprint mode")
+        if mode == "blueprint":
+            controller = sibling_module("conversation_controller")
+            state = blueprint_state(directory, manifest)
+            if approval_exchange is not None:
+                candidate = controller.approval_candidate(state, approval_exchange)
+            if controller.required(manifest) and candidate.get("approval_exchange_id"):
+                # Persist the cursor change only with the validated approval.
+                controller.resume_approval_wait(state, candidate["approval_exchange_id"])
         approval, errors = validate_approval_record(directory, candidate, manifest)
         if errors:
             raise StateError("Approval invalid: " + "; ".join(errors))
-        mode = initiative_mode(manifest)
         previous = manifest.get("active_approval_id")
         retired = []
         if mode == "blueprint":
@@ -3436,8 +3448,12 @@ def main(argv: list[str] | None = None) -> int:
             sub.add_argument("--report-file", required=True)
         if name == "prototype-coverage":
             sub.add_argument("--coverage-file", required=True)
-        if name in {"blueprint-approval-preview", "approve"}:
+        if name == "blueprint-approval-preview":
             sub.add_argument("--approval-file", required=True)
+        if name == "approve":
+            approval = sub.add_mutually_exclusive_group(required=True)
+            approval.add_argument("--approval-file")
+            approval.add_argument("--approval-exchange", help="Decided blueprint approval reply exchange ID")
         if name == "revoke-approval":
             sub.add_argument("--reason", required=True)
         if name == "slice-create":
@@ -3635,7 +3651,7 @@ def main(argv: list[str] | None = None) -> int:
                                      f"Missing or invalid evidence: {error}\nNext: {next_action}") from error
             print(json.dumps(result, indent=2, ensure_ascii=False))
         elif args.command == "approve":
-            approve(directory, args.approval_file)
+            approve(directory, args.approval_file, approval_exchange=args.approval_exchange)
         elif args.command == "revoke-approval":
             revoke_approval(directory, args.reason)
         elif args.command == "slice-create":

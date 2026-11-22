@@ -79,7 +79,7 @@ pending.
 
 ## Record the decision
 
-For intake, plan and blueprint reviews, record the open checkpoint before the user replies. Then link the exact reply to that checkpoint with `responds_to`. For slice consent use the existing `slice_consent` exchange and its exact target and quote. For `visual-quality --action accept`, include the exact displayed `question`, `presentation_path`, audit ID, digest and user response.
+For intake, plan and blueprint reviews, record the open checkpoint before the user replies. Then link the exact reply to that checkpoint with `responds_to`. For blueprint approval, run `approve --approval-exchange <decided-exchange-id>` in that same turn. For slice consent use the existing `slice_consent` exchange and its exact target and quote. For `visual-quality --action accept`, include the exact displayed `question`, `presentation_path`, audit ID, digest and user response.
 
 The coordinator looks up the current thread in the local Codex session store. It verifies the preceding visible question, the exact displayed scope and the latest text reply with user provenance. It rejects a mismatched quote, an already-used reply, and ambiguity about the permitted action. The receipt stores the event IDs, timestamps, scoped action and hashes. The coordinator reads the current session log without copying the transcript into the initiative. An unavailable session or missing user provenance leaves the checkpoint waiting. Use a supported Codex session and ask the user about the same scope again if the original exchange cannot be verified.
 

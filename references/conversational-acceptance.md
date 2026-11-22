@@ -62,7 +62,10 @@ was skipped or when following the script would grant approval out of context.
    as a separate decision.
 6. Continue through the remaining blueprint review. Approve the blueprint only
    when the agent presents coverage, consistency and the exact approval scope.
-7. Confirm the complete slice map after its walkthrough. Ask a question about
+   Send `I approve this blueprint.` once and verify the matching approval in
+   the next snapshot.
+7. After the walkthrough, send `I confirm this slice map.` once and verify
+   consent for the exact map in the next snapshot. Ask a question about
    the dependency or verification of one slice. Review and approve each exact
    revision, responding separately to continuation questions.
 8. Approve locking the reviewed package. Verify the next response waits on

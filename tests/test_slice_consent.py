@@ -29,7 +29,12 @@ class SliceConsentTests(unittest.TestCase):
         self.assertEqual(preview['display'].splitlines()[-1], 'Do you confirm this slice map?')
         for value in target.values():
             self.assertIn(value, preview['question'])
-        session.prompt(preview['display'])
+        # A renderer may add Markdown hard breaks to the displayed scope.
+        display = '  \n'.join(preview['display'].splitlines()[:-1]) + '\n' + preview['display'].splitlines()[-1]
+        session.prompt(display.replace(target['map_sha256'], '0' * 64))
+        session.reply('I confirm this slice map.')
+        self.assertEqual(json.loads(fixture.cli(*args, '--check-reply').stdout)['status'], 'reissue_required')
+        session.prompt(display)
         session.reply('I confirm this slice map.')
         reply = json.loads(fixture.cli(*args, '--check-reply').stdout)
         self.assertEqual(reply['status'], 'confirmation_ready')

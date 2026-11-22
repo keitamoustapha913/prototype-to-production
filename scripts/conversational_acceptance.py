@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 
 from acceptance_codex import Codex
+from confirmation import accepts, blueprint_replies
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -390,7 +391,19 @@ def checkpoints(turns, baseline, scenario, compacted):
             "Next": "next",
         }
         probes = set()
-        for turn, before, after in zip(turns[1:], states, states[1:]):
+        for previous, turn, before, after in zip(turns, turns[1:], states, states[1:]):
+            previous_prompt = previous['messages'][-1]
+            approval = open_step(before, "blueprint_approval")
+            if approval and accepts("blueprint_approval", turn["user"], previous_prompt,
+                                    explicit=blueprint_replies(approval["review_version"])):
+                if not after.get("approval_id") or after.get("approved_version") != approval["review_version"]:
+                    issues.append("The scoped blueprint approval did not apply on the first reply")
+            slice_map = lookup(before, "slice_review", "slice_map")
+            if (slice_map and not slice_map.get("consent_id")
+                    and accepts("confirm_map", turn["user"], previous_prompt)):
+                confirmed = lookup(after, "slice_review", "slice_map") or {}
+                if not confirmed.get("consent_id") or confirmed.get("target") != slice_map.get("target"):
+                    issues.append("The scoped slice-map confirmation did not apply on the first reply")
             probe = exact_probes.get(turn["user"])
             initial = open_step(before, "initial_alignment")
             revised = open_step(after, "initial_alignment")

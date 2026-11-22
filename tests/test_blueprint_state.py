@@ -5025,14 +5025,27 @@ print(json.dumps(output))
         record(advance | {'exchange_id': 'workstream-revisit-reply', 'responds_to': reopened['exchange_id'],
                           'response': 'Continue'})
         record(reopened | {'exchange_id': 'unrequested-second-revisit'}, ok=False)
+        # Reusing the approval JSON may include the coordinator's derived review IDs.
+        draft['workstream_review_ids'] = ['workstream-revisit-reply', 'resumed-workstream-continue']
         prompt = prompt | {'exchange_id': 'approval-prompt-after-revisit'}
         record(prompt)
+        waiting = {'task_id': 'review-blueprint', 'phase': 'blueprint', 'status': 'waiting_user',
+                   'pending_question_id': prompt['exchange_id'], 'summary': 'Approval question shown',
+                   'next_action': 'Wait for blueprint approval', 'completed_steps': [],
+                   'pending_steps': ['Lock the approved blueprint'], 'blockers': [],
+                   'code_paths': [], 'artifact_paths': []}
+        self.cli('work-update', '--work-file', self.payload('waiting-for-approval', waiting))
+        self.cli('approve', '--approval-exchange', prompt['exchange_id'], ok=False)
+        self.assertEqual(self.manifest()['stage'], 'blueprint')
         answer = answer | {'exchange_id': 'approval-reply-after-revisit', 'responds_to': prompt['exchange_id']}
         record(answer | {'response': 'Approve blueprint spec-v1'})
         final = approval | {'approval_exchange_id': answer['exchange_id'], 'user_approval_note': 'Approve blueprint spec-v1'}
         self.assertIn('recorded approval request', self.cli('approve', '--approval-file',
                       self.payload('approval', final | {'exceptions': ['An unreviewed exception']}), ok=False).stderr)
-        self.cli('approve', '--approval-file', self.payload('approval', final))
+        self.cli('approve', '--approval-exchange', answer['exchange_id'])
+        work = self.manifest()['work_items'][waiting['task_id']]
+        self.assertEqual((work['status'], work['phase']), ('in_progress', 'approved'))
+        self.assertNotIn('pending_question_id', work)
         saved = self.manifest()['approvals'][approval['decision_id']]
         self.assertIn('conversation/approval-prompt-after-revisit.json', saved['artifact_hashes'])
         self.assertIn('conversation/approval-reply-after-revisit.json', saved['artifact_hashes'])

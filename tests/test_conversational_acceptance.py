@@ -180,6 +180,32 @@ class ConversationalAcceptanceTests(unittest.TestCase):
                                  {"git_head": "fixture"}, "redesign", set())
             self.assertFalse(any("ambiguous" in issue for issue in issues))
 
+    def test_redesign_requires_first_scoped_blueprint_and_map_replies_to_apply(self):
+        blueprint = {'exchange_id': 'approval', 'review_step': 'blueprint_approval',
+                     'review_version': 'spec-v1', 'question': 'Do you approve this blueprint?'}
+        map_target = {'map_id': 'slice-map-v1', 'map_path': 'maps/v1.md', 'map_sha256': 'a' * 64}
+        for pending, question, reply, applied, issue in (
+                ({'pending_questions': [blueprint]}, 'Do you approve this blueprint?',
+                 'I approve this blueprint.', {'approval_id': 'approve-spec-v1', 'approved_version': 'spec-v1'},
+                 'blueprint approval did not apply'),
+                ({'slice_review': {'slice_map': {'target': map_target}}},
+                 'Do you confirm this slice map?', 'I confirm this slice map.',
+                 {'slice_review': {'slice_map': {'target': map_target, 'consent_id': 'map-consent'}}},
+                 'slice-map confirmation did not apply')):
+            with self.subTest(issue=issue):
+                def turn(user, message, state):
+                    return {'user': user, 'messages': [message], 'recovery': None,
+                            'after': {'state': state, 'git_head': 'fixture', 'git_status': ''}}
+
+                prompt = turn('Please present the review.', question, pending)
+                repeated = turn(reply, question, pending)
+                advanced = turn(reply, 'Recorded.', applied)
+                baseline = {'git_head': 'fixture'}
+                self.assertTrue(any(issue in item for item in
+                                    checkpoints([prompt, repeated, advanced], baseline, 'redesign', set())))
+                self.assertFalse(any(issue in item for item in
+                                     checkpoints([prompt, advanced], baseline, 'redesign', set())))
+
     def test_baseline_requires_untampered_evidence_for_its_commit(self):
         commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
         candidate = fingerprint(commit)
