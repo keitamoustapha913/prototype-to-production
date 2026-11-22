@@ -2102,7 +2102,8 @@ class BlueprintState:
         for feature in selected:
             self.check_test_sources(feature, test_ownership)
         prerequisites = {required for f in selected for required in f.get('prerequisite_feature_ids', [])}
-        self.require(prerequisites <= supplied, 'A slice must depend on slices covering all approved prerequisite features')
+        self.require(prerequisites <= supplied.union(ids),
+                     'A slice must include approved prerequisite features or depend on slices covering them')
         if not allow_partial_checks:
             self.require(self.strings(candidate.get('functional_tests')) and set(candidate['functional_tests']) == checks,
                          'Genuine test plan must cover every selected acceptance ID')

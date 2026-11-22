@@ -22,6 +22,61 @@ Show the required scope alongside the question. For workstreams, include the nam
 
 An acknowledgment keeps the checkpoint open. If a reply is conditional, mixes approval with a correction, or could mean more than one thing, ask one focused clarification and wait. If the user requests a change, record their actual reply and apply the existing correction or amendment workflow. Present changed material for a fresh decision. A plan handoff opens blueprint drafting. Blueprint approval opens slice planning. Package approval permits locking. Only a separate implementation instruction for the locked package permits coding.
 
+## Preview saved review questions and replies
+
+Use `confirmation-preview` for open intake, discovery, roadmap, workstream,
+plan handoff, and blueprint approval checkpoints. Save the open checkpoint
+with a supported question from the table, then run the command before
+presenting it. Add `--checkpoint <exchange-id>` when more than one review
+question is open.
+
+```bash
+python3 <skill-root>/scripts/project_state.py confirmation-preview \
+  --project-root <repo> --initiative-id <id>
+```
+
+Put your explanation first. Copy the returned `display` block as plain text
+at the end of your final reply. Keep its question on the final line and
+leave it free of Markdown formatting, quotation marks, and trailing text.
+The block supplies the exact initiative, review version, and workstream.
+Use the same preview when reissuing an open question after a correction,
+clarification, or recovered session.
+
+After the user responds, run the same command with `--check-reply` before
+trying to record a decision. It reads the actual latest user message from
+Codex and changes no workflow records.
+
+| Result | What to do |
+| --- | --- |
+| `acknowledgment` | Keep the checkpoint open and wait or reissue the scoped question. |
+| `clarification_required` | Ask one question about the user's specific uncertainty or condition. Keep the same checkpoint open and wait. Once they clarify, summarize the answer and reissue the confirmation separately. |
+| `discussion_required` | Answer their question or follow the correction, revisit, or skipped-stage handling for the current review. |
+| `reissue_required` | Explain the reported mismatch accurately and present the returned `display` block. Wait for a new answer at the same checkpoint. |
+| `confirmation_ready` | Record the exact reply using the normal coordinator command. |
+
+For example, “Maybe, if the export behavior stays the same” calls for
+asking which export behavior the user wants to keep. Repeating the
+confirmation question alone leaves the condition unresolved. Delegated slice
+reviews and final-audit consents use their documented prompts and commands.
+
+## Preview slice consent
+
+For scoped confirmations in slice review, prepare the current map, slice recap,
+next slice scope, collection validation, or package lock as required. Then use
+the same command with `--slice-action confirm_map|approve|continue|lock|start`.
+Copy the returned `display` verbatim at the end of the visible reply. This
+includes the exact scope and hashes, the saved recap for slice approval, and
+a brief summary for locking. Before the lock prompt, link to the complete
+canonical recap saved from `slice-package-preview`. Keep the question on its
+final line.
+
+Before recording consent, repeat the command with `--check-reply`. For
+`confirmation_ready`, copy the returned full `question`, exact `target`,
+`reply` as `response`, and any returned `presentation_path` and
+`evidence_paths` into the consent exchange. Then run the corresponding slice
+command. For any other status, follow the table above and leave the action
+pending.
+
 ## Record the decision
 
 For intake, plan and blueprint reviews, record the open checkpoint before the user replies. Then link the exact reply to that checkpoint with `responds_to`. For slice consent use the existing `slice_consent` exchange and its exact target and quote. For `visual-quality --action accept`, include the exact displayed `question`, `presentation_path`, audit ID, digest and user response.

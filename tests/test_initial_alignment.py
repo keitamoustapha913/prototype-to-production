@@ -111,6 +111,60 @@ class InitialAlignmentTests(unittest.TestCase):
         self.assertEqual(receipt["confirmation_origin"]["scope"], ["intake", "intake-v1"])
         self.assertEqual(receipt["response"], "The list also needs a filter.")
 
+    def test_confirmation_preview_routes_replies_without_recording_a_decision(self):
+        self.initialize("blueprint", legacy=False)
+        first = self.presentation()
+        first["question"] = "Is my understanding correct?"
+        self.exchange(first)
+        manifest = self.directory / "manifest.json"
+        before = manifest.read_bytes()
+        preview = json.loads(self.cli("confirmation-preview"))
+        self.assertEqual(preview["checkpoint_id"], "intake-v1")
+        self.assertEqual(preview["display"].splitlines()[-1], first["question"])
+        self.assertIn("intake-v1", preview["display"])
+
+        with tempfile.TemporaryDirectory() as store:
+            session = ConfirmationSession(self.root, store, self.env)
+            for reply, expected in (
+                ("I understand", "acknowledgment"),
+                ("Maybe, if the export behavior stays the same.", "clarification_required"),
+                ("Yes, but only if the export behavior stays the same.", "clarification_required"),
+                ("One correction: the list also needs a filter.", "discussion_required"),
+                ("That looks correct.", "confirmation_ready"),
+            ):
+                with self.subTest(reply=reply):
+                    session.prompt(preview["display"], phase="final_answer")
+                    session.reply(reply)
+                    result = json.loads(self.cli("confirmation-preview", "--check-reply"))
+                    self.assertEqual(result["status"], expected)
+                    if expected == "clarification_required":
+                        self.reply(first, "revise", reply, blocked="conditional or uncertain")
+            self.assertEqual(manifest.read_bytes(), before)
+            self.reply(first, "confirm", "That looks correct.")
+        self.cli("confirmation-preview", "--checkpoint", "intake-v1", blocked="open confirmation")
+
+    def test_preview_reissues_a_recovered_question_after_a_format_mismatch(self):
+        self.initialize("blueprint", legacy=False)
+        first = self.presentation()
+        first["question"] = "Is my understanding correct?"
+        self.exchange(first)
+        with tempfile.TemporaryDirectory() as store:
+            session = ConfirmationSession(self.root, store, self.env)
+            session.prompt("Initiative intake, version intake-v1\n"
+                           "The saved question is **Is my understanding correct?**\n"
+                           "This only confirms intake.", phase="final_answer")
+            session.reply("That looks correct.")
+            result = json.loads(self.cli("confirmation-preview", "--check-reply"))
+            self.assertEqual(result["status"], "reissue_required")
+            self.assertIn("final line", result["reason"])
+            self.reply(first, "confirm", "That looks correct.", blocked="final line")
+
+            session.prompt(result["display"], phase="final_answer")
+            session.reply("That looks correct.")
+            result = json.loads(self.cli("confirmation-preview", "--check-reply"))
+            self.assertEqual(result["status"], "confirmation_ready")
+            self.reply(first, "confirm", "That looks correct.")
+
     def test_blueprint_requires_confirmation_and_carries_the_current_map_into_the_plan(self):
         self.initialize("blueprint")
         audit = {"audit_id": "audit-v1", "scope": "feature", "surface": "backend",

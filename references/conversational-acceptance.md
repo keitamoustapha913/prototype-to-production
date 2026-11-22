@@ -55,7 +55,11 @@ was skipped or when following the script would grant approval out of context.
    After the refusal, send `Next`. Verify that one workstream advances.
 5. At the second workstream's pending question, send `/fresh`. This opens a real
    new thread and asks it to pick up the conversation without supplying any of
-   the previous transcript. Wait for the recovery briefing before continuing.
+   the previous transcript. Wait for the recovery briefing. Ask to resume
+   the Export discussion without advancing. Wait for the scoped question in
+   plain text on the final line, then reply `Yes, continue.` once. Verify that
+   the reply closes the recovered workstream and leaves blueprint approval
+   as a separate decision.
 6. Continue through the remaining blueprint review. Approve the blueprint only
    when the agent presents coverage, consistency and the exact approval scope.
 7. Confirm the complete slice map after its walkthrough. Ask a question about

@@ -1,10 +1,12 @@
 import re
+from types import SimpleNamespace
 from pathlib import Path
 import unittest
 
 from scripts.slice_guide import (
     markdown_links,
     _parse_mermaid,
+    _validate_annexes,
     _validate_diagram_contracts,
     validate_json_schema,
     validate_surface_contracts,
@@ -435,6 +437,84 @@ class GuideContractTests(unittest.TestCase):
     def test_state_parser_does_not_treat_prototype_property_as_pseudostate(self):
         parsed = _parse_mermaid(_Review(), ['stateDiagram-v2\nstate constructor\n'], 'items-slice')
         self.assertEqual(parsed[0]['states'], ['constructor'])
+
+    def test_annex_compares_every_approved_output_line(self):
+        packet, guide, _ = _guide_fixture()
+        contract = packet['feature_contracts'][0].setdefault('surface_contracts', {}).setdefault('backend', {})
+        original = '- Inputs and outputs: GET /items returns the item list to the caller.'
+        for format_name in ('continuation', 'fenced'):
+            with self.subTest(format=format_name):
+                approved = 'Approved output rows:\n2: Call vendor\n4: Confirm freight\n3: File receipt'
+                if format_name == 'fenced':
+                    approved = 'Approved output rows:\n\n- Verify: Call vendor\n4: Confirm freight'
+                    field = '- Inputs and outputs:\n  ```text\n' + '\n'.join(
+                        '  ' + line for line in approved.split('\n')) + '\n  ```'
+                else:
+                    field = '- Inputs and outputs: ' + approved
+                contract['Inputs and outputs'] = approved
+                _validate_annexes(_Review(), packet, guide.replace(original, field))
+                with self.assertRaisesRegex(AssertionError, 'Inputs and outputs differs'):
+                    _validate_annexes(_Review(), packet, guide.replace(original, field.replace('Confirm freight', 'Different item')))
+
+    def test_state_aliases_match_exact_approved_names_and_transitions(self):
+        feature = {
+            'feature_id': 'queue-report',
+            'states': ['unresolved items', 'no items'],
+            'state_transitions': [{
+                'from': 'unresolved items', 'to': 'no items',
+                'trigger': 'finish work', 'guard': 'queue empty', 'effect': 'show empty message',
+            }],
+        }
+        packet = {'feature_contracts': [feature], 'guide_format_version': 3}
+        source = (
+            'stateDiagram-v2\nstate "unresolved items" as unresolved_items\n'
+            'state "no items" as no_items\n'
+            'unresolved_items --> no_items : finish work, queue empty, show empty message\n'
+        )
+        parsed = _parse_mermaid(_Review(), [source], 'priority')
+        _validate_diagram_contracts(_Review(), packet, parsed, 'priority')
+
+        for changed, message in (
+            (source.replace('"no items"', '"different items"'), 'unapproved states'),
+            (source.replace('unresolved_items --> no_items', 'no_items --> unresolved_items'),
+             'unapproved transitions'),
+            (source.replace('"no items"', '"unresolved items"'), 'ambiguous state label'),
+            (source.replace('state "no items" as no_items',
+                            'state "no items" as no_items\nstate "different items" as no_items'),
+             'conflicting state aliases'),
+        ):
+            with self.subTest(message=message), self.assertRaisesRegex(AssertionError, message):
+                parsed = _parse_mermaid(_Review(), [changed], 'priority')
+                _validate_diagram_contracts(_Review(), packet, parsed, 'priority')
+
+    def test_blueprint_preview_checks_that_state_contracts_can_be_diagrammed(self):
+        from scripts import confirmation, conversation_controller, slice_guide
+
+        review = _Review()
+        state = SimpleNamespace(
+            manifest={'stage': 'blueprint', 'confirmation_protocol_version': 1},
+            require=review.require,
+            load=lambda group, version: spec,
+            validate_approval=lambda draft, requesting: {'presentation_evidence_hashes': {}},
+            api=SimpleNamespace(sibling_module={'confirmation': confirmation, 'slice_guide': slice_guide}.__getitem__),
+        )
+        draft = {'approved_version': 'spec-v1'}
+        spec = {'surface_contract_version': 2, 'features': [{
+            'feature_id': 'queue-report',
+            'states': ['unresolved items', 'no items'],
+            'state_transitions': [{
+                'from': 'unresolved items', 'to': 'no items',
+                'trigger': 'finish work', 'guard': 'queue empty', 'effect': 'show empty message',
+            }],
+        }]}
+        preview = conversation_controller.approval_preview(state, draft)
+        diagram = preview['state_diagrams']['queue-report']
+        self.assertIn('state "unresolved items" as ', diagram)
+        self.assertIn('state "no items" as ', diagram)
+
+        spec['features'][0]['state_transitions'][0]['effect'] = 'one; extra state'
+        with self.assertRaisesRegex(AssertionError, 'queue-report.*Mermaid'):
+            conversation_controller.approval_preview(state, draft)
 
     def test_mermaid_parser_preserves_sequence_control_flow_and_positions(self):
         source = ('sequenceDiagram\nparticipant A\nparticipant B\nA->>B: request\n'

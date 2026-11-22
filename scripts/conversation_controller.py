@@ -117,7 +117,10 @@ def approval_preview(state, draft):
                   'Provide the current blueprint presentation with the approval fields omitted')
     preview = state.validate_approval(draft, requesting=True)
     contextual = state.api.sibling_module('confirmation').enabled(state.manifest)
+    spec = state.load('blueprints', draft['approved_version'])
+    diagrams = state.api.sibling_module('slice_guide').blueprint_state_diagrams(state, spec)
     return {'approval_presentation': draft,
+            'state_diagrams': diagrams,
             'instruction': 'Do you approve this blueprint?' if contextual else approval_phrase(draft['approved_version']),
             'presentation_hashes': preview['presentation_evidence_hashes']}
 

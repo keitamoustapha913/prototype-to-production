@@ -56,3 +56,35 @@ def displayed_values(target):
         elif isinstance(value, str) or type(value) is int:
             values.append(str(value))
     return values
+
+
+SLICE_QUESTIONS = {
+    'confirm_map': 'Do you confirm this slice map?',
+    'approve': 'Do you approve this slice revision?',
+    'continue': 'Are you ready to continue to the next slice?',
+    'lock': 'May I lock this reviewed package?',
+    'start': 'May I start implementation of this locked package?',
+}
+SCOPE_LABELS = {
+    'map_id': 'Map', 'map_path': 'Map path', 'map_sha256': 'Map SHA-256',
+    'guide_sha256': 'Guide SHA-256', 'contract_sha256': 'Contract SHA-256',
+    'visual_sha256': 'Visual review SHA-256', 'package_id': 'Package',
+    'collection_path': 'Collection path', 'collection_sha256': 'Collection SHA-256',
+    'recap_sha256': 'Recap SHA-256', 'package_hash': 'Package SHA-256',
+}
+
+
+def render_prompt(initiative, action, target, *, recap='', guide_path=None):
+    lines = [f'Initiative {initiative}']
+    if 'slices' in target:
+        for item in target['slices']:
+            lines.append(f"Slice {item['slice_id']} revision {item['proposal_revision']}")
+            lines.extend(f'{SCOPE_LABELS[key]} {value}' for key, value in item.items() if key in SCOPE_LABELS)
+    else:
+        lines.extend(f'{SCOPE_LABELS[key]} {value}' for key, value in target.items())
+    if guide_path:
+        lines.append(f'Guide path {guide_path}')
+    if action == 'start':
+        lines.append('Starting implementation authorizes edits to source code within this locked package.')
+    blocks = [recap.strip(), '\n'.join(lines), SLICE_QUESTIONS[action]]
+    return '\n\n'.join(block for block in blocks if block)

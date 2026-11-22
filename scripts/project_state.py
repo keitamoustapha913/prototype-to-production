@@ -3376,7 +3376,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     for name in (
-        "init", "artifact-setup", "review-viewer", "review-revision", "visual-integrity", "visual-baseline", "cross-screen", "visual-quality", "event", "checkpoint", "conversation-record", "plan-record", "blueprint-record", "blueprint-coverage", "blueprint-index-rebuild", "work-update", "discovery-record", "discovery-capture", "browser-build-fingerprint", "missing-feature", "prototype-coverage", "blueprint-approval-preview", "approve", "revoke-approval", "slice-create", "slice-cancel",
+        "init", "artifact-setup", "review-viewer", "review-revision", "visual-integrity", "visual-baseline", "cross-screen", "visual-quality", "event", "checkpoint", "conversation-record", "confirmation-preview", "plan-record", "blueprint-record", "blueprint-coverage", "blueprint-index-rebuild", "work-update", "discovery-record", "discovery-capture", "browser-build-fingerprint", "missing-feature", "prototype-coverage", "blueprint-approval-preview", "approve", "revoke-approval", "slice-create", "slice-cancel",
         "slice-report", "reconcile", "warning-record", "warning-decide", "resume", "validate", *REVIEW_COMMANDS,
     ):
         sub = commands.add_parser(name)
@@ -3420,6 +3420,12 @@ def main(argv: list[str] | None = None) -> int:
             sub.add_argument("--plan-version", required=True)
         if name == "conversation-record":
             sub.add_argument("--exchange-file", required=True)
+        if name == "confirmation-preview":
+            scope = sub.add_mutually_exclusive_group()
+            scope.add_argument("--checkpoint", help="Open review exchange ID if more than one is pending")
+            scope.add_argument("--slice-action", choices=("confirm_map", "approve", "continue", "lock", "start"))
+            sub.add_argument("--check-reply", action="store_true",
+                             help="Classify the latest verified user reply without recording it")
         if name == "work-update":
             sub.add_argument("--work-file", required=True)
         if name == "discovery-record":
@@ -3467,7 +3473,9 @@ def main(argv: list[str] | None = None) -> int:
             raise StateError(f"Initiative not initialized: {directory}. Run init first.")
         review_workflow = args.command in REVIEW_COMMANDS or (
             manifest_file.is_file() and requires_slice_review(read_json(manifest_file)))
-        ensure_local_git_ignore(project_root, directory, configure=explicit_setup or not review_workflow)
+        ensure_local_git_ignore(project_root, directory, configure=(
+            explicit_setup or (not review_workflow and args.command != "confirmation-preview")
+        ))
         if args.command == "init":
             initialize(directory, args.scope, args.next_action, args.mode,
                        guided_design_review=args.guided_design_review)
@@ -3594,6 +3602,17 @@ def main(argv: list[str] | None = None) -> int:
             report_missing_feature(directory, args.report_file)
         elif args.command == "prototype-coverage":
             record_prototype_coverage(directory, args.coverage_file)
+        elif args.command == "confirmation-preview":
+            with coordinator_lock(directory):
+                manifest = manifest_at(directory)
+                if args.slice_action:
+                    review = slice_review_state(directory, manifest)
+                    result = review.consent_preview(args.slice_action, check_reply=args.check_reply)
+                else:
+                    state = blueprint_state(directory, manifest)
+                    result = sibling_module("confirmation").preview(
+                        state, args.checkpoint, check_reply=args.check_reply)
+            print(json.dumps(result, indent=2, ensure_ascii=False))
         elif args.command == "blueprint-approval-preview":
             with coordinator_lock(directory):
                 manifest = manifest_at(directory)

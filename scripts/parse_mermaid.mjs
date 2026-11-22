@@ -36,14 +36,39 @@ for (const source of sources) {
   };
   visit(ast);
   const stateId = (id) => id === 'root_start' || id === 'root_end' ? '[*]' : id;
-  const stateEdges = flat.filter((item) => item.stmt === 'relation')
+  const rawStateEdges = flat.filter((item) => item.stmt === 'relation')
     .map((item) => [stateId(item.state1?.id), stateId(item.state2?.id), item.description ?? ''])
     .filter(([from, to]) => from && to);
-  const states = [...new Set([
+  const stateIds = [...new Set([
     ...flat.filter((item) => item.stmt === 'state').map((item) => item.id),
     ...(Array.isArray(ast) ? ast.filter((item) => typeof item === 'string') : []),
-    ...stateEdges.flatMap(([from, to]) => [from, to]),
+    ...rawStateEdges.flatMap(([from, to]) => [from, to]),
   ].filter((id) => id && !['[*]', 'root_start', 'root_end'].includes(id)))];
+  // Mermaid emits the same AST shape for a quoted alias and an ID annotation.
+  // Recognize explicit alias declarations in the source and verify them in the parsed AST.
+  const aliases = new Map();
+  if (type === 'stateDiagram') {
+    const declaration = /(?:^|[;{}])[ \t]*state[ \t]+"([^"\r\n]+)"[ \t]+as[ \t]+([^\s;{}]+)(?=[ \t]*(?:[;{}]|%%|\r?$))/gm;
+    for (const [, label, id] of source.matchAll(declaration)) {
+      if (!stateIds.includes(id)
+          || !flat.some(item => item.stmt === 'state' && item.id === id && item.description === label)) {
+        throw new Error(`Mermaid state alias ${id} does not match its parsed declaration`);
+      }
+      if ((aliases.has(id) && aliases.get(id) !== label)
+          || flat.some(item => item.stmt === 'state' && item.id === id
+            && item.description && item.description !== label)) {
+        throw new Error(`Mermaid diagram has conflicting state aliases for ${id}`);
+      }
+      aliases.set(id, label);
+    }
+  }
+  const name = id => aliases.get(id)?.replace(/#(quot|34|35);/g,
+    (_, entity) => entity === '35' ? '#' : '"') ?? id;
+  const states = stateIds.map(name);
+  if (states.includes('[*]') || new Set(states).size !== states.length) {
+    throw new Error('Mermaid diagram has an ambiguous state label');
+  }
+  const stateEdges = rawStateEdges.map(([from, to, label]) => [name(from), name(to), label]);
   const participants = [...new Set(flat.filter((item) => item.type === 'addParticipant')
     .map((item) => item.actor).filter(Boolean))];
   const messages = flat.filter((item) => item.type === 'addMessage')

@@ -76,7 +76,7 @@ class EvidenceTests(unittest.TestCase):
                       '## State and scenario matrix\n- forbidden gives 403.\n'
                       '## Tests and acceptance evidence\n- confirmed visible.\n'
                       '## Finished experience or service contract\n- confirmed visible.\n'
-                      '## Detailed functional requirements\n- validated guard.\n'
+                      '## Detailed functional requirements\n### Membership\n- validated guard.\n'
                       '## Step-by-step implementation recipe\n- validated guard before query.\n'
                       '```markdown\n## Example heading inside a code fence\n```\n')
         packet = {'slice_id': 'items', 'proposal_revision': 2, 'owner': 'builder',
@@ -119,13 +119,19 @@ class EvidenceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'normative guide sections'):
             slice_evidence.validate_handoff(self.review, packet, entry, declaration)
         for line, section in ((6, 'Finished experience or service contract'),
-                              (8, 'Detailed functional requirements'),
-                              (10, 'Step-by-step implementation recipe')):
+                              (9, 'Detailed functional requirements'),
+                              (11, 'Step-by-step implementation recipe')):
             declaration['findings'].append({'section': section, 'citation': f'line {line}',
                                             'finding': 'Compared the implementation against the approved guard.',
                                             'resolution': 'The approved member and outsider outcomes are preserved.',
                                             'result': 'PASS'})
         slice_evidence.validate_handoff(self.review, packet, entry, declaration)
+        finding = next(finding for finding in declaration['findings']
+                       if finding['section'] == 'Detailed functional requirements')
+        finding['citation'] = 'lines 9-11'
+        with self.assertRaisesRegex(ValueError, 'must point inside Detailed functional requirements'):
+            slice_evidence.validate_handoff(self.review, packet, entry, declaration)
+        finding['citation'] = 'line 9'
         reference = declaration['read_only_scenarios'][0]['references'][0]
         for symbol in ('A heading that does not exist', 'Example heading inside a code fence'):
             with self.subTest(symbol=symbol):
@@ -307,7 +313,7 @@ class EvidenceTests(unittest.TestCase):
                 'contract_sha256': 'b' * 64}},
                 'reviews': {'items': {'review_mode': 'manual', 'result': 'approved',
                                      'reviewer': 'user', 'handoff_review': {'result': 'PASS',
-                                        'walkthrough': {'test_execution': False}}}},
+                                        'walkthrough': {'independent': False, 'test_execution': False}}}},
             },
             active_approval='approval-3', manifest={'approved_version': 'spec-v3'},
         )
@@ -334,9 +340,13 @@ class EvidenceTests(unittest.TestCase):
         recap = slice_evidence.render_recap(review, 'package-v1', 'slice-review/validation/v1.json', report)
         for required in ('package-v1', 'approval-3', 'spec-v3', 'Member item list', 'manual',
                          'end_to_end_journeys', 'NOT_APPLICABLE', 'src/items.py', 'a' * 64,
-                         'Independent no-code walkthrough', 'test execution: no', 'collection-reader',
+                         'Coordinator no-code walkthrough', 'test execution: no', 'collection-reader',
                          'Specification review', 'items.list/member-result', 'line 3', 'items-read', 'line 4'):
             self.assertIn(required, recap)
+        self.assertNotIn('Independent no-code walkthrough', recap)
+        review.registry['reviews']['items']['handoff_review']['walkthrough']['independent'] = True
+        self.assertIn('Independent no-code walkthrough',
+                      slice_evidence.render_recap(review, 'package-v1', 'slice-review/validation/v1.json', report))
 
 
 if __name__ == '__main__':

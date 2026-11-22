@@ -4859,21 +4859,44 @@ print(json.dumps(output))
         feature = self.reviewed_blueprint()
         self.review_cli('slice-plan', {'slices': [self.guide_candidate(feature)]})
         self.review_cli('slice-review-record', self.review_input())
-        package = self.lock_reviewed_package()
+        self.review_cli('slice-collection-validate', self.collection_input())
+        preview = self.review_cli('slice-package-preview')
         session = self.enable_contextual_confirmation()
-        question = f"Locked {package['package_id']} ({package['package_hash']}). This permits edits to source code.\nMay I start implementation of this locked package?"
+        lock_args = ('confirmation-preview', '--slice-action', 'lock')
+        lock = json.loads(self.cli(*lock_args).stdout)
+        self.assertIn('items-slice revision 1', lock['display'])
+        self.assertNotIn(preview['recap'], lock['display'])
+        self.assertEqual(lock['target']['recap_sha256'], preview['recap_sha256'])
+        session.prompt(lock['display'])
+        session.reply('Go ahead and lock it.')
+        reply = json.loads(self.cli(*lock_args, '--check-reply').stdout)
+        self.assertEqual(reply['status'], 'confirmation_ready')
+        consent = {'exchange_id': 'contextual-lock', 'phase': 'slice_review', 'record_type': 'slice_consent',
+                   'status': 'decided', 'consent_action': 'lock', 'target': lock['target'],
+                   'question': lock['question'], 'response': reply['reply']}
+        self.cli('conversation-record', '--exchange-file', self.payload('natural-lock', consent))
+        summary = self.review_cli('slice-package-lock', lock['target'] | {
+            'recap_path': self.artifact('inputs/recap.md', preview['recap']), 'approved_by_user': True,
+            'consent_id': consent['exchange_id'], 'user_response': reply['reply']})
+        self.assertFalse(summary['implementation_authorized'])
+        start_args = ('confirmation-preview', '--slice-action', 'start')
+        start = json.loads(self.cli(*start_args).stdout)
+        package = start['target']
+        self.assertEqual(package['package_hash'], summary['packages']['package-v1']['package_hash'])
         exchange = {'exchange_id': 'contextual-start', 'phase': 'slice_review', 'record_type': 'slice_consent',
                     'status': 'decided', 'consent_action': 'start', 'target': package,
-                    'question': question, 'response': 'Start implementation.'}
+                    'question': start['question'], 'response': 'Start implementation.'}
 
         def record(*, ok=True):
             return self.cli('conversation-record', '--exchange-file', self.payload('natural-start', exchange), ok=ok)
 
-        session.prompt(f"Initiative sample-work\n{question}")
+        session.prompt(start['display'])
         session.reply('I approve this package.')
+        self.assertEqual(json.loads(self.cli(*start_args, '--check-reply').stdout)['status'], 'discussion_required')
         record(ok=False)
-        session.prompt(f"Initiative sample-work\n{question}")
+        session.prompt(start['display'])
         session.reply(exchange['response'])
+        self.assertEqual(json.loads(self.cli(*start_args, '--check-reply').stdout)['status'], 'confirmation_ready')
         record()
         summary = self.review_cli('implementation-authorize', package | {
             'instruction': 'start implementation', 'authorized_by_user': True,
@@ -5296,7 +5319,7 @@ print(json.dumps(output))
         exchange = json.loads((self.directory/'conversation/choose-layout.json').read_text())
         self.assertNotIn('slice_ids', exchange)
 
-    def test_approved_feature_prerequisite_requires_its_own_slice(self):
+    def test_approved_prerequisite_can_be_delivered_within_or_before_its_slice(self):
         self.start()
         self.exchange()
         self.record_baseline()
@@ -5316,6 +5339,11 @@ print(json.dumps(output))
         self.cli('approve', '--approval-file', self.payload('approval', self.approval()))
         packet = self.slice()
         self.cli('slice-create', '--contract-file', self.payload('missing-prerequisite', packet), ok=False)
+        combined = dict(packet, slice_id='combined-slice', feature_ids=['foundation', 'items-feature'],
+                        allowed_paths=[*packet['allowed_paths'], 'src/foundation.py'],
+                        functional_tests=[*packet['functional_tests'], 'foundation-check'])
+        self.cli('slice-create', '--contract-file', self.payload('combined', combined))
+        self.cli('slice-cancel', '--slice-id', 'combined-slice', '--reason', 'Exercise the separate delivery path')
         foundation_slice = dict(packet, slice_id='foundation-slice', feature_ids=['foundation'],
                                 allowed_paths=['src/foundation.py'], functional_tests=['foundation-check'])
         self.cli('slice-create', '--contract-file', self.payload('foundation', foundation_slice))

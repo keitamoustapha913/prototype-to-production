@@ -43,6 +43,12 @@ RELATIVE = {
 }
 YES = {'yes', 'yes please', 'yes, please', 'yes go ahead', 'yes, go ahead'}
 YES_CONTINUE = {'yes continue', 'yes, continue'}
+ACKNOWLEDGMENTS = {'i understand', 'understood', 'okay', 'ok', 'got it', 'thanks', 'thank you'}
+CONDITIONAL_REPLY = re.compile(
+    r'^(?:maybe|possibly|probably|it depends|if|unless|only if|as long as|provided that)\b'
+    r'|^(?:yes|sure|okay|ok|continue|i approve|i confirm|that looks correct)\b.*'
+    r'\b(?:if|unless|but|as long as|provided that)\b'
+)
 
 
 def enabled(manifest):
@@ -53,13 +59,17 @@ def normalize(value):
     return ' '.join(value.casefold().split()).rstrip('.!').rstrip()
 
 
+def is_scoped_question(action, question):
+    lines = question.strip().splitlines()
+    prompt = normalize(lines[-1]) if lines else ''
+    return prompt.endswith('?') and re.fullmatch(QUESTIONS[action], prompt[:-1]) is not None
+
+
 def accepts(action, reply, question, *, explicit=()):
     if not isinstance(reply, str):
         return False
     text = normalize(reply)
-    lines = question.strip().splitlines()
-    prompt = normalize(lines[-1]) if lines else ''
-    scoped = prompt.endswith('?') and re.fullmatch(QUESTIONS[action], prompt[:-1]) is not None
+    scoped = is_scoped_question(action, question)
     if action != 'start' and text in YES:
         return scoped
     if text in YES_CONTINUE:
@@ -131,9 +141,17 @@ def current_exchange(state):
 
 
 def bind(state, question, response, scope, action, *, not_before=None, single_question=False):
-    thread, (prompt_id, shown_at, shown), (user_id, replied_at, reply) = current_exchange(state)
-    state.require(reply.strip() == response.strip() and shown.rstrip().endswith(question.strip()),
-                  'The saved prompt and reply must match the latest user exchange in the Codex session')
+    return bind_exchange(state, current_exchange(state), question, response, scope, action,
+                         not_before=not_before, single_question=single_question)
+
+
+def bind_exchange(state, exchange, question, response, scope, action, *, not_before=None, single_question=False):
+    thread, (prompt_id, shown_at, shown), (user_id, replied_at, reply) = exchange
+    state.require(reply.strip() == response.strip(),
+                  'The recorded reply must match the latest user exchange in the Codex session')
+    state.require(shown.rstrip().endswith(question.strip()),
+                  'The saved prompt must match the latest user exchange. '
+                  'Put the exact saved question in plain text on the final line.')
     values = [state.manifest['initiative_id'], *scope]
     state.require(all(contains_scope(shown, value) for value in values),
                   'Show the initiative ID and exact review scope in the same message as the confirmation question')
@@ -175,6 +193,63 @@ def blueprint_replies(version):
     return (f'Approve blueprint {version}', f'I approve blueprint {version}', f'I approve version {version}')
 
 
+def review_scope(checkpoint):
+    scope = [checkpoint['review_version']]
+    if name := checkpoint.get('review_workstream'):
+        scope.append(name)
+    return scope
+
+
+def preview(state, checkpoint_id=None, *, check_reply=False):
+    state.require(enabled(state.manifest), 'Confirmation preview requires scoped confirmations')
+    checkpoints = [
+        record for record in state.pending()
+        if record.get('record_type') == 'review_checkpoint'
+        and record.get('review_step') in REVIEW_CONFIRMATIONS
+        and (checkpoint_id is None or record['exchange_id'] == checkpoint_id)
+    ]
+    state.require(checkpoints, 'No matching open confirmation checkpoint')
+    state.require(len(checkpoints) == 1, 'Select an open confirmation checkpoint with --checkpoint')
+    checkpoint = checkpoints[0]
+    _, action = REVIEW_CONFIRMATIONS[checkpoint['review_step']]
+    scope = review_scope(checkpoint)
+    initiative = state.manifest['initiative_id']
+    question = checkpoint['question'].strip()
+    result = {
+        'status': 'present_question', 'checkpoint_id': checkpoint['exchange_id'],
+        'action': action, 'initiative_id': initiative, 'review_version': scope[0],
+        'workstream': checkpoint.get('review_workstream'), 'question': question,
+        'display': f"Initiative {initiative} · Review {' · '.join(scope)}\n\n{question}",
+    }
+    state.require(is_scoped_question(action, question) and question.count('?') == 1,
+                  'The saved question is unsupported for scoped confirmation. '
+                  'Use the review workflow to open a corrected checkpoint before asking for approval.')
+    explicit = blueprint_replies(scope[0]) if action == 'blueprint_approval' else ()
+    return preview_reply(state, result, scope, explicit=explicit,
+                         not_before=checkpoint['recorded_at']) if check_reply else result
+
+
+def preview_reply(state, result, scope, *, explicit=(), not_before=None, single_question=False):
+    action, question = result['action'], result['question']
+    try:
+        exchange = current_exchange(state)
+        reply = exchange[2][2]
+        text = normalize(reply)
+        if text in ACKNOWLEDGMENTS:
+            result['status'] = 'acknowledgment'
+        elif CONDITIONAL_REPLY.search(text):
+            result['status'] = 'clarification_required'
+        elif not accepts(action, reply, question, explicit=explicit):
+            result['status'] = 'discussion_required'
+        else:
+            bind_exchange(state, exchange, question, reply, scope, action,
+                          not_before=not_before, single_question=single_question)
+            result.update(status='confirmation_ready', reply=reply)
+    except state.api.StateError as error:
+        result.update(status='reissue_required', reason=str(error))
+    return result
+
+
 def record_review(state, value):
     if value['status'] != 'decided':
         return
@@ -187,11 +262,13 @@ def record_review(state, value):
     version = value.get('review_version')
     state.require(state.identifier(version), 'The review confirmation needs an exact version')
     explicit = blueprint_replies(version) if action == 'blueprint_approval' else ()
+    response = normalize(value['response'])
+    state.require(response not in ACKNOWLEDGMENTS,
+                  'The reply is an acknowledgment. Keep the confirmation checkpoint open.')
+    state.require(not CONDITIONAL_REPLY.search(response),
+                  'The reply is conditional or uncertain. Ask what the user means and keep the checkpoint open.')
     if chosen == expected:
         clarify(state, action, value['response'], prompt['question'], explicit=explicit)
-    scope = [version]
-    if name := value.get('review_workstream'):
-        scope.append(name)
     value['confirmation_origin'] = bind(
-        state, prompt['question'], value['response'], scope,
+        state, prompt['question'], value['response'], review_scope(value),
         action if chosen == expected else chosen, not_before=prompt['recorded_at'])

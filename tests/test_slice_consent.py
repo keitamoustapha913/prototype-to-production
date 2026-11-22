@@ -1,3 +1,4 @@
+import json
 import unittest
 from unittest.mock import patch
 
@@ -5,6 +6,44 @@ from scripts.slice_consent import affirmative
 
 
 class SliceConsentTests(unittest.TestCase):
+    def test_scoped_map_preview_supplies_every_required_value_and_records_no_consent(self):
+        from test_blueprint_state import BlueprintTests
+
+        fixture = BlueprintTests()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        feature = fixture.reviewed_blueprint()
+        fixture.enable_slice_map()
+        candidate = fixture.guide_candidate(feature) | {
+            'outcome': 'Members can list items while outsiders are refused.',
+            'boundary_reason': 'Keep the existing guard and persistence together.',
+        }
+        target = fixture.review_cli('slice-plan', {'slices': [candidate]})['slice_map']['target']
+        fixture.cli('slice-map')
+        session = fixture.enable_contextual_confirmation()
+        manifest = fixture.directory / 'manifest.json'
+        before = manifest.read_bytes()
+        args = ('confirmation-preview', '--slice-action', 'confirm_map')
+        preview = json.loads(fixture.cli(*args).stdout)
+        self.assertEqual(preview['target'], target)
+        self.assertEqual(preview['display'].splitlines()[-1], 'Do you confirm this slice map?')
+        for value in target.values():
+            self.assertIn(value, preview['question'])
+        session.prompt(preview['display'])
+        session.reply('I confirm this slice map.')
+        reply = json.loads(fixture.cli(*args, '--check-reply').stdout)
+        self.assertEqual(reply['status'], 'confirmation_ready')
+        self.assertEqual(manifest.read_bytes(), before)
+        exchange = {
+            'exchange_id': 'preview-map-consent', 'phase': 'slice_review', 'record_type': 'slice_consent',
+            'status': 'decided', 'consent_action': 'confirm_map', 'target': target,
+            'question': preview['question'], 'response': reply['reply'],
+        }
+        fixture.cli('conversation-record', '--exchange-file', fixture.payload('preview-consent', exchange))
+        register = fixture.review_cli('slice-register')
+        self.assertEqual(register['current_slice_id'], 'items-slice')
+        self.assertFalse(register['implementation_authorized'])
+
     def test_authorizing_a_locked_package_rechecks_its_authored_guides(self):
         from test_blueprint_state import BlueprintTests, FIXTURE_CLI
 

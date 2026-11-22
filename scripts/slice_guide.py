@@ -476,11 +476,38 @@ def _parse_mermaid(review, diagrams, key):
         return []
 
 
-def _validate_diagram_contracts(review, packet, parsed, key):
+def blueprint_state_diagrams(review, spec):
+    """Round-trip state diagram sources through the slice guide validator."""
+    if not spec.get('surface_contract_version'):
+        return {}
+    features = [feature for feature in spec['features'] if feature.get('state_transitions')]
+    sources = {}
+    for feature in features:
+        ids = {state: f'p2p_state_{index}' for index, state in enumerate(feature['states'], 1)}
+        lines = ['stateDiagram-v2']
+        for state, internal_id in ids.items():
+            label = state.replace('#', '#35;').replace('"', '#quot;')
+            lines.append(f'    state "{label}" as {internal_id}')
+        for edge in feature['state_transitions']:
+            label = ', '.join(' '.join(edge[field].split()) for field in ('trigger', 'guard', 'effect'))
+            lines.append(f"    {ids[edge['from']]} --> {ids[edge['to']]} : {label}")
+        sources[feature['feature_id']] = '\n'.join(lines) + '\n'
+    key = f"Blueprint {spec.get('version', '')} state diagrams ({', '.join(sources)})"
+    parsed = _parse_mermaid(review, list(sources.values()), key)
+    _fail(review, len(parsed) == len(features), f'{key}: Mermaid parser output is incomplete')
+    for feature, diagram in zip(features, parsed):
+        packet = {'feature_contracts': [feature]}
+        _validate_diagram_contracts(review, packet, [diagram], feature['feature_id'],
+                                    state_only=True)
+    return sources
+
+
+def _validate_diagram_contracts(review, packet, parsed, key, *, state_only=False):
     features = {feature['feature_id']: feature for feature in packet['feature_contracts']}
     state_diagrams = [diagram for diagram in parsed if diagram.get('type') == 'stateDiagram']
     sequence_diagrams = [diagram for diagram in parsed if diagram.get('type') == 'sequence']
-    sequence_contracts = [feature for feature in features.values() if feature.get('sequence_contract')]
+    sequence_contracts = ([] if state_only else
+                          [feature for feature in features.values() if feature.get('sequence_contract')])
     state_contracts = [feature for feature in features.values() if feature.get('state_transitions')]
     matched_state_features = set()
     if state_diagrams:
@@ -732,6 +759,36 @@ def _validate_guide_specificity(review, packet, sections, key):
                   f'{key}: recipe step {step} needs a concrete Expected result')
 
 
+def _annex_fields(body):
+    """Read bullet fields, supporting consecutive lines and fenced literal values."""
+    fields = {}
+    current = None
+    fence = None
+    indent = ''
+    for line in body.splitlines():
+        if fence:
+            if re.fullmatch(rf'\s*{re.escape(fence[0])}{{{len(fence)},}}\s*', line):
+                fence = None
+                current = None
+            else:
+                current.append(line.removeprefix(indent))
+            continue
+        field = re.fullmatch(r'- ([^:\n]+):(?: (.*))?', line)
+        if field:
+            name, value = field.groups()
+            current = [value] if value else []
+            fields[name] = current
+        elif current is not None:
+            opening = re.fullmatch(r'(\s*)(`{3,}|~{3,})[^\s`~]*\s*', line)
+            if not current and opening:
+                indent, fence = opening.groups()
+            elif not line.strip():
+                current = None
+            else:
+                current.append(line)
+    return {field: '\n'.join(lines) for field, lines in fields.items()}
+
+
 def _validate_annexes(review, packet, guide):
     sections = _sections_with_lines(guide, 3)
     spec = review.blueprint.load('blueprints', packet['blueprint_version'])
@@ -756,7 +813,7 @@ def _validate_annexes(review, packet, guide):
             heading = f'{surface.upper()} annex — {f}'
             _fail(review, heading in sections, f'{packet["slice_id"]}: missing {heading}')
             body = sections[heading][1]
-            fields = dict(re.findall(r'^- ([^:\n]+): (.+)$', body, re.M))
+            fields = _annex_fields(body)
             for field in surface_api.ANNEX_FIELDS[surface]:
                 content = fields.get(field, '')
                 approved = feature.get('surface_contracts', {}).get(surface, {}).get(field)

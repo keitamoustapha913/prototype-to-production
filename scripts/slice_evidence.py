@@ -184,9 +184,9 @@ def _heading_lines(lines):
                 fence = None
             continue
         if fence is None:
-            heading = re.match(r'^ {0,3}#{1,6}[ \t]+(.+?)\s*$', line)
+            heading = re.match(r'^ {0,3}(#{1,6})[ \t]+(.+?)\s*$', line)
             if heading:
-                yield heading[1], number
+                yield heading[2], number, len(heading[1])
 
 
 def validate_handoff(review, packet, entry, value, *, verify_symbols=False, depth=None):
@@ -234,7 +234,7 @@ def validate_handoff(review, packet, entry, value, *, verify_symbols=False, dept
 
     guide_path = review.api.artifact_file(review.directory, entry.get('guide_path'))
     guide_lines = guide_path.read_text(encoding='utf-8').splitlines()
-    headings = dict(_heading_lines(guide_lines))
+    headings = {title: (line, level) for title, line, level in _heading_lines(guide_lines)}
     findings = value.get('findings')
     _require(review, isinstance(findings, list) and bool(findings),
              'Handoff review needs specific findings')
@@ -250,8 +250,10 @@ def validate_handoff(review, packet, entry, value, *, verify_symbols=False, dept
         _require(review, citation is not None, 'Handoff citation must name exact guide line numbers')
         start = int(citation.group(1))
         end = int(citation.group(2) or start)
-        next_heading = min((line for line in headings.values() if line > headings[title]), default=len(guide_lines) + 1)
-        _require(review, headings[title] < start <= end < next_heading,
+        section_start, level = headings[title]
+        next_heading = min((line for line, other_level in headings.values()
+                            if line > section_start and other_level <= level), default=len(guide_lines) + 1)
+        _require(review, section_start < start <= end < next_heading,
                  f'Handoff citation must point inside {title}')
         _require(review, (schema_version < 3 and not depth) or finding.get('result') != 'BLOCKED',
                  f'Handoff records a blocker in {title}: {finding["finding"]}')
@@ -346,7 +348,7 @@ def validate_handoff(review, packet, entry, value, *, verify_symbols=False, dept
                         source_lines[source_path] = _citation_lines(review, source_path, {key: packet})
                     lines = source_lines[source_path]
                     if source_path.casefold().endswith('.md'):
-                        exists = any(heading == symbol for heading, _ in _heading_lines(lines))
+                        exists = any(heading == symbol for heading, _, _ in _heading_lines(lines))
                     else:
                         target = re.compile(r'(?<![\w-])' + re.escape(symbol) + r'(?![\w-])')
                         exists = any(target.search(line) for line in lines)
@@ -745,7 +747,9 @@ def render_recap(review, package_id, collection_path, report):
         ])
         walkthrough = receipt.get('handoff_review', {}).get('walkthrough', {})
         if walkthrough:
-            lines.append(f'- Independent no-code walkthrough: '
+            reviewer_type = {True: 'Independent ', False: 'Coordinator '}.get(walkthrough.get('independent'), '')
+            label = f'{reviewer_type}no-code walkthrough'.capitalize()
+            lines.append(f'- {label}: '
                          f'{receipt.get("handoff_review", {}).get("result", "PASS")} '
                          f'(reviewer attestation; test execution: '
                          f'{"yes" if walkthrough.get("test_execution") else "no"})')

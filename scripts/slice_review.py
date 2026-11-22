@@ -419,6 +419,65 @@ class SliceReview:
                 target['visual_sha256'] = viewer.digest(viewer.encode(visual))
         return target
 
+    def consent_preview(self, action, *, check_reply=False):
+        confirmation = self.api.sibling_module('confirmation')
+        service = self.api.sibling_module('slice_consent')
+        self.require(confirmation.enabled(self.manifest), 'Confirmation preview requires scoped confirmations')
+        self.check_history()
+        self.approval()
+        if action != 'confirm_map':
+            self.require_map_confirmed()
+        recap = ''
+        guide_path = None
+        evidence = {}
+        if action == 'confirm_map':
+            current = self.current_map()
+            self.require(current and not self.registry.get('planning_gaps') and not current.get('consent_id'),
+                         'No complete slice map is awaiting confirmation')
+            self.require(current.get('presentation'), 'Run slice-map to save the terminal presentation first')
+            target = current['target']
+        elif action == 'approve':
+            self.require_review_turn()
+            key = self.registry.get('current_slice_id')
+            self.require(key and key not in self.registry.get('reviews', {}),
+                         'No current slice revision is awaiting approval')
+            entry = self.registry['selected'][key]
+            target = {'slices': [self.visual_consent_target(key, entry)]}
+            guide_path = entry['guide_path']
+            if self.adaptive_handoff:
+                ready = self.require_readiness(key)
+                progress = self.registry.get('walkthroughs', {}).get(key, {})
+                sealed = progress.get('recap')
+                self.require(sealed, 'Record the completeness recap before asking for slice approval')
+                recap = self.api.artifact_file(self.directory, sealed['path']).read_text()
+                evidence = {'presentation_path': progress['presentation_path'],
+                            'evidence_paths': [progress['presentation_path'], sealed['path']]}
+                self.api.sibling_module('slice_coverage').require_recap(
+                    self, key, {**evidence, 'question': recap}, ready)
+        elif action == 'continue':
+            target = self.registry.get('pending_continue')
+            self.require(target, 'There is no slice review waiting for continuation')
+        elif action == 'lock':
+            package = self.package_preview()
+            target = {key: package[key] for key in
+                      ('package_id', 'collection_path', 'collection_sha256', 'recap_sha256')}
+            revisions = ', '.join(f"{key} revision {self.registry['selected'][key]['revision']}"
+                                  for key in self.registry['order'])
+            recap = (f'Collection validation passed for {revisions}. '
+                     'Locking freezes these reviewed revisions. Starting implementation requires separate permission.')
+        else:
+            key, entry, _ = self.package()
+            self.require(not entry.get('authorization_path'), 'Implementation is already authorized for this package')
+            target = {'package_id': key, 'package_hash': entry['package_hash']}
+        initiative = self.manifest['initiative_id']
+        prompt = service.render_prompt(initiative, action, target, recap=recap, guide_path=guide_path)
+        result = {'status': 'present_question', 'action': action, 'initiative_id': initiative,
+                  'target': target, 'question': prompt, 'display': prompt, **evidence}
+        return confirmation.preview_reply(
+            self.blueprint, result, service.displayed_values(target),
+            explicit=service.confirmation_phrases(action, target),
+            single_question=action == 'start') if check_reply else result
+
     def validate_consent(self, exchange):
         service = self.api.sibling_module('slice_consent')
         action, target = exchange.get('consent_action'), exchange.get('target')
